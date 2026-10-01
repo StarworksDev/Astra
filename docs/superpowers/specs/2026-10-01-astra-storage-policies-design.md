@@ -51,7 +51,8 @@ Bevy (per-component `SparseSet` storage) and Flecs (a non-fragmenting trait) add
   struct Health { float hp; static constexpr auto AstraStorage = Astra::Storage::Sparse; };
   ```
   `StorageTraits<T>` / `StorageOfV<T>` default to `Table`, gated with `if constexpr` exactly like `EnableableTraits` (the MSVC rationale at `Component.hpp:52-57` applies). `ComponentRegistry::MakeDescriptor` (`Component/ComponentRegistry.hpp:305-394`, next to `isEnableable`/`isChangeTracked` at 348-353) writes it into a new `ComponentDescriptor::storage` field (`Component.hpp:104-154`). Both registration paths (anonymous `RegisterComponentImpl` and `ComponentModule::RegisterOneChecked`, `Component/ComponentModule.hpp:203`) share `MakeDescriptor`, so both pick it up.
-- **Empty (tag) types may be Sparse.** A sparse tag has a sparse set with no data buffer (presence only). Today tags have no column and cannot be enableable (`ComponentRegistry.hpp:360-362`); a sparse tag CAN be enableable (its disabled state lives in the store, s4.1), so that `static_assert` is narrowed to Table tags.
+- **Empty (tag) types may be Sparse.** A sparse tag has a sparse set with no data buffer (presence only); its disabled state lives in the store (s4.1).
+- **Every tag may be enableable, Table tags included (parity, user 2026-10-01).** Today a tag has no column, so it cannot carry disabled bits and enableable tags are `static_assert`-refused (`ComponentRegistry.hpp:360-362`; `Archetype::BuildColumnMeta` skips `size == 0`, `Archetype.hpp:75`). An enableable Table tag now gets a **bit-only column**: an `ArchetypeColumnMeta` entry with `stride 0`, no data region, and a disabled-word region carved like any enableable column (`InitializeColumns`, `ArchetypeChunkPool.hpp:738-787`, and the capacity math `ComputeCapacityForBytes`/`ComputeLayoutBytesForCapacity`/`ChunkBytesToHold`, `Archetype.hpp:113-218`, count its words). `idToColumn` is `>= 0` for it, so `SetEnabledByID`, `IsEnabledByID`, every view filter path and every bit carry work unchanged. `GetComponentArray<T>()` still returns nullptr for it (no data), `SerializeColumn` writes zero data bytes plus the existing disabled section, and non-enableable tags keep having no column at all (no cost). The `static_assert` is deleted.
 - **Universal (D1).** `Registry::Config` (`Registry/Registry.hpp:40-50`) gains
   ```cpp
   struct UniversalSpec { ComponentID id; void (*init)(Entity, void* component, void* user); void* user; };
@@ -282,7 +283,7 @@ These were not discussed explicitly; each is the writer's pick with its reason.
 2. **Adding an already-present Universal component is a no-op returning `true`**, matching today's Table rule (`ArchetypeManager.hpp:314-315`). The alternative (assign the new value) would be a behaviour difference from Table, violating D2.
 3. **Removing a Universal component: Debug assert, Release `false`, no signal.**
 4. **Range-for works for views with Sparse arguments** (s6.5), at the cost of teaching `ViewIterator` run-stepping. The existing refusal for *enableable* filters is untouched.
-5. **Sparse tags may be enableable** (s3.2), unlike Table tags today.
+5. **Every tag may be enableable** (s3.2): Sparse tags through the store, Table tags through a bit-only column (user-requested parity, 2026-10-01).
 6. **Storage-agnostic load with migration in both directions** (s8.3), rather than refusing an archive whose storage classes differ from the build's.
 7. **Universal `init` runs only when no explicit value was supplied** (s4.2), including for entities restored by load that lack the component.
 8. **Caller-less relocation functions are deleted** (s5.3) instead of maintained.
@@ -294,7 +295,7 @@ These were not discussed explicitly; each is the writer's pick with its reason.
 
 One plan on `feat/storage-policies`, TDD throughout, every task ending with the full `AstraTest` run (shuffled, seed recorded):
 1. **Prerequisites:** I1 type-name fix, I2 `<limits>`; delete the three caller-less relocation functions.
-2. **Declaration:** `Storage` trait, `ComponentDescriptor::storage`, `Config::AddUniversal`, sparse-slot table; narrowing the tag/enableable assert.
+2. **Declaration:** `Storage` trait, `ComponentDescriptor::storage`, `Config::AddUniversal`, sparse-slot table; enableable Table tags via bit-only columns (the tag/enableable `static_assert` deleted, parity-tested against an enableable data component).
 3. **`ComponentStorage` + `UniversalColumn`:** create/destroy/Clear/Get/Has/enable/ticks; the creation funnel (7.1), including the CommandBuffer reroute; Remove refusal.
 4. **`SparseSet`:** insert/erase/Get/Has/enable/ticks; typed and by-id add/remove routing; batches.
 5. **Chunk presence blocks:** `SparseBlock`, the word freelist, P1-P3, `ValidateStorageInvariants`, carry at every s5.3 site, destroy walk.
