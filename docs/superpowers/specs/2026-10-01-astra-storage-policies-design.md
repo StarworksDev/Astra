@@ -4,6 +4,7 @@
 **Repo / branch:** Astra, `feat/storage-policies` (worktree `D:\dev\starworks\Astra-storage`), based on `dev` @ `975cdb7`. Kept OFF `dev` until Arcane's node-page phase has vendored `975cdb7` (its task T1-C7).
 **Consumers:** every Astra user (generic feature); Arcane adopts it at the start of its entity-record undo arc (s10, out of scope here).
 **Evidence:** the read-only internals map produced 2026-10-01 (all `file:line` citations below are at `975cdb7`, paths relative to `include/Astra/` unless rooted at `tests/`, `docs/` or `benchmark/`).
+**Notation:** `entity.Index()` / `e.Index()` below is shorthand for the entity's id; the code's accessor is `Entity::GetID()` (stores index by `static_cast<std::size_t>(e.GetID())`).
 
 ## 0. Why
 
@@ -69,7 +70,7 @@ Bevy (per-component `SparseSet` storage) and Flecs (a non-fragmenting trait) add
 | `HasComponent<T>` | mask test (`ArchetypeManager.hpp:614-621`) | sparse lookup | `true` for a live entity |
 | `GetComponent<T>` (const / mut) | chunk column | dense slot via the sparse index | `column[entity.Index()]` |
 | `AddComponent`/`Emplace` when absent | archetype move | sparse insert + chunk bit set; NO move | n/a (always present) |
-| `AddComponent`/`Emplace` when present | no-op, returns `true` (today: `ArchetypeManager.hpp:314-315` + `Registry.hpp:337-368`) | same: no-op, `true` | same: no-op, `true` |
+| `AddComponent`/`Emplace` when present | no-op, returns `true` (today: `ArchetypeManager.hpp:314-315` + `Registry.hpp:337-368`); by-id `AddComponentByID` returns `false` (today's by-id answer for an already-present id, `ArchetypeManager::AddComponentByID`) | same: typed no-op `true`, by-id `false` | same: typed no-op `true`, by-id `false` (Universal is always present) |
 | `RemoveComponent` when present | archetype move, `true` | sparse erase + bit clear, `true` | **refused**: `ASTRA_ASSERT` in Debug, returns `false` in Release, no signal |
 | `RemoveComponent` when absent | `false` (`ArchetypeManager.hpp:373-374`) | `false` | n/a |
 | `SetEnabled<T>` / `IsEnabled<T>` | per-chunk disabled bits | per-entity flag in the store + chunk mirror (s5.2) | per-slot flag in the column page + chunk mirror |
@@ -78,6 +79,10 @@ Bevy (per-component `SparseSet` storage) and Flecs (a non-fragmenting trait) add
 | Reflection (`GetComponentByHash`, `HasComponentByHash`, `GetEntityComponents`, `InspectEntity`, `GetComponentByName`, `Registry.hpp:857-1099`) | mask + chunk | must include sparse/universal members | same |
 
 Pointer validity: the public contract stays today's table rule ("valid until the next structural change"). Universal pointers are in fact stable (never move); that is an implementation property, not a promise.
+
+Add-when-present asymmetry (plan consistency pass, 2026-10-01): the typed and by-id surfaces already answer differently for an already-present Table component (typed `true`, by-id `false`). D2 is parity with each surface's current answer, so an already-present Universal (or Sparse) component also answers typed `true`, by-id `false`. This refines s12 item 2.
+
+Change-tick tiers (plan consistency pass): tracked Sparse/Universal components are exact per element / per slot. Untracked ones are coarse, the restatement of today's chunk-column version: one version per Sparse component (any write makes every member answer changed), and one version per 1024-slot page for a Universal component. One coarse scheme per kind; the sparse set itself keeps none.
 
 ## 4. The stores (s2 of the brainstorm)
 
@@ -101,9 +106,15 @@ A new `ComponentStorage` (new header `Registry/ComponentStorage.hpp`, plus `Regi
 
 Identical to tables: structural changes run on the registry's context (`AssertContextAffinity`); parallel iteration over disjoint entities may read and write their own elements (each entity owns its slot in every store). Sparse-set growth during a parallel iteration is a structural change and is refused exactly like a table structural change (`tests/Registry/IterationSafetyTest.cpp` semantics extend to sparse adds/removes).
 
+"Refused" means exactly what it means for a Table change today: the Debug structural-mutation guard REPORTS it (`ASTRA_ASSERT` after the walk; the guard now also compares a sparse membership counter beside the archetype-set counter). The add/remove is not rejected at its call site, in any build. The walk itself stays memory-safe in every build: presence-word pointers are copied per chunk, Sparse elements are re-fetched by entity, the sparse-driven walk is index-based, and a required element that vanished mid-walk is skipped. Parity means "same outcome as Table today": the guard trips for archetype-set changes (as today) plus sparse membership changes. Destroying a bystander, or a Table move into an already-existing archetype, does not trip it today and is not made to; destroying an entity that holds a Sparse component changes sparse membership and does bump the sparse counter.
+
 ### 4.4 Module unload
 
-A plugin `ComponentModule` can register a Sparse type and later unload (`ComponentRegistry::UnregisterModuleRange`, `ComponentRegistry.hpp:153-223`; `ReleaseModule` 555-582). Descriptor function pointers into an unloaded image dangle, so `ComponentStorage` must destroy and drop that component's sparse set or universal column (and release its sparse slot and every chunk presence block for that slot) **before** the module's descriptors are released. This hooks the same unload path that already purges archetype state for the module's components.
+A plugin `ComponentModule` can register a Sparse type and later unload (`ComponentRegistry::UnregisterModuleRange`, `ComponentRegistry.hpp:153-223`; `ReleaseModule` 555-582). Descriptor function pointers into an unloaded image dangle, so `ComponentStorage` must destroy and drop that component's sparse set or universal column (and release its sparse slot and every chunk presence block for that slot) **before** the module's descriptors are released.
+
+No existing unload path purges archetype state for a module's components (that was a mis-reading at spec time), so the unload purge is NEW: `ComponentRegistry` gains store-release hooks (`AddStoreReleaseHook`/`RemoveStoreReleaseHook`). `ReleaseModule` and `UnregisterModuleRange` collect every departing entry (live and shadowed) under the registration lock, then call every hook OUTSIDE all locks while the departing descriptors are still installed, and only then change any slot. Every `Registry` subscribes for its lifetime; for a store built from the departing descriptor (matched by its destructor pointer) it destroys every element, drops the store, frees the sparse slot and releases that slot's presence block in every chunk. Table columns of an unloaded type are still not purged (pre-existing behaviour, out of scope).
+
+Unloading a Universal type drops its column, so every entity loses the value and "always present" is SUSPENDED for that type until it is registered again (a later create or access rebuilds the column from the then-registered descriptor). Universal types should therefore be engine-resident; s10's Arcane adoption records this.
 
 ## 5. Chunk presence bits (D3)
 
@@ -220,12 +231,12 @@ Unchanged event set and timing (`Core/Signal.hpp:21-145`). For a Sparse empty ty
 
 ### 8.2 The ComponentStorage block
 
-`uint32 storedCount`, then per stored component (sorted by hash for deterministic output): `{ uint64 hash; uint16 version; uint8 kind (Sparse|Universal); uint8 flags (hasDisabled); uint32 elementCount; }`, then `elementCount` entities in ascending entity order, then the values (per-element `serializeVersioned`, the same element I/O as columns, `Archetype.hpp:1539-1576`), then a disabled bitmap if `hasDisabled`. With LZ4 enabled each component's payload is its own compressed block (the per-column precedent, 967-985). Change ticks are not persisted (today's rule). Chunk presence blocks are NOT serialized: they are derived on load from the sets and the entity records.
+`uint32 storedCount`, then per stored component (sorted by hash for deterministic output): `{ uint64 hash; uint32 version; uint8 kind (Sparse|Universal); uint8 flags (hasDisabled = 0x01, hasValues = 0x02); uint32 elementCount; }` (18 bytes), then `elementCount` entities in ascending entity order, then the values iff `hasValues` (per-element `serializeVersioned`, the same element I/O as columns, `Archetype.hpp:1539-1576`), then a disabled bitmap if `hasDisabled`. Details fixed while planning: `version` is `uint32`, matching `ComponentDescriptor::version` and the archetype record (was `uint16`); `hasValues` is an explicit flag, so a tag block is presence-only; stores with zero elements are not written; "ascending entity order" is by `Entity::GetID()` (a raw `Entity` comparison would order by version first). With LZ4 enabled each component's payload is its own compressed block (the per-column precedent, 967-985). Change ticks are not persisted (today's rule). Chunk presence blocks are NOT serialized: they are derived on load from the sets and the entity records.
 
 ### 8.3 Storage-agnostic load (G5)
 
 Every serialized component is resolved by hash to the LOADING registry's descriptor (as columns are today, `Archetype.hpp:1085-1098`) and placed in whatever storage that registry assigns, whatever the archive used:
-- archived as a Table column, now Sparse/Universal: `Archetype::Deserialize` diverts that column's values into `ComponentStorage` keyed by the chunk's entities and excludes it from the rebuilt archetype mask (which relaxes the `mask.Count() == descriptors.size()` check at 1122-1125 to "mask count == number of Table descriptors");
+- archived as a Table column, now Sparse/Universal: `Archetype::Deserialize` diverts that column's values into `ComponentStorage` keyed by the chunk's entities and excludes it from the rebuilt archetype mask (which relaxes the `mask.Count() == descriptors.size()` check at 1122-1125: the ON-DISK mask's popcount must equal the number of ARCHIVED descriptors -- the literal "mask count == number of Table descriptors" would refuse every migrating archive, because the disk mask still counts the diverted components; archetypes whose masks collapse after diversion are merged by one batched move);
 - archived Sparse/Universal, now Table: the values are staged and applied after archetype load by one batched archetype move per destination archetype (`ApplyMigratedTableComponents`);
 - declared Universal now but absent for some entities in the archive (an older save, or it was Table/Sparse and missing): those entities get default construction + the registry's `init` (Arcane: a fresh GUID for an entity that never had one).
 v5 and older archives load through the same path (all components arrive as Table columns).
@@ -280,7 +291,7 @@ Results are recorded in `bench-compare/RESULTS.md` with the machine and commit.
 These were not discussed explicitly; each is the writer's pick with its reason.
 
 1. **`ASTRA_MAX_SPARSE_COMPONENTS` = 32** per registry (configurable macro). Reason: bounds the per-chunk block search and the slot table; a typical game has a handful of sparse types.
-2. **Adding an already-present Universal component is a no-op returning `true`**, matching today's Table rule (`ArchetypeManager.hpp:314-315`). The alternative (assign the new value) would be a behaviour difference from Table, violating D2.
+2. **Adding an already-present Universal component is a no-op returning `true`**, matching today's Table rule (`ArchetypeManager.hpp:314-315`). The alternative (assign the new value) would be a behaviour difference from Table, violating D2. Refined while planning: that is the TYPED answer; the by-id `AddComponentByID` returns `false`, which is today's by-id Table answer for an already-present id (see s3.3).
 3. **Removing a Universal component: Debug assert, Release `false`, no signal.**
 4. **Range-for works for views with Sparse arguments** (s6.5), at the cost of teaching `ViewIterator` run-stepping. The existing refusal for *enableable* filters is untouched.
 5. **Every tag may be enableable** (s3.2): Sparse tags through the store, Table tags through a bit-only column (user-requested parity, 2026-10-01).
