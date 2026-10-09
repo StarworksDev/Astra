@@ -239,7 +239,7 @@ Every serialized component is resolved by hash to the LOADING registry's descrip
 - archived as a Table column, now Sparse/Universal: `Archetype::Deserialize` diverts that column's values into `ComponentStorage` keyed by the chunk's entities and excludes it from the rebuilt archetype mask (which relaxes the `mask.Count() == descriptors.size()` check at 1122-1125: the ON-DISK mask's popcount must equal the number of ARCHIVED descriptors -- the literal "mask count == number of Table descriptors" would refuse every migrating archive, because the disk mask still counts the diverted components; archetypes whose masks collapse after diversion are merged by one batched move);
 - archived Sparse/Universal, now Table: the values are staged and applied after archetype load by one batched archetype move per destination archetype (`ApplyMigratedTableComponents`);
 - declared Universal now but absent for some entities in the archive (an older save, or it was Table/Sparse and missing): those entities get default construction + the registry's `init` (Arcane: a fresh GUID for an entity that never had one).
-v5 and older archives load through the same path (all components arrive as Table columns).
+v5 and older archives load through the same path (all components arrive as Table columns). Amended 2026-10-09 by §14: the width check comes first.
 
 ### 8.4 Cross-compiler type hashes (flagged, partly out of scope)
 
@@ -315,3 +315,7 @@ One plan on `feat/storage-policies`, TDD throughout, every task ending with the 
 8. **Module unload** teardown (s4.4).
 9. **Parity suite + fuzzer** (9.1, 9.2).
 10. **Benchmarks + RESULTS.md** (9.3), the S4 gate; **Inspector** reporting and advisory (9.4).
+
+## 14. Amendments
+
+- 2026-10-09, A4 — amends s8.3. See the Astra 1.0 lane spec `docs/superpowers/specs/2026-10-09-astra-1.0-lane-design.md` (worktree `D:\dev\starworks\Astra-lane`): a 64/32 build refuses archives of another entity width (including v5-and-older 32/8 archives) with a clear SerializationError naming both widths; storage-agnostic migration applies only after the width check passes. No width migration (binary archives are transient snapshots; persistent identity is GUID-based in the consumer).
