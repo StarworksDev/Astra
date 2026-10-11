@@ -53,3 +53,21 @@ jobs:
         run: make config=release AstraTest -j"$(nproc)" CC=${{ matrix.cc }} CXX=${{ matrix.compiler }}
       - name: Test
         run: ./bin/Release-linux-x86_64/AstraTest/AstraTest --gtest_brief=1
+
+  # Discord: post this repo's CI result into its thread in the ⚙️・ci-builds forum (shared action:
+  # StarworksDev/.github/actions/discord-ci-notify). Never for pull requests (fork PRs get no secrets).
+  notify:
+    name: Discord notify
+    needs: [windows-msvc, linux]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: StarworksDev/.github/actions/discord-ci-notify@main
+        with:
+          result: ${{ contains(needs.*.result, 'failure') && 'failure' || (contains(needs.*.result, 'cancelled') && 'cancelled' || 'success') }}
+          webhook: ${{ secrets.DISCORD_CI_WEBHOOK }}
+          threads: ${{ vars.DISCORD_CI_THREADS }}
+          github-token: ${{ github.token }}
