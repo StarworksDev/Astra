@@ -173,3 +173,21 @@ jobs:
           name: test-results-${{ matrix.lane.name }}-${{ matrix.lane.config }}
           path: test-results/
           if-no-files-found: warn
+
+  # Discord: post this repo's CI result into its thread in the ⚙️・ci-builds forum (shared action:
+  # StarworksDev/.github/actions/discord-ci-notify). Never for pull requests (fork PRs get no secrets).
+  notify:
+    name: Discord notify
+    needs: [build-test, extra]
+    if: always() && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - uses: StarworksDev/.github/actions/discord-ci-notify@main
+        with:
+          result: ${{ contains(needs.*.result, 'failure') && 'failure' || (contains(needs.*.result, 'cancelled') && 'cancelled' || 'success') }}
+          webhook: ${{ secrets.DISCORD_CI_WEBHOOK }}
+          threads: ${{ vars.DISCORD_CI_THREADS }}
+          github-token: ${{ github.token }}
