@@ -91,8 +91,10 @@ Sanitizer details and triage rules: [`ci/README.md`](../ci/README.md).
 
 ## Supply chain
 
-- Actions are pinned by full commit SHA (`actions/checkout` v4.4.0,
-  `actions/upload-artifact` v4.6.2), with the tag in a comment.
+- Actions are pinned by full commit SHA (`actions/checkout` v7.0.1,
+  `actions/upload-artifact` v7.0.2 -- the node24 releases), with the tag in a
+  comment. Checkout does not persist the token; every job has a timeout;
+  test results are kept 14 days.
 - The workflow token is read-only: `permissions: contents: read`.
 - The only download is premake, pinned by version and SHA-256 in
   `scripts/premake.lock`; a mismatch fails the build. Compilers come from the

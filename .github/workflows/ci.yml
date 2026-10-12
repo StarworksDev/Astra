@@ -24,6 +24,7 @@ jobs:
   build-test:
     name: ${{ matrix.leg.name }} (${{ matrix.config }})
     runs-on: ${{ matrix.leg.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -45,7 +46,9 @@ jobs:
             os: macos-15
             xcode: "16.4"
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       # Fixed seed 1 reproduces exactly run to run; the second seed moves with
       # the run number so test-order coupling keeps being probed.
@@ -107,11 +110,12 @@ jobs:
 
       - name: Upload test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-results-${{ matrix.leg.name }}-${{ matrix.config }}
           path: test-results/
           if-no-files-found: warn
+          retention-days: 14
 
   # Extra lanes, all on ubuntu-24.04 with the pinned Clang 19. Each goes
   # through the same build/test scripts, with a premake option selecting the
@@ -120,6 +124,7 @@ jobs:
   extra:
     name: ${{ matrix.lane.name }} (${{ matrix.lane.config }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
@@ -143,7 +148,9 @@ jobs:
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1:abort_on_error=1
       TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1:suppressions=${{ github.workspace }}/ci/tsan-suppressions.txt
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Seeds
         run: |
@@ -168,11 +175,12 @@ jobs:
 
       - name: Upload test results
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: test-results-${{ matrix.lane.name }}-${{ matrix.lane.config }}
           path: test-results/
           if-no-files-found: warn
+          retention-days: 14
 
   # Discord: post this repo's CI result into its thread in the ⚙️・ci-builds forum (shared action:
   # StarworksDev/.github/actions/discord-ci-notify). Never for pull requests (fork PRs get no secrets).
@@ -181,6 +189,7 @@ jobs:
     needs: [build-test, extra]
     if: always() && github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     permissions:
       actions: read
       contents: read
