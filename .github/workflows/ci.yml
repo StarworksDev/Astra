@@ -194,9 +194,9 @@ jobs:
       actions: read
       contents: read
     steps:
-      - uses: StarworksDev/.github/actions/discord-ci-notify@main
+      - uses: StarworksDev/.github/actions/discord-ci-notify@af9284cd93ba45b7d5bd5818c9ee90812271535c # discord-ci-notify-v1.0.0
         with:
-          result: ${{ contains(needs.*.result, 'failure') && 'failure' || (contains(needs.*.result, 'cancelled') && 'cancelled' || 'success') }}
+          needs: ${{ toJSON(needs) }}
           webhook: ${{ secrets.DISCORD_CI_WEBHOOK }}
           threads: ${{ vars.DISCORD_CI_THREADS }}
           github-token: ${{ github.token }}
