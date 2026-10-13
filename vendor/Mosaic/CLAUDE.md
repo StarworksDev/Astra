@@ -40,4 +40,6 @@ msbuild Mosaic.sln /p:Configuration=Debug /m
 bin\Debug-windows-x86_64\MosaicTests\MosaicTests.exe
 ```
 
-Configurations: Debug / Release / Dist. Linux (`gmake2`) is scaffolded, not green.
+Configurations: Debug / Release / Dist. The CI entry points (any OS; `docs/ci.md`):
+`scripts/build.{ps1,sh} <Config>`, `scripts/run-tests.{ps1,sh} <Config> [--rng-seed N]`,
+`ci/check-headers.sh`. Linux GCC 14 / Clang 19 (+ ASan/UBSan, TSan) are desk-verified green; macOS arm64 is proven by CI only.

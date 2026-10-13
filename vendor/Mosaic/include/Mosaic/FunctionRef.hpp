@@ -23,6 +23,29 @@ namespace Mosaic
         void* m_obj = nullptr;
         R (*m_thunk)(void*, Args...) = nullptr;
 
+        // A function's address and an object's address are different kinds of
+        // pointer: static_cast between a function pointer and void* is ill-formed
+        // (MSVC accepts it; GCC and Clang do not). reinterpret_cast is the
+        // conditionally-supported conversion every Starworks target implements
+        // (POSIX requires it for dlsym), and keeps the layout -- one void* plus the
+        // thunk -- unchanged across the IWorkScheduler seam.
+        template <class T>
+        static void* ToStorage(T* p) noexcept
+        {
+            if constexpr (std::is_function_v<T>)
+                return reinterpret_cast<void*>(p);
+            else
+                return const_cast<void*>(static_cast<const void*>(p));
+        }
+        template <class T>
+        static T* FromStorage(void* o) noexcept
+        {
+            if constexpr (std::is_function_v<T>)
+                return reinterpret_cast<T*>(o);
+            else
+                return static_cast<T*>(o);
+        }
+
     public:
         FunctionRef() = default;
 
@@ -35,9 +58,9 @@ namespace Mosaic
             // yields the function's stable address (not a temporary) -- safe. Same for
             // any lvalue callable. Do NOT bind a function-POINTER rvalue (e.g. a cast
             // result): F would deduce as a pointer type and m_obj would dangle.
-            : m_obj(const_cast<void*>(static_cast<const void*>(std::addressof(f)))),
+            : m_obj(ToStorage(std::addressof(f))),
               m_thunk(+[](void* o, Args... a) -> R {
-                  return (*static_cast<std::remove_reference_t<F>*>(o))(static_cast<Args&&>(a)...);
+                  return (*FromStorage<std::remove_reference_t<F>>(o))(static_cast<Args&&>(a)...);
               })
         {
         }
