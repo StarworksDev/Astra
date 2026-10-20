@@ -2,7 +2,9 @@
 #include <Astra/Astra.hpp>
 #include <Astra/Debug/Inspector.hpp>
 
+#include <array>
 #include <bit>
+#include <cstring>
 #include <cstdint>
 #include <span>
 #include <tuple>
@@ -162,8 +164,8 @@ TEST(EnableableTag, BatchAddLeavesNeighbourDataIntact)
     std::vector<Astra::Entity> odd;
     for (size_t i = 1; i < N; i += 2)
         odd.push_back(es[i]);
-    // Archetype::SetComponents -> ArchetypeChunk::BatchConstructComponent<EnTag>: must not
-    // write sizeof(EnTag) bytes through the bit-only column's base.
+    // End-to-end smoke: Position data around a batch tag add stays intact and the tag is born
+    // enabled. The chunk-level guard for step (h) is BatchConstructWritesNothingThroughBitOnlyColumn.
     reg.AddComponents<EnTag>(std::span<Astra::Entity>(odd.data(), odd.size()), EnTag{});
     for (size_t i = 0; i < N; ++i)
     {
@@ -177,6 +179,37 @@ TEST(EnableableTag, BatchAddLeavesNeighbourDataIntact)
             EXPECT_TRUE(reg.IsEnabled<EnTag>(es[i])) << i;
     }
     ExpectBitInvariant(reg);
+}
+
+TEST(EnableableTag, BatchConstructWritesNothingThroughBitOnlyColumn)
+{
+    // ArchetypeChunk::BatchConstructComponent<EnTag> on a bit-only (stride-0) column must be a
+    // no-op: without the empty-type early-out, the non-contiguous path memcpy's sizeof(EnTag)
+    // bytes through the column base (the start of the version region, Position's column having
+    // the lower TypeID), and the contiguous path would write through it too.
+    Astra::Registry reg;
+    std::vector<Astra::Entity> es;
+    for (int i = 0; i < 4; ++i)
+        es.push_back(reg.CreateEntity<Position, EnTag>());
+    const Astra::EntityRecord* rec = RecordOf(reg, es[0]);
+    auto* chunk = rec->chunk;
+    const Astra::ComponentID tagId = Astra::TypeID<EnTag>::Value();
+    const int columnCount = rec->archetype->GetColumnMeta().columnCount;
+
+    auto* tagBase = static_cast<const unsigned char*>(chunk->GetComponentArrayByID(tagId));
+    ASSERT_NE(tagBase, nullptr);                                  // the bit-only column exists
+    const unsigned char before = *tagBase;
+    std::vector<Astra::Tick> versions;
+    for (int c = 0; c < columnCount; ++c)
+        versions.push_back(chunk->GetColumnVersion(c));
+
+    EnTag v;
+    std::memset(&v, 0xA5, sizeof v);
+    chunk->BatchConstructComponent<EnTag>(std::array<size_t, 2>{0, 2}, v);   // non-contiguous
+
+    EXPECT_EQ(*tagBase, before);
+    for (int c = 0; c < columnCount; ++c)
+        EXPECT_EQ(chunk->GetColumnVersion(c), versions[static_cast<size_t>(c)]) << c;
 }
 
 TEST(EnableableTag, ViewsFilterDisabledTagsInMixedAndTagOnlyArchetypes)
