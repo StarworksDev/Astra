@@ -2746,6 +2746,10 @@ namespace Astra
         bool IterResolveImpl(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, size_t index, [[maybe_unused]] void** out,
                              std::index_sequence<ReqIs...>) const
         {
+            // The iterator walks the count cached at chunk entry; an entity destroyed mid-walk
+            // (even a bystander with no Sparse component, which trips no guard) shrinks the chunk.
+            if (index >= chunk->GetCount())
+                return false;
             const Entity e = chunk->GetEntities()[index];
             std::tuple<Fetch<std::tuple_element_t<ReqIs, RequiredTypes>>...> req{
                 MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, m_stores)... };

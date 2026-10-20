@@ -182,3 +182,50 @@ TEST(StorageViewAccess, RangeForWritesPersistAndStamp)
         EXPECT_TRUE(reg.IsChanged<PosS>(es[i], since));   // untracked: coarse stamp through the iterator
     }
 }
+
+TEST(StorageViewAccess, RangeForSurvivesDestroyingBystandersOfTheCurrentChunk)
+{
+    Astra::Registry reg;
+    std::vector<Astra::Entity> bystanders;
+    size_t withS = 0;
+    for (int i = 0; i < 300; ++i)
+    {
+        Astra::Entity e = reg.CreateEntity<Position>();
+        if (i % 2 == 0) { reg.AddComponent(e, PosS{}); ++withS; }
+        else bystanders.push_back(e);   // same chunk, no Sparse component: trips no guard
+    }
+    size_t visited = 0;
+    bool destroyed = false;
+    for (auto [e, pos, s] : reg.CreateView<Position, PosS>())
+    {
+        ++visited;
+        if (!destroyed)
+        {
+            destroyed = true;
+            for (auto b : bystanders) reg.DestroyEntity(b);   // swap-removes and shrinks the chunk mid-walk
+        }
+    }
+    EXPECT_GE(visited, 1u);
+    EXPECT_LE(visited, withS);
+    EXPECT_TRUE(reg.ValidateStorageInvariants().empty());
+}
+
+TEST(StorageViewAccess, RangeForSurvivesDestroyingBystandersOnUniversalYield)
+{
+    auto reg = MakeRegistry<Health>();
+    std::vector<Astra::Entity> all;
+    for (int i = 0; i < 300; ++i) all.push_back(reg->CreateEntity<Position>());
+    size_t visited = 0;
+    bool destroyed = false;
+    for (auto [e, pos, h] : reg->CreateView<Position, Health>())
+    {
+        ++visited;
+        if (!destroyed)
+        {
+            destroyed = true;
+            for (size_t i = all.size() - 1; i > 100; --i) reg->DestroyEntity(all[i]);
+        }
+    }
+    EXPECT_GE(visited, 1u);
+    EXPECT_TRUE(reg->ValidateStorageInvariants().empty());
+}
