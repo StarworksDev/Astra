@@ -732,6 +732,8 @@ namespace Astra
         {
             if (componentId >= MAX_COMPONENTS) ASTRA_UNLIKELY
                 return false;
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return SetEnabledUniversal(entity, componentId, enable);
             // One validated record fetch (version + archetype); stale handle => null.
             auto* rec = const_cast<EntityRecord*>(m_archetypeManager->GetEntityRecord(entity));
             if (!rec || !rec->chunk) ASTRA_UNLIKELY
@@ -771,6 +773,13 @@ namespace Astra
         {
             if (componentId >= MAX_COMPONENTS) ASTRA_UNLIKELY
                 return false;
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+            {
+                const UniversalColumn* column = m_componentStorage->FindUniversal(componentId);
+                if (!column || !column->IsLive(entity)) ASTRA_UNLIKELY
+                    return false;                         // stale or never constructed: not enabled
+                return !column->IsDisabled(entity);       // non-enableable: IsDisabled is false
+            }
             const auto* rec = m_archetypeManager->GetEntityRecord(entity);
             if (!rec || !rec->chunk) ASTRA_UNLIKELY
                 return false;
@@ -1978,6 +1987,33 @@ namespace Astra
         {
             return id < MAX_COMPONENTS && m_componentStorage->HasUniversals()
                 && m_componentStorage->KindOf(id) == StorageKind::Universal;
+        }
+
+        // Universal arm of SetEnabledByID (spec s3.3, s7.2). The column's per-slot flag is
+        // the truth (P3). Chunk C's enable task adds the chunk-side `disabled` mirror
+        // update here. Same answers as the Table path: true iff the live entity holds an
+        // enableable component, whether or not the state changed; the signal fires on a
+        // genuine change only.
+        bool SetEnabledUniversal(Entity entity, ComponentID componentId, bool enable)
+        {
+            UniversalColumn* column = m_componentStorage->FindUniversal(componentId);
+            if (!column || !column->IsLive(entity)) ASTRA_UNLIKELY
+                return false;                             // stale handle: miss
+            if (!column->Descriptor().isEnableable) ASTRA_UNLIKELY
+                return false;                             // present but not enableable: nothing to toggle
+            const bool changed = column->SetDisabled(entity, !enable);   // SET == DISABLED
+            if (changed)
+            {
+                const Signal flag = enable ? Signal::ComponentEnabled : Signal::ComponentDisabled;
+                if (m_signalManager.IsSignalEnabled(flag)) ASTRA_UNLIKELY
+                {
+                    // A present tag's payload is the sentinel on every by-ID path.
+                    void* component = column->Descriptor().size == 0 ? EmptyComponentSentinel() : column->Get(entity);
+                    if (enable) m_signalManager.Emit<Events::ComponentEnabled>(entity, componentId, component);
+                    else        m_signalManager.Emit<Events::ComponentDisabled>(entity, componentId, component);
+                }
+            }
+            return true;
         }
 
         // Non-stamping, type-erased store lookup: the element pointer (or

@@ -352,3 +352,97 @@ TEST(UniversalStorageStaleHandle, AddAndRemoveMissQuietlyAndNeverTouchTheOccupan
     ASSERT_TRUE(reg.HasComponent<Position>(fresh));
     EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(fresh)->x, 3.0f);
 }
+
+namespace
+{
+    Registry::Config UniversalTimerConfig()
+    {
+        Registry::Config cfg;
+        cfg.AddUniversal<Astra::Test::Timer>();   // enableable
+        cfg.AddUniversal<Position>();             // not enableable
+        return cfg;
+    }
+}
+
+TEST(UniversalStorage, SetEnabledTogglesTheColumnFlagAndSignalsOnChangeOnly)
+{
+    using Astra::Test::Timer;
+    Registry reg(UniversalTimerConfig());
+    const Entity e = reg.CreateEntity();
+    const Entity other = reg.CreateEntity();
+    reg.EnableSignals(Astra::Signal::ComponentEnabled | Astra::Signal::ComponentDisabled);
+    int enabledSignals = 0, disabledSignals = 0;
+    const void* payload = nullptr;
+    auto* signals = reg.GetSignalManager();
+    auto hOn = signals->On<Astra::Events::ComponentEnabled>().Register(
+        [&](const Astra::Events::ComponentEnabled& ev) { ++enabledSignals; payload = ev.component; });
+    auto hOff = signals->On<Astra::Events::ComponentDisabled>().Register(
+        [&](const Astra::Events::ComponentDisabled& ev) { ++disabledSignals; payload = ev.component; });
+
+    EXPECT_TRUE(reg.IsEnabled<Timer>(e));                  // born enabled
+    EXPECT_TRUE(reg.SetEnabled<Timer>(e, false));
+    EXPECT_FALSE(reg.IsEnabled<Timer>(e));
+    EXPECT_TRUE(reg.IsEnabled<Timer>(other));              // per entity
+    EXPECT_EQ(disabledSignals, 1);
+    EXPECT_EQ(payload, static_cast<const void*>(std::as_const(reg).GetComponent<Timer>(e)));
+    EXPECT_TRUE(reg.SetEnabled<Timer>(e, false));          // idempotent: still true...
+    EXPECT_EQ(disabledSignals, 1);                         // ...but silent
+    EXPECT_TRUE(reg.HasComponent<Timer>(e));               // existence never lies
+    EXPECT_NE(std::as_const(reg).GetComponent<Timer>(e), nullptr);
+    EXPECT_TRUE(reg.SetEnabled<Timer>(e, true));
+    EXPECT_TRUE(reg.IsEnabled<Timer>(e));
+    EXPECT_EQ(enabledSignals, 1);
+
+    // A non-enableable universal: present, always enabled, nothing to toggle.
+    EXPECT_FALSE(reg.SetEnabledByID(e, Astra::TypeID<Position>::Value(), false));
+    EXPECT_TRUE(reg.IsEnabledByID(e, Astra::TypeID<Position>::Value()));
+
+    signals->On<Astra::Events::ComponentEnabled>().Unregister(hOn);
+    signals->On<Astra::Events::ComponentDisabled>().Unregister(hOff);
+}
+
+TEST(UniversalStorage, CommandBufferSetEnabledReachesTheColumn)
+{
+    using Astra::Test::Timer;
+    Registry reg(UniversalTimerConfig());
+    const Entity e = reg.CreateEntity();
+    {
+        Astra::CommandBuffer cb(&reg);
+        cb.SetEnabled<Timer>(e, false);
+        EXPECT_FALSE(cb.Execute().IsErr());
+    }
+    EXPECT_FALSE(reg.IsEnabled<Timer>(e));
+}
+
+TEST(UniversalStorage, DestroyRecycleBringsTheNextOccupantBackEnabled)
+{
+    using Astra::Test::Timer;
+    Registry reg(UniversalTimerConfig());
+    const Entity e = reg.CreateEntity();
+    ASSERT_TRUE(reg.SetEnabled<Timer>(e, false));
+    reg.DestroyEntity(e);
+    const Entity next = reg.CreateEntity();
+    ASSERT_EQ(next.GetID(), e.GetID());
+    EXPECT_TRUE(reg.IsEnabled<Timer>(next));               // born enabled, like any component
+}
+
+// ---- Review Focus 1 (Universal), SetEnabled arm ----
+TEST(UniversalStorageStaleHandle, SetEnabledMissesAndNeverTogglesTheOccupant)
+{
+    using Astra::Test::Timer;
+    Registry reg(UniversalTimerConfig());
+    const Entity stale = reg.CreateEntity();
+    reg.DestroyEntity(stale);
+    const Entity fresh = reg.CreateEntity();
+    ASSERT_EQ(fresh.GetID(), stale.GetID());
+
+    EXPECT_FALSE(reg.SetEnabled<Timer>(stale, false));
+    EXPECT_FALSE(reg.IsEnabled<Timer>(stale));             // stale: "not enabled" (Table answer)
+    EXPECT_TRUE(reg.IsEnabled<Timer>(fresh));              // the occupant was never disabled
+
+    reg.Clear();
+    const Entity afterClear = reg.CreateEntity();
+    ASSERT_EQ(afterClear.GetID(), fresh.GetID());
+    EXPECT_FALSE(reg.SetEnabled<Timer>(fresh, false));
+    EXPECT_TRUE(reg.IsEnabled<Timer>(afterClear));
+}
