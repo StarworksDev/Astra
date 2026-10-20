@@ -860,7 +860,7 @@ namespace Astra
             // A registry with no store never reads a descriptor kind (one bool check).
             if (m_componentStorage->HasAnyStore())
             {
-                if (const StorageKind kind = m_componentStorage->KindOf(componentId); kind != StorageKind::Table) ASTRA_UNLIKELY
+                if (const StorageKind kind = EnableKindOf(componentId); kind != StorageKind::Table) ASTRA_UNLIKELY
                     return SetEnabledInStore(entity, *rec, componentId, kind, enable);
             }
             if (!rec->archetype->GetMask().Test(componentId)) ASTRA_UNLIKELY
@@ -903,7 +903,7 @@ namespace Astra
                 return false;
             if (m_componentStorage->HasAnyStore())
             {
-                if (const StorageKind kind = m_componentStorage->KindOf(componentId); kind != StorageKind::Table) ASTRA_UNLIKELY
+                if (const StorageKind kind = EnableKindOf(componentId); kind != StorageKind::Table) ASTRA_UNLIKELY
                 {
                     if (kind == StorageKind::Sparse)
                     {
@@ -2276,11 +2276,20 @@ namespace Astra
         }
 
         // True when `id` is declared Universal in this registry: a bool load plus a mask
-        // test, and no descriptor read, so Table add/remove/SetEnabled/IsEnabled never pay
-        // for KindOf (false in a registry with no universal).
+        // test, and no descriptor read, so Table add/remove never pay for KindOf (false in
+        // a registry with no universal).
         ASTRA_NODISCARD bool IsUniversalId(ComponentID id) const noexcept
         {
             return m_componentStorage->HasUniversals() && m_componentStorage->IsDeclaredUniversal(id);
+        }
+
+        // Kind of `id` for SetEnabled/IsEnabled, with no descriptor read: Universal by the
+        // declared mask, Sparse iff the id owns a slot (a Sparse id with no slot has no set,
+        // and the Table mask test answers the same false/false), else Table.
+        ASTRA_NODISCARD StorageKind EnableKindOf(ComponentID id) const noexcept
+        {
+            if (IsUniversalId(id)) return StorageKind::Universal;
+            return m_componentStorage->SparseSlotOf(id) >= 0 ? StorageKind::Sparse : StorageKind::Table;
         }
 
         // Storage policies (spec s7.2): SetEnabled for a Sparse or Universal id. The STORE
