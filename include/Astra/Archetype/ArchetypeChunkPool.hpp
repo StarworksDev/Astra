@@ -135,12 +135,20 @@ namespace Astra
         template<typename T>
         void ConstructComponentAt(size_t index, T&& value)
         {
+            if constexpr (std::is_empty_v<std::decay_t<T>>)
+            {
+                return;   // a tag carries no value (and an enableable Table tag's column is bit-only)
+            }
             ComponentID id = TypeID<std::decay_t<T>>::Value();
             const int col = m_meta->idToColumn[id];
 
             if (col < 0) ASTRA_UNLIKELY
             {
-                return;  // absent or tag: no storage
+                // Spec 2026-10-01 s7.1, "no silent drops": the Registry diverts every
+                // Sparse/Universal value before archetype placement, so a non-empty value
+                // without a column here is a routing bug. Make it loud.
+                ASTRA_ASSERT(false, "ConstructComponentAt: component has no column in this archetype");
+                return;
             }
 
             const ComponentDescriptor& desc = *m_meta->columns[col].descriptor;

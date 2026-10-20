@@ -14,6 +14,7 @@
 #include "../Core/Base.hpp"
 #include "../Core/Tick.hpp"
 #include "../Entity/Entity.hpp"
+#include "SparseSet.hpp"
 #include "UniversalColumn.hpp"
 
 namespace Astra
@@ -148,9 +149,18 @@ namespace Astra
             for (const UniversalSpec& spec : m_universal)
                 if (UniversalColumn* column = FindUniversal(spec.id))
                     column->SetTickSource(tick);
+            for (ComponentID id : m_sparseIds)
+                m_sparseSets[id]->SetTickSource(tick);
         }
 
         ASTRA_NODISCARD bool HasUniversals() const noexcept { return !m_universal.empty(); }
+
+        // Mask-only: is `id` declared universal in this registry. Reads no descriptor, so a
+        // Table-trait Get/Has can decide its routing without touching the registry (G4).
+        ASTRA_NODISCARD bool IsDeclaredUniversal(ComponentID id) const noexcept
+        {
+            return id < MAX_COMPONENTS && m_universalMask.Test(id);
+        }
 
         // True once any universal column or sparse set exists. The Registry's destroy paths
         // skip the storage walk entirely while this is false (G4: Table-only registries pay
@@ -215,10 +225,43 @@ namespace Astra
             }
         }
 
+        // ================= Sparse sets (spec 2026-10-01 s4.1) =================
+
+        // Lookup without creation. Every read path uses this (RULINGS G2).
+        ASTRA_NODISCARD SparseSet* FindSparse(ComponentID id) const noexcept
+        {
+            return id < MAX_COMPONENTS ? m_sparseSets[id].get() : nullptr;
+        }
+
+        // The set for a Sparse-kind id. It is created on first use, which acquires the
+        // id's sparse slot (spec s3.2). Returns nullptr for any other kind, for an
+        // unregistered id, and once ASTRA_MAX_SPARSE_COMPONENTS slots are taken
+        // (AcquireSparseSlot asserts in Debug). The caller then refuses the component,
+        // so Release never silently writes it elsewhere. Insert-path only.
+        SparseSet* Sparse(ComponentID id)
+        {
+            if (id >= MAX_COMPONENTS || KindOf(id) != StorageKind::Sparse) ASTRA_UNLIKELY
+                return nullptr;
+            std::unique_ptr<SparseSet>& owned = m_sparseSets[id];
+            if (!owned) ASTRA_UNLIKELY
+            {
+                const ComponentDescriptor* desc = m_registry ? m_registry->GetComponentDescriptor(id) : nullptr;
+                if (!desc) ASTRA_UNLIKELY
+                    return nullptr;
+                if (SparseSlotOf(id) < 0 && AcquireSparseSlot(id) < 0) ASTRA_UNLIKELY
+                    return nullptr;
+                owned = std::make_unique<SparseSet>(*desc);
+                owned->SetTickSource(m_tickSource);
+                m_sparseIds.push_back(id);
+                ++m_storeCount;
+            }
+            return owned.get();
+        }
+
         // Destroy hook (spec s7.3). Called after EntityDestroyed and before the archetype
-        // swap-remove. Destroys e's slot in every universal column. Task 11 adds the
-        // sparse erase. Chunk C replaces that erase with the presence-block walk, which
-        // reads `chunk`/`index`.
+        // swap-remove. Destroys e's slot in every universal column and erases e from
+        // every sparse set. Chunk C replaces the sparse erase with the presence-block
+        // walk, which reads `chunk`/`index`.
         void OnEntityDestroyed(Entity e, ArchetypeChunk& chunk, size_t index)
         {
             (void)chunk;
@@ -226,6 +269,11 @@ namespace Astra
             for (const UniversalSpec& spec : m_universal)
                 if (UniversalColumn* column = FindUniversal(spec.id))
                     column->Destroy(e);
+            // Interim: erase from every existing set (O(sets)). Chunk C's destroy-walk
+            // task replaces this loop with the walk over `chunk`'s presence blocks at
+            // `index` (spec s7.3).
+            for (ComponentID id : m_sparseIds)
+                (void)m_sparseSets[id]->Erase(e);
         }
 
         // Registry::Clear (spec s7.3): destroys every element IN PLACE (cached Views stay
@@ -236,6 +284,8 @@ namespace Astra
             for (const UniversalSpec& spec : m_universal)
                 if (UniversalColumn* column = FindUniversal(spec.id))
                     column->Clear();
+            for (ComponentID id : m_sparseIds)
+                m_sparseSets[id]->Clear();   // the set and its slot survive (spec s7.3)
         }
 
     private:
@@ -252,6 +302,8 @@ namespace Astra
         std::array<ComponentID, MAX_SPARSE_COMPONENTS> m_componentOfSlot{};  // slot -> id, INVALID_COMPONENT = free
         size_t m_usedSlots = 0;
         std::array<std::unique_ptr<UniversalColumn>, MAX_COMPONENTS> m_universalColumns{};
+        std::array<std::unique_ptr<SparseSet>, MAX_COMPONENTS> m_sparseSets{};
+        std::vector<ComponentID> m_sparseIds;   // ids with a live set, in creation order
         const Tick* m_tickSource = nullptr;
         std::uint32_t m_storeCount = 0;   // columns + sparse sets created so far (HasAnyStore)
     };

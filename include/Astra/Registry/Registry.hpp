@@ -8,6 +8,7 @@
 #include <memory>
 #include <span>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "../Archetype/Archetype.hpp"
@@ -31,6 +32,7 @@
 #include "Query.hpp"
 #include "Relations.hpp"
 #include "RelationshipGraph.hpp"
+#include "StorageSplit.hpp"
 #include "View.hpp"
 
 namespace Astra
@@ -149,20 +151,13 @@ namespace Astra
             }
             else
             {
-                m_archetypeManager->AddEntity<Components...>(entity);
+                // Spec s7.1: Table members choose the archetype, Sparse members go to their
+                // sets, and a NAMED Universal member is left to ConstructUniversals (no
+                // value was passed, so default + init).
+                PlaceDefault<Components...>(entity);
                 ConstructUniversalsFor(entity, nullptr, 0);
-
                 m_signalManager.Emit<Events::EntityCreated>(entity);
-
-                if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
-                {
-                    // Get the entity location to retrieve components for signals
-                    auto* record = m_archetypeManager->GetEntityRecord(entity);
-                    if (record)
-                    {
-                        ((m_signalManager.Emit<Events::ComponentAdded>(entity, TypeID<Components>::Value(), record->archetype->GetComponent<Components>(record->location))), ...);
-                    }
-                }
+                EmitPackAdded<Components...>(entity);
                 EmitUniversalAdded(entity);
                 return entity;
             }
@@ -175,25 +170,17 @@ namespace Astra
             Entity entity = m_entityManager.Create();
             if (!entity.IsValid()) ASTRA_UNLIKELY
                 return Entity::Invalid();
-            
-            // Use AddEntityWith for components with values
-            m_archetypeManager->AddEntityWith(entity, std::forward<Components>(components)...);
-            ConstructUniversalsFor(entity, nullptr, 0);
-            
-            m_signalManager.Emit<Events::EntityCreated>(entity);
-            
-            if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
-            {
-                // Get the entity location to retrieve components for signals
-                auto* record = m_archetypeManager->GetEntityRecord(entity);
-                if (record)
-                {
-                    ((m_signalManager.Emit<Events::ComponentAdded>(entity, TypeID<std::decay_t<Components>>::Value(), record->archetype->GetComponent<std::decay_t<Components>>(record->location))), ...);
-                }
-            }
-            
-            EmitUniversalAdded(entity);
 
+            // Universal members the caller supplied: moved in by PlaceWith, so they skip
+            // default + init (spec s4.2: an explicitly supplied value is never overwritten).
+            ComponentID supplied[sizeof...(Components) > 0 ? sizeof...(Components) : 1]{};
+            size_t suppliedCount = 0;
+            PlaceWith(entity, supplied, suppliedCount, std::forward<Components>(components)...);
+            ConstructUniversalsFor(entity, supplied, suppliedCount);
+
+            m_signalManager.Emit<Events::EntityCreated>(entity);
+            EmitPackAdded<std::decay_t<Components>...>(entity);
+            EmitUniversalAdded(entity);
             return entity;
         }
 
@@ -211,35 +198,10 @@ namespace Astra
             if (created == 0) ASTRA_UNLIKELY
                 return 0;
 
-            // Use unified batch AddEntities - handles archetype selection internally
-            m_archetypeManager->AddEntities<Components...>(outEntities.subspan(0, created));
-            ConstructUniversalsForBatch(outEntities.subspan(0, created));
-
-            if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
-            {
-                for (size_t i = 0; i < created; ++i)
-                {
-                    m_signalManager.Emit<Events::EntityCreated>(outEntities[i]);
-                }
-            }
-
-            if constexpr (sizeof...(Components) > 0)
-            {
-                if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
-                {
-                    for (size_t i = 0; i < created; ++i)
-                    {
-                        auto* record = m_archetypeManager->GetEntityRecord(outEntities[i]);
-                        if (record)
-                        {
-                            ((m_signalManager.Emit<Events::ComponentAdded>(outEntities[i], TypeID<Components>::Value(), record->archetype->GetComponent<Components>(record->location))), ...);
-                        }
-                    }
-                }
-            }
-
-            EmitUniversalAddedBatch(outEntities.subspan(0, created));
-
+            const std::span<Entity> made = outEntities.subspan(0, created);
+            PlaceDefaultBatch<Components...>(made);
+            ConstructUniversalsForBatch(made);
+            EmitBatchCreated<Components...>(made);
             return created;
         }
 
@@ -257,31 +219,30 @@ namespace Astra
             if (created == 0) ASTRA_UNLIKELY
                 return 0;
 
-            m_archetypeManager->AddEntitiesWith<Components...>(outEntities.subspan(0, created), std::forward<Generator>(generator));
-            ConstructUniversalsForBatch(outEntities.subspan(0, created));
-
-            if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
+            const std::span<Entity> made = outEntities.subspan(0, created);
+            constexpr bool allTableTrait = ((StorageOfV<Components> == Storage::Table) && ...);
+            if (allTableTrait && !AnyUniversal<Components...>()) ASTRA_LIKELY
             {
-                for (size_t i = 0; i < created; ++i)
-                {
-                    m_signalManager.Emit<Events::EntityCreated>(outEntities[i]);
-                }
+                // Today's batched chunk-run path, unchanged (G4).
+                m_archetypeManager->AddEntitiesWith<Components...>(made, std::forward<Generator>(generator));
+                ConstructUniversalsForBatch(made);
             }
-
-            if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
+            else
             {
+                // Mixed storage: one entity at a time, calling the generator exactly once
+                // per index, in order (the Archetype::AddEntitiesWith contract).
                 for (size_t i = 0; i < created; ++i)
                 {
-                    auto* record = m_archetypeManager->GetEntityRecord(outEntities[i]);
-                    if (record)
+                    ComponentID supplied[sizeof...(Components) > 0 ? sizeof...(Components) : 1]{};
+                    size_t suppliedCount = 0;
+                    std::apply([&](auto&&... values)
                     {
-                        ((m_signalManager.Emit<Events::ComponentAdded>(outEntities[i], TypeID<Components>::Value(), record->archetype->GetComponent<Components>(record->location))), ...);
-                    }
+                        PlaceWith(made[i], supplied, suppliedCount, std::forward<decltype(values)>(values)...);
+                    }, generator(i));
+                    ConstructUniversalsFor(made[i], supplied, suppliedCount);
                 }
             }
-
-            EmitUniversalAddedBatch(outEntities.subspan(0, created));
-
+            EmitBatchCreated<Components...>(made);
             return created;
         }
 
@@ -1946,19 +1907,22 @@ namespace Astra
             return m_componentStorage->KindOf(id);
         }
 
-        // True when T's value lives in a ComponentStorage store rather than a chunk
-        // column. A Table-trait T is a store kind only when this registry declares it
-        // universal: one predictable bool load in a registry with no universal (G4).
-        // Task 11 adds the compile-time Sparse arm.
+        // True when T's value lives in a ComponentStorage store rather than a chunk column.
+        // A Sparse-trait T always routes to a store: its set, or its universal column when
+        // this registry declares it universal (decided at compile time). A Table-trait T
+        // routes to a store only when declared universal: a bool load plus a mask test, and
+        // no descriptor read, in a registry with no universal (G4).
         template<Component T>
         ASTRA_NODISCARD bool RoutesToStore() const noexcept
         {
-            return m_componentStorage->HasUniversals() && KindOfT<T>() == StorageKind::Universal;
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+                return true;
+            else
+                return m_componentStorage->HasUniversals() && m_componentStorage->IsDeclaredUniversal(TypeID<T>::Value());
         }
 
         // Non-stamping, type-erased store lookup: the element pointer (or
         // EmptyComponentSentinel() for a present tag), or nullptr when absent or stale.
-        // Task 11 adds the Sparse arm.
         ASTRA_NODISCARD void* StoreLookup(Entity entity, ComponentID id) const noexcept
         {
             if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
@@ -1969,6 +1933,11 @@ namespace Astra
                 {
                     UniversalColumn* column = m_componentStorage->FindUniversal(id);
                     return column ? column->Get(entity) : nullptr;
+                }
+                case StorageKind::Sparse:
+                {
+                    SparseSet* set = m_componentStorage->FindSparse(id);
+                    return set ? set->Get(entity) : nullptr;
                 }
                 default:
                     return nullptr;
@@ -2056,6 +2025,232 @@ namespace Astra
             m_signalManager.Emit<Events::EntityCreated>(preallocated);
             EmitUniversalAdded(preallocated);
             return preallocated;
+        }
+
+        // True if any of Ts is declared universal in this registry. Table-trait members
+        // only reach the archetype in one piece when this is false.
+        template<Component... Ts>
+        ASTRA_NODISCARD bool AnyUniversal() const noexcept
+        {
+            if constexpr (sizeof...(Ts) == 0)
+                return false;
+            else
+                return m_componentStorage->HasUniversals() && ((KindOfT<Ts>() == StorageKind::Universal) || ...);
+        }
+
+        // One default-constructed (named, no value) member, by its runtime kind. Used for
+        // Sparse-trait members always, and for Table-trait members only on the rare path
+        // where a pack names a universal type.
+        template<Component C>
+        void PlaceDefaultMember(Entity entity)
+        {
+            m_componentRegistry->RegisterComponent<C>();   // KindOf needs the descriptor (Sparse trait)
+            const ComponentID id = TypeID<C>::Value();
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return;
+            // Release: a Sparse member past the 32-slot cap is dropped here (Sparse() returns
+            // nullptr). Debug asserts in AcquireSparseSlot; a creator has no return channel
+            // for spec s3.2's Release refusal (ledgered deviation).
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Table:
+                    (void)m_archetypeManager->AddComponent<C>(entity);
+                    break;
+                case StorageKind::Sparse:
+                    if (SparseSet* set = m_componentStorage->Sparse(id); set && !set->Contains(entity)) ASTRA_LIKELY
+                        (void)set->Insert(entity);
+                    break;
+                case StorageKind::Universal:
+                    break;   // ConstructUniversals builds it: named only, so default + init
+            }
+        }
+
+        template<Component... Components>
+        void PlaceDefault(Entity entity)
+        {
+            [&]<typename... Ts>(std::type_identity<std::tuple<Ts...>>)
+            {
+                if (!AnyUniversal<Ts...>()) ASTRA_LIKELY
+                {
+                    m_archetypeManager->AddEntity<Ts...>(entity);   // today's path
+                }
+                else
+                {
+                    m_archetypeManager->AddEntity<>(entity);        // root, then one member at a time
+                    (PlaceDefaultMember<Ts>(entity), ...);
+                }
+            }(std::type_identity<Detail::TypesWithStorage<Storage::Table, Components...>>{});
+
+            [&]<typename... Ss>(std::type_identity<std::tuple<Ss...>>)
+            {
+                (PlaceDefaultMember<Ss>(entity), ...);
+            }(std::type_identity<Detail::TypesWithStorage<Storage::Sparse, Components...>>{});
+        }
+
+        template<Component... Components>
+        void PlaceDefaultBatch(std::span<Entity> entities)
+        {
+            [&]<typename... Ts>(std::type_identity<std::tuple<Ts...>>)
+            {
+                if (!AnyUniversal<Ts...>()) ASTRA_LIKELY
+                {
+                    m_archetypeManager->AddEntities<Ts...>(entities);   // today's batched path
+                }
+                else
+                {
+                    m_archetypeManager->AddEntities<>(entities);
+                    for (Entity e : entities)
+                    {
+                        (PlaceDefaultMember<Ts>(e), ...);
+                    }
+                }
+            }(std::type_identity<Detail::TypesWithStorage<Storage::Table, Components...>>{});
+
+            [&]<typename... Ss>(std::type_identity<std::tuple<Ss...>>)
+            {
+                if constexpr (sizeof...(Ss) > 0)
+                {
+                    for (Entity e : entities)
+                    {
+                        (PlaceDefaultMember<Ss>(e), ...);
+                    }
+                }
+            }(std::type_identity<Detail::TypesWithStorage<Storage::Sparse, Components...>>{});
+        }
+
+        // One SUPPLIED member, by its runtime kind. An rvalue is moved straight from the
+        // caller's object; an lvalue is copied through a temporary, as ArchetypeChunk's
+        // ConstructComponentAt does. Universal members are recorded in `supplied`, so
+        // ConstructUniversals skips their default + init.
+        template<typename V>
+        void PlaceValueMember(Entity entity, ComponentID* supplied, size_t& suppliedCount, V&& value)
+        {
+            using C = std::decay_t<V>;
+            m_componentRegistry->RegisterComponent<C>();
+            const ComponentID id = TypeID<C>::Value();
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return;
+
+            const auto moveInto = [&](auto&& sink)
+            {
+                if constexpr (std::is_rvalue_reference_v<V&&> && !std::is_const_v<std::remove_reference_t<V>>)
+                {
+                    (void)sink(static_cast<void*>(std::addressof(value)));
+                }
+                else
+                {
+                    C temp(value);
+                    (void)sink(static_cast<void*>(std::addressof(temp)));
+                }
+            };
+
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Table:
+                    (void)m_archetypeManager->AddComponent<C>(entity, std::forward<V>(value));
+                    break;
+                case StorageKind::Sparse:
+                    if (SparseSet* set = m_componentStorage->Sparse(id); set && !set->Contains(entity)) ASTRA_LIKELY
+                        moveInto([&](void* src) { return set->InsertMove(entity, src); });
+                    break;
+                case StorageKind::Universal:
+                    if (UniversalColumn* column = m_componentStorage->Universal(id); column && !column->IsLive(entity)) ASTRA_LIKELY
+                    {
+                        moveInto([&](void* src) { return column->ConstructMove(entity, src); });
+                        supplied[suppliedCount++] = id;
+                    }
+                    break;
+            }
+        }
+
+        // Places a value pack (spec s7.1). Table-trait members go to the archetype in ONE
+        // placement (today's AddEntityWith) unless one of them is declared universal. In
+        // that rare case: the root first, then member by member. Sparse-trait members go to
+        // their sets afterwards. The forwarding tuple carries every value exactly once.
+        template<typename... Vs>
+        void PlaceWith(Entity entity, ComponentID* supplied, size_t& suppliedCount, Vs&&... values)
+        {
+            auto refs = std::forward_as_tuple(std::forward<Vs>(values)...);
+            using Refs = decltype(refs);
+
+            [&]<std::size_t... I>(std::index_sequence<I...>)
+            {
+                if constexpr (sizeof...(I) == 0)
+                {
+                    m_archetypeManager->AddEntity<>(entity);
+                }
+                else
+                {
+                    if (!AnyUniversal<std::decay_t<std::tuple_element_t<I, Refs>>...>()) ASTRA_LIKELY
+                    {
+                        m_archetypeManager->AddEntityWith(entity, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))...);
+                    }
+                    else
+                    {
+                        m_archetypeManager->AddEntity<>(entity);
+                        (PlaceValueMember(entity, supplied, suppliedCount, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))), ...);
+                    }
+                }
+            }(Detail::StorageIndexSeq<Storage::Table, Vs...>{});
+
+            [&]<std::size_t... I>(std::index_sequence<I...>)
+            {
+                (PlaceValueMember(entity, supplied, suppliedCount, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))), ...);
+            }(Detail::StorageIndexSeq<Storage::Sparse, Vs...>{});
+        }
+
+        // ComponentAdded for one pack member, by its runtime kind (Table: the chunk slot,
+        // today's payload; Sparse: the set element, or the per-type static for a tag).
+        // Universal members are skipped here because EmitUniversalAdded covers each
+        // universal exactly once.
+        template<Component C>
+        void EmitAddedFor(Entity entity)
+        {
+            const ComponentID id = TypeID<C>::Value();
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return;
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Table:
+                    if (const EntityRecord* record = m_archetypeManager->GetEntityRecord(entity))
+                        m_signalManager.Emit<Events::ComponentAdded>(entity, id, record->archetype->GetComponent<C>(record->location));
+                    break;
+                case StorageKind::Sparse:
+                    if (C* component = StoreGet<C>(entity))
+                        m_signalManager.Emit<Events::ComponentAdded>(entity, id, component);
+                    break;
+                case StorageKind::Universal:
+                    break;
+            }
+        }
+
+        template<Component... Components>
+        void EmitPackAdded(Entity entity)
+        {
+            if constexpr (sizeof...(Components) > 0)
+            {
+                if (!m_signalManager.IsSignalEnabled(Signal::ComponentAdded)) ASTRA_LIKELY
+                    return;
+                (EmitAddedFor<Components>(entity), ...);
+            }
+        }
+
+        // Batch twin of the single-entity tail: every EntityCreated first, then the pack's
+        // ComponentAdded for every entity, then the universals' (today's batch order).
+        template<Component... Components>
+        void EmitBatchCreated(std::span<Entity> made)
+        {
+            if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
+            {
+                for (Entity e : made)
+                    m_signalManager.Emit<Events::EntityCreated>(e);
+            }
+            if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
+            {
+                for (Entity e : made)
+                    EmitPackAdded<Components...>(e);
+            }
+            EmitUniversalAddedBatch(made);   // today's batch order: the pack's ComponentAdded for every entity, then the universals'
         }
 
         /**

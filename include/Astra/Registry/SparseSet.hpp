@@ -66,6 +66,8 @@ namespace Astra
             return d == INVALID_INDEX ? nullptr : ElementPtr(d);
         }
 
+        // Precondition: `e` is the id's LIVE handle (the caller checked IsValid / the entity
+        // record). The stale-entry eviction branch assumes the held handle is older.
         void* Insert(Entity e) { return InsertImpl(e, nullptr); }
         void* InsertMove(Entity e, void* src) { return InsertImpl(e, src); }
 
