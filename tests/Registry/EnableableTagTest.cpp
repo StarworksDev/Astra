@@ -283,3 +283,223 @@ TEST(EnableableTag, InspectorReadsTheBitOnlyColumnAsZeroBytes)
     }
     EXPECT_TRUE(sawBitOnly);
 }
+
+// ---------------- Serialization (spec s3.2: zero data bytes + the disabled section) ----------------
+
+TEST(EnableableTagSerialization, RoundTripsInLz4AndNoneIncludingTagOnlyArchetypes)
+{
+    for (const Astra::CompressionMode mode : {Astra::CompressionMode::LZ4, Astra::CompressionMode::None})
+    {
+        SCOPED_TRACE(mode == Astra::CompressionMode::LZ4 ? "LZ4" : "None");
+        Astra::Registry reg;
+        constexpr size_t N = 3000;                                // spans chunks
+        std::vector<Astra::Entity> es(N);
+        ASSERT_EQ((reg.CreateEntitiesWith<Position, EnTag>(N, std::span{es},
+            [](size_t i) { return std::tuple{Position{static_cast<float>(i), 0.0f, 0.0f}, EnTag{}}; })), N);
+        std::vector<bool> expected(N, true);
+        for (size_t i = 0; i < N; i += 3)
+        {
+            reg.SetEnabled<EnTag>(es[i], false);
+            expected[i] = false;
+        }
+        std::vector<Astra::Entity> tagOnly;
+        for (int i = 0; i < 70; ++i)
+            tagOnly.push_back(reg.CreateEntity<EnTag>());
+        reg.SetEnabled<EnTag>(tagOnly[5], false);
+        reg.SetEnabled<EnTag>(tagOnly[64], false);
+
+        Astra::Registry::SaveConfig cfg;
+        cfg.compressionMode = mode;
+        auto saved = reg.Save(cfg);
+        ASSERT_TRUE(saved.IsOk());
+
+        auto creg = std::make_shared<Astra::ComponentRegistry>();
+        creg->RegisterComponents<Position, EnTag>();
+        auto loaded = Astra::Registry::Load(std::span<const std::byte>(*saved.GetValue()), creg);
+        ASSERT_TRUE(loaded.IsOk());
+        Astra::Registry& out = **loaded.GetValue();
+
+        for (size_t i = 0; i < N; ++i)
+        {
+            ASSERT_TRUE(out.HasComponent<EnTag>(es[i])) << i;
+            EXPECT_EQ(out.IsEnabled<EnTag>(es[i]), expected[i]) << i;
+            const Position* p = out.GetComponent<Position>(es[i]);
+            ASSERT_NE(p, nullptr);
+            EXPECT_EQ(p->x, static_cast<float>(i));
+        }
+        for (int i = 0; i < 70; ++i)
+            EXPECT_EQ(out.IsEnabled<EnTag>(tagOnly[i]), i != 5 && i != 64) << i;
+        ExpectBitInvariant(out);
+    }
+}
+
+TEST(EnableableTagSerialization, BitOnlyColumnWritesZeroDataBytes)
+{
+    // Two registries with the same shape, one with the enableable tag and one with a plain
+    // tag. Both archives match except the tag column block. The plain tag writes nothing.
+    // EnTag writes ZERO data bytes, then disabledCount (4) + ceil(100/64) == 2 words (16).
+    // 100 entities fit one 4 KB chunk in both layouts.
+    Astra::Registry::SaveConfig cfg;
+    cfg.compressionMode = Astra::CompressionMode::None;
+    Astra::Registry withEnTag;
+    Astra::Registry withPlayer;
+    for (int i = 0; i < 100; ++i)
+    {
+        withEnTag.CreateEntity<Position, EnTag>();
+        withPlayer.CreateEntity<Position, Player>();
+    }
+    auto a = withEnTag.Save(cfg);
+    auto b = withPlayer.Save(cfg);
+    ASSERT_TRUE(a.IsOk());
+    ASSERT_TRUE(b.IsOk());
+    EXPECT_EQ(a.GetValue()->size(), b.GetValue()->size() + sizeof(uint32_t) + 2 * sizeof(uint64_t));
+}
+
+namespace
+{
+    // Hand-built single-archetype {EnTag, Position} archive at format v5, following
+    // the field order of Archetype::Serialize (see the legacy-format tests in
+    // BinarySerializationTests). Version 5 is HARDCODED: it is the last format before the
+    // storage-policies bump to 6, and v5 archives stay loadable. Five entities in one
+    // chunk, EnTag first in descriptor order.
+    //   withSection == false: a writer whose EnTag was a PLAIN tag. Flag 0, no column block.
+    //   withSection == true:  a writer that stored EnTag as a bit-only column. Flag 1, zero
+    //                         data bytes, then disabledCount 2 + one word with slots 1 and 3 set.
+    constexpr uint32_t kTagArchiveCount = 5;
+
+    void BuildTagArchive(std::vector<std::byte>& buf, const Astra::ComponentDescriptor& tag,
+                         const Astra::ComponentDescriptor& pos, bool withSection)
+    {
+        Astra::BinaryHeader header;                               // magic/endianness, compression None
+        header.version = 5;
+        const auto* raw = reinterpret_cast<const std::byte*>(&header);
+        buf.insert(buf.end(), raw, raw + sizeof(header));
+        {
+            Astra::BinaryWriter writer(buf);                      // memory mode appends after the header
+            Astra::ComponentMask mask;
+            mask.Set(tag.id);
+            mask.Set(pos.id);
+            for (size_t i = 0; i < Astra::ComponentMask::WORD_COUNT; ++i)
+                writer(mask.Data()[i]);
+            writer(static_cast<uint64_t>(kTagArchiveCount));      // archetype entityCount
+            writer(static_cast<uint64_t>(8));                     // entitiesPerChunk bound
+            writer(static_cast<uint32_t>(1));                     // chunkCount
+            writer(static_cast<uint32_t>(2));                     // descriptorCount
+            for (const Astra::ComponentDescriptor* d : {&tag, &pos})
+            {
+                writer(d->hash);
+                writer(static_cast<uint64_t>(d->size));
+                writer(static_cast<uint64_t>(d->alignment));
+                writer(d->version);
+                writer(static_cast<uint8_t>((d == &tag && withSection) ? 1 : 0));   // IM-9 has-section flag
+            }
+            writer(kTagArchiveCount);                             // chunk 0 entity count
+            for (uint32_t i = 0; i < kTagArchiveCount; ++i)
+                writer(Astra::Entity(i + 1, 1));
+            if (withSection)                                      // EnTag block: no data, then the section
+            {
+                writer(static_cast<uint32_t>(2));
+                writer(static_cast<uint64_t>((1ull << 1) | (1ull << 3)));
+            }
+            for (uint32_t i = 0; i < kTagArchiveCount; ++i)       // Position block
+            {
+                Position p{static_cast<float>(i), 1.0f, 2.0f};
+                writer.WriteVersionedComponent(p);
+            }
+        }
+    }
+}
+
+TEST(EnableableTagSerialization, ArchiveFromAPlainTagWriterLoadsAllEnabled)
+{
+    auto cr = std::make_shared<Astra::ComponentRegistry>();
+    cr->RegisterComponents<EnTag, Position>();
+    const Astra::ComponentDescriptor* tag = cr->GetComponentDescriptor(Astra::TypeID<EnTag>::Value());
+    const Astra::ComponentDescriptor* pos = cr->GetComponentDescriptor(Astra::TypeID<Position>::Value());
+    ASSERT_NE(tag, nullptr);
+    ASSERT_NE(pos, nullptr);
+    std::vector<Astra::ComponentDescriptor> descriptors;
+    cr->GetAllDescriptors(descriptors);
+
+    std::vector<std::byte> buf;
+    BuildTagArchive(buf, *tag, *pos, /*withSection=*/false);
+    Astra::BinaryReader reader{std::span<const std::byte>(buf)};
+    ASSERT_TRUE(reader.ReadHeader().IsOk());
+    Astra::ArchetypeChunkPool pool;
+    auto result = Astra::Archetype::Deserialize(reader, descriptors, &pool);
+    ASSERT_TRUE(result.IsOk()) << "flag 0 => no EnTag block in the stream; the reader must not expect one";
+    auto archetype = std::move(*result.GetValue());
+
+    const int col = archetype->GetColumnMeta().idToColumn[tag->id];
+    ASSERT_GE(col, 0);                                            // THIS build stores EnTag as a bit-only column
+    Astra::ArchetypeChunk& chunk = *archetype->GetChunks()[0];
+    EXPECT_EQ(chunk.GetDisabledCount(col), 0u);
+    for (uint32_t i = 0; i < kTagArchiveCount; ++i)
+    {
+        EXPECT_FALSE(chunk.IsDisabled(col, i)) << i;
+        EXPECT_EQ(chunk.GetComponent<Position>(i)->x, static_cast<float>(i)) << "stream desync at " << i;
+    }
+}
+
+TEST(EnableableTagSerialization, BitOnlySectionAppliesWhenThisBuildHasTheColumn)
+{
+    auto cr = std::make_shared<Astra::ComponentRegistry>();
+    cr->RegisterComponents<EnTag, Position>();
+    const Astra::ComponentDescriptor* tag = cr->GetComponentDescriptor(Astra::TypeID<EnTag>::Value());
+    const Astra::ComponentDescriptor* pos = cr->GetComponentDescriptor(Astra::TypeID<Position>::Value());
+    ASSERT_NE(tag, nullptr);
+    ASSERT_NE(pos, nullptr);
+    std::vector<Astra::ComponentDescriptor> descriptors;
+    cr->GetAllDescriptors(descriptors);
+
+    std::vector<std::byte> buf;
+    BuildTagArchive(buf, *tag, *pos, /*withSection=*/true);
+    Astra::BinaryReader reader{std::span<const std::byte>(buf)};
+    ASSERT_TRUE(reader.ReadHeader().IsOk());
+    Astra::ArchetypeChunkPool pool;
+    auto result = Astra::Archetype::Deserialize(reader, descriptors, &pool);
+    ASSERT_TRUE(result.IsOk());
+    auto archetype = std::move(*result.GetValue());
+
+    const int col = archetype->GetColumnMeta().idToColumn[tag->id];
+    ASSERT_GE(col, 0);
+    Astra::ArchetypeChunk& chunk = *archetype->GetChunks()[0];
+    EXPECT_EQ(chunk.GetDisabledCount(col), 2u);
+    for (uint32_t i = 0; i < kTagArchiveCount; ++i)
+    {
+        EXPECT_EQ(chunk.IsDisabled(col, i), i == 1 || i == 3) << i;
+        EXPECT_EQ(chunk.GetComponent<Position>(i)->x, static_cast<float>(i)) << "stream desync at " << i;
+    }
+}
+
+TEST(EnableableTagSerialization, BitOnlySectionIsConsumedWhenThisBuildHasNoColumn)
+{
+    // The archive writer stored EnTag as a bit-only column (flag 1). Simulate a loading
+    // build where EnTag is a PLAIN tag by clearing isEnableable on the descriptor copy
+    // handed to Deserialize. The section must be consumed (stream stays in sync) and dropped.
+    auto cr = std::make_shared<Astra::ComponentRegistry>();
+    cr->RegisterComponents<EnTag, Position>();
+    const Astra::ComponentDescriptor* tag = cr->GetComponentDescriptor(Astra::TypeID<EnTag>::Value());
+    const Astra::ComponentDescriptor* pos = cr->GetComponentDescriptor(Astra::TypeID<Position>::Value());
+    ASSERT_NE(tag, nullptr);
+    ASSERT_NE(pos, nullptr);
+    std::vector<Astra::ComponentDescriptor> descriptors;
+    cr->GetAllDescriptors(descriptors);
+    for (Astra::ComponentDescriptor& d : descriptors)
+        if (d.id == tag->id)
+            d.isEnableable = false;
+
+    std::vector<std::byte> buf;
+    BuildTagArchive(buf, *tag, *pos, /*withSection=*/true);
+    Astra::BinaryReader reader{std::span<const std::byte>(buf)};
+    ASSERT_TRUE(reader.ReadHeader().IsOk());
+    Astra::ArchetypeChunkPool pool;
+    auto result = Astra::Archetype::Deserialize(reader, descriptors, &pool);
+    ASSERT_TRUE(result.IsOk()) << "flag 1 => the section must be consumed even with no local column";
+    auto archetype = std::move(*result.GetValue());
+
+    EXPECT_EQ(archetype->GetColumnMeta().idToColumn[tag->id], -1);   // plain tag here: no column
+    Astra::ArchetypeChunk& chunk = *archetype->GetChunks()[0];
+    for (uint32_t i = 0; i < kTagArchiveCount; ++i)
+        EXPECT_EQ(chunk.GetComponent<Position>(i)->x, static_cast<float>(i)) << "stream desync at " << i;
+}

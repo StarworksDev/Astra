@@ -964,14 +964,14 @@ namespace Astra
                     writer(entities[i]);
                 }
                 
-                // Write component arrays (SOA layout)
+                // Write component arrays (SOA layout). One block per COLUMN: every data
+                // component, and every enableable tag's bit-only column (zero data bytes +
+                // its disabled section, spec 2026-10-01 s3.2). A non-enableable tag has no
+                // column and writes nothing -- byte-identical to the earlier format.
                 for (const auto& desc : m_componentDescriptors)
                 {
-                    void* componentArray = chunk->GetComponentArrayByID(desc.id);
-                    if (!componentArray) continue;
+                    if (m_columnMeta.idToColumn[desc.id] < 0) continue;
 
-                    // (componentArray null / tag columns already skipped by the
-                    //  `if (!componentArray) continue;` above)
                     if (writer.GetCompressionMode() == CompressionMode::LZ4)
                     {
                         // Per-column block (orthogonal to versioning): serialize the
@@ -1270,8 +1270,13 @@ namespace Astra
                 for (size_t di = 0; di < descriptors.size(); ++di)
                 {
                     const ComponentDescriptor& desc = descriptors[di];
-                    void* componentArray = chunk->GetComponentArrayByID(desc.id);
-                    if (!componentArray) continue;
+                    // A block follows iff the WRITER had a column: every data component, and a
+                    // tag only when the writer stored it as an enableable bit-only column --
+                    // which the archive records as the has-disabled-section flag (IM-9). Keyed
+                    // on the ARCHIVE, never on this build's column, so a tag whose
+                    // enableability differs between builds keeps the stream in sync.
+                    const bool archiveHasColumn = desc.size != 0 || diskHasDisabledSection[di] != 0;
+                    if (!archiveHasColumn) continue;
 
                     // Mirror of the write path (Serialize above): LZ4 archives wrap
                     // each column in a compressed block, so read+decompress it into a
@@ -1541,9 +1546,9 @@ namespace Astra
         // followed by the column's disabled-bit section iff it is enableable.
         // Extracted verbatim from Serialize()'s per-column loop body (Task 2 of
         // the LZ4 per-column compression plan, NO behavior change) so Task 3's
-        // compressed-column path can reuse it. Caller guarantees
-        // chunk->GetComponentArrayByID(desc.id) is non-null (null/tag columns
-        // are skipped before calling).
+        // compressed-column path can reuse it. Caller guarantees desc has a column
+        // here (idToColumn >= 0): a data column, or an enableable tag's bit-only
+        // column, which writes ZERO data bytes and then its disabled section.
         void SerializeColumn(BinaryWriter& w, ArchetypeChunk* chunk, const ComponentDescriptor& desc, size_t chunkEntityCount) const
         {
             void* componentArray = chunk->GetComponentArrayByID(desc.id);
@@ -1561,7 +1566,8 @@ namespace Astra
             // chunkEntityCount elements -- a stream desync with no other trip.
             ASTRA_ASSERT(desc.serializeVersioned || desc.serialize,
                 "SerializeColumn: component descriptor has no serialize hook");
-            if (desc.serializeVersioned || desc.serialize)
+            // desc.size == 0: an enableable tag's bit-only column -- no data, zero bytes.
+            if (desc.size != 0 && (desc.serializeVersioned || desc.serialize))
             {
                 // For custom serialization, we can't compress the whole array
                 // as each component is serialized individually
@@ -1591,9 +1597,8 @@ namespace Astra
             // is unchanged by this feature (beyond the version-constant bump).
             if (desc.isEnableable)
             {
-                // Tag components (desc.size == 0) never reach here -- their
-                // componentArray is null and the caller's null-skip already
-                // skipped them -- so this ordinal is always a real storage column.
+                // An enableable tag reaches here through its bit-only column
+                // (zero data bytes above); every admitted desc has idToColumn >= 0.
                 const int col = m_columnMeta.idToColumn[desc.id];
                 w(chunk->GetDisabledCount(col));
 
@@ -1619,9 +1624,11 @@ namespace Astra
         // validates, and applies the column's disabled-bit section. Extracted
         // verbatim from Deserialize()'s per-column loop body (Task 2 of the LZ4
         // per-column compression plan, NO behavior change) so Task 3's
-        // compressed-column path can reuse it. Caller guarantees
-        // chunk->GetComponentArrayByID(desc.id) is non-null (null/tag columns
-        // are skipped before calling); hasDisabledSection is the per-descriptor
+        // compressed-column path can reuse it. Called iff the ARCHIVE holds a block
+        // for desc (desc.size != 0 || hasDisabledSection). For a tag that block is zero
+        // data bytes plus the section; when THIS build has no column for the tag (not
+        // enableable here) the section is consumed, validated and dropped below.
+        // hasDisabledSection is the per-descriptor
         // disk flag (diskHasDisabledSection[di], IM-9), not this build's
         // desc.isEnableable. Static (like Deserialize itself): archetype is
         // passed explicitly rather than accessed via `this`.
@@ -1639,7 +1646,8 @@ namespace Astra
             // silently read zero bytes for chunkEntityCount elements -> stream desync.
             ASTRA_ASSERT(desc.deserializeVersioned || desc.deserialize,
                 "DeserializeColumn: component descriptor has no deserialize hook");
-            if (desc.deserializeVersioned || desc.deserialize)
+            // desc.size == 0: a tag's block carries no data (bit-only column) -- read nothing.
+            if (desc.size != 0 && (desc.deserializeVersioned || desc.deserialize))
             {
                 // For custom deserialization, components are not compressed
                 // as they were serialized individually
