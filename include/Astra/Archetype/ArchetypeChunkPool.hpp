@@ -831,7 +831,7 @@ namespace Astra
         // component pays 4 bytes per chunk per column). `column` is a storage-column
         // ORDINAL (m_meta->columns index), never a ComponentID. The region is carved
         // in the chunk arena right after the column data (see InitializeColumns) and
-        // is zero-initialised: version 0 == "never stamped". Stamps are plain stores.
+        // is zero-initialised: version 0 == "never stamped". Stamps are plain stores on serial paths, check-before-store relaxed atomic_ref under Par.
 
         // `Par`: a parallel driver whose workers can share this chunk (a sparse-driven
         // dense range is not chunk-partitioned) uses relaxed atomic access (RULINGS Task 28).
@@ -850,7 +850,7 @@ namespace Astra
         {
             ASTRA_ASSERT(column >= 0 && column < m_meta->columnCount, "column ordinal out of range");
             if constexpr (Par)
-                StoreTickRelaxed(m_columnVersion[column], tick);
+                StampTickShared(m_columnVersion[column], tick);
             else
                 m_columnVersion[column] = tick;
         }

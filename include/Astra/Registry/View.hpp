@@ -447,6 +447,8 @@ namespace Astra
 
             // No scheduler, or workload below the parallel thresholds: walk every
             // chunk inline, in flat order -- deterministic, no thread fan-out.
+            // (This archetype-driven inline path still runs ParallelForEachChunkImpl, i.e. Par=true
+            // atomics on one thread: harmless. Only the sparse-driven inline path uses Par=false.)
             if (!m_scheduler ||
                 quickCount < MIN_ENTITIES_QUICK_CHECK ||
                 totalMatchingEntities < MIN_ENTITIES_FOR_PARALLEL ||

@@ -317,7 +317,7 @@ namespace Astra
             if (id < MAX_COMPONENTS) ASTRA_LIKELY
             {
                 if constexpr (Par)
-                    StoreTickRelaxed(m_coarseVersion[id], tick);
+                    StampTickShared(m_coarseVersion[id], tick);
                 else
                     m_coarseVersion[id] = tick;
             }

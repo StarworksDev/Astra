@@ -51,6 +51,17 @@ namespace Astra
     }
 
     /**
+     * Check-before-store for a shared stamp slot a parallel walk hits once per ENTITY: after
+     * the first worker stores `now`, the line stays shared and read-only instead of bouncing
+     * in exclusive state between workers on every entity.
+     */
+    inline void StampTickShared(Tick& slot, Tick now) noexcept
+    {
+        if (LoadTickRelaxed(slot) != now)
+            StoreTickRelaxed(slot, now);
+    }
+
+    /**
      * Per-entity ticks for a change-tracked column (spec §3.2, opt-in tier):
      * `added` = the tick the component was added to this entity, `changed` = the
      * tick of the last mark. 8 bytes per entity per tracked column, carved into

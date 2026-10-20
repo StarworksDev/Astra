@@ -142,7 +142,7 @@ namespace Astra
             if (!page) ASTRA_UNLIKELY
                 return false;
             if constexpr (Par)
-                StoreTickRelaxed(page->version, now);
+                StampTickShared(page->version, now);
             else
                 page->version = now;
             if (page->ticks)
