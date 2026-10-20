@@ -244,3 +244,50 @@ TEST(StorageViewFilter, UniversalPageCursorRetestsLiveness)
     EXPECT_NE(col->GetCached(b2, cur), nullptr);
     EXPECT_EQ(col->GetCached(b, cur), nullptr);               // the stale handle still misses
 }
+
+// s4.3 memory safety: a callback that destroys every entity of a single-page chunk frees the
+// Universal page the walk's cursor is sitting on. The walk must finish without touching it.
+TEST(StorageViewFilter, UniversalWalkSurvivesDestroyingTheWholePage)
+{
+    auto reg = MakeRegistry<Health>();
+    std::vector<Astra::Entity> es;
+    for (int i = 0; i < 8; ++i) es.push_back(reg->CreateEntity<Position>());
+
+    size_t visits = 0;
+    reg->CreateView<Position, Health>().ForEach([&](Astra::Entity, Position&, Health&)
+    {
+        if (++visits == 1)
+            for (Astra::Entity e : es) reg->DestroyEntity(e);
+    });
+    EXPECT_EQ(visits, 1u);
+    EXPECT_EQ((reg->CreateView<Position, Health>().Size()), 0u);
+    size_t after = 0;
+    reg->CreateView<Position, Health>().ForEach([&](Astra::Entity, Position&, Health&) { ++after; });
+    EXPECT_EQ(after, 0u);
+    EXPECT_TRUE(reg->ValidateStorageInvariants().empty());
+}
+
+// Same, but the callback also recycles ids (create after destroy), so a fresh page may take
+// the freed page's index while the walk still holds the old one.
+TEST(StorageViewFilter, UniversalWalkSurvivesDestroyThenCreateInTheCallback)
+{
+    auto reg = MakeRegistry<Health>();
+    std::vector<Astra::Entity> es;
+    for (int i = 0; i < 8; ++i) es.push_back(reg->CreateEntity<Position>());
+
+    size_t visits = 0;
+    reg->CreateView<Position, Health>().ForEach([&](Astra::Entity, Position&, Health&)
+    {
+        if (++visits == 1)
+        {
+            for (Astra::Entity e : es) reg->DestroyEntity(e);
+            for (int i = 0; i < 8; ++i) reg->CreateEntity<Position>();
+        }
+    });
+    EXPECT_GE(visits, 1u);
+    EXPECT_EQ((reg->CreateView<Position, Health>().Size()), 8u);
+    size_t after = 0;
+    reg->CreateView<Position, Health>().ForEach([&](Astra::Entity, Position&, Health&) { ++after; });
+    EXPECT_EQ(after, 8u);
+    EXPECT_TRUE(reg->ValidateStorageInvariants().empty());
+}

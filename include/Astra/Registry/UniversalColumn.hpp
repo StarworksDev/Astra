@@ -241,33 +241,31 @@ namespace Astra
         };
 
     public:
-        // Sequential-walk cursor (View's storage path): remembers the last page so a run of
-        // entities in one ASTRA_UNIVERSAL_PAGE_SLOTS page resolves the page once. The cursor
-        // must not outlive a structural change: a Destroy that empties a page frees it.
+        // Sequential-walk cursor (View's storage path): remembers the last page index so a
+        // run of entities in one ASTRA_UNIVERSAL_PAGE_SLOTS page skips the index recompute.
+        // The page POINTER is re-read from the owning table on every call, so a callback that
+        // destroys entities (freeing an emptied page) or recycles ids onto a fresh page
+        // mid-walk is safe: the cursor never holds a pointer across a user callback.
         struct Cursor
         {
-            const Page* page = nullptr;
             std::size_t index = ~std::size_t(0);
         };
 
-        // Get(e) with the page lookup cached in `c`. Still re-tests the slot's live bit and
-        // the stored handle for EVERY call (one bit test + one compare), so a slot that is
-        // not live -- a suspended universal after a module unload (spec s4.4), a stale
-        // handle -- answers nullptr instead of unconstructed memory.
+        // Get(e) with the page lookup cached in `c`. Re-reads m_pages[page] and re-tests the
+        // slot's live bit and the stored handle for EVERY call (one bounds check, one load,
+        // one bit test, one compare), so a slot that is not live -- a suspended universal
+        // after a module unload (spec s4.4), a stale handle, a freed page -- answers nullptr.
         ASTRA_NODISCARD void* GetCached(Entity e, Cursor& c) const noexcept
         {
             const std::size_t pageIndex = PageOf(e);
-            if (pageIndex != c.index) ASTRA_UNLIKELY
-            {
-                if (pageIndex >= m_pages.size() || !m_pages[pageIndex]) ASTRA_UNLIKELY
-                    return nullptr;                      // nothing cached: a miss re-resolves next call
-                c.page = m_pages[pageIndex].get();
-                c.index = pageIndex;
-            }
-            const std::size_t slot = SlotOf(e);
-            if (!TestBit(c.page->live, slot) || c.page->entities[slot] != e) ASTRA_UNLIKELY
+            c.index = pageIndex;
+            const Page* page = pageIndex < m_pages.size() ? m_pages[pageIndex].get() : nullptr;
+            if (!page) ASTRA_UNLIKELY
                 return nullptr;
-            return SlotPtr(*c.page, slot);
+            const std::size_t slot = SlotOf(e);
+            if (!TestBit(page->live, slot) || page->entities[slot] != e) ASTRA_UNLIKELY
+                return nullptr;
+            return SlotPtr(*page, slot);
         }
 
     private:
