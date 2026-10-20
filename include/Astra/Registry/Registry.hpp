@@ -101,6 +101,7 @@ namespace Astra
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+            m_archetypeManager->SetComponentStorage(m_componentStorage.get());
         }
 
         Registry(const EntityManager::Config& entityConfig, const ArchetypeChunkPool::Config& chunkConfig) :
@@ -115,6 +116,7 @@ namespace Astra
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+            m_archetypeManager->SetComponentStorage(m_componentStorage.get());
         }
 
         Registry(std::shared_ptr<ComponentRegistry> componentRegistry, const Config& config = {}) :
@@ -129,6 +131,7 @@ namespace Astra
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+            m_archetypeManager->SetComponentStorage(m_componentStorage.get());
         }
 
         // A Registry is a heavy, stateful container: copying is not supported (the old
@@ -3014,6 +3017,7 @@ namespace Astra
             // The stores stamp from the archetype manager's counter. Both were just
             // rebuilt, so re-point them; a stale pointer would be a use-after-free.
             registry->m_componentStorage->SetTickSource(registry->m_archetypeManager->TickSource());
+            registry->m_archetypeManager->SetComponentStorage(registry->m_componentStorage.get());
             if (!registry->m_archetypeManager->Deserialize(reader))
             {
                 return Result<std::unique_ptr<Registry>, SerializationError>::Err(SerializationError::CorruptedData);

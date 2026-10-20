@@ -33,7 +33,9 @@ namespace Astra
 {
     template<typename... QueryArgs>
     class View;
-    
+
+    class ComponentStorage;
+
     class ArchetypeManager
     {
     public:
@@ -671,6 +673,13 @@ namespace Astra
         }
 
         ArchetypeChunkPool& GetChunkPool() { return m_chunkPool; }
+
+        // Storage policies (spec 2026-10-01 s6): the owning Registry's ComponentStorage,
+        // so View and Relations -- which hold only this manager -- reach sparse sets and
+        // universal columns. Non-owning, exactly like m_records: never retain a manager
+        // (or a View) past its Registry. Clear() keeps it (the storage is cleared in place).
+        void SetComponentStorage(ComponentStorage* storage) noexcept { m_componentStorage = storage; }
+        ASTRA_NODISCARD ComponentStorage* GetComponentStorage() const noexcept { return m_componentStorage; }
 
         // Monotonic count of archetype-SET changes: a new archetype being
         // created, or an empty archetype removed during defragmentation. This
@@ -1646,6 +1655,7 @@ namespace Astra
         // Non-owning: the shared record table is owned by the Registry's EntityManager and
         // outlives this manager. Never retain an ArchetypeManager (or a View) past its Registry.
         EntityTable* m_records = nullptr;
+        ComponentStorage* m_componentStorage = nullptr;   // non-owning; see SetComponentStorage
 
         Archetype* m_rootArchetype = nullptr;
         

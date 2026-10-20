@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <memory>
 #include <optional>
@@ -14,6 +15,7 @@
 #include "../Core/Base.hpp"
 #include "../Core/WorkScheduler.hpp"
 #include "../Entity/Entity.hpp"
+#include "ComponentStorage.hpp"
 #include "EnabledRuns.hpp"
 #include "Query.hpp"
 #include "ViewIterator.hpp"
@@ -85,6 +87,27 @@ namespace Astra
             : std::bool_constant<((Detail::IsMutableYield<Ts> && IsChangeTrackedV<Ts>) || ...)> {};
         static constexpr bool HasTrackedYield = AnyTrackedYield<RequiredTypes>::value || AnyTrackedYield<OptionalTypes>::value;
 
+        // ================= Storage policies (spec 2026-10-01 s6) =================
+        //
+        // PlanTypes: every component the query names (through any modifier), const
+        // stripped, deduplicated. m_kinds[PlanIndex<T>] is T's effective StorageKind in
+        // this view's registry, resolved ONCE at construction: Table/Sparse from the
+        // trait, Universal from the registry's Config (fixed for the registry's life).
+        using PlanTypes       = Detail::QueryPlanTypes<QueryArgs...>;
+        using WithTypes       = typename Detail::QueryClassifier<QueryArgs...>::WithComponents;
+        using ExcludedTypes   = typename Detail::QueryClassifier<QueryArgs...>::ExcludedComponents;
+        using AnyGroupTypes   = typename Detail::QueryClassifier<QueryArgs...>::AnyGroups;
+        using OneOfGroupTypes = typename Detail::QueryClassifier<QueryArgs...>::OneOfGroups;
+        static constexpr size_t NPlan      = std::tuple_size_v<PlanTypes>;
+        static constexpr size_t NPlanSlots = NPlan == 0 ? 1 : NPlan;
+        template<typename T>
+        static constexpr size_t PlanIndex = Detail::TupleIndexOf<std::remove_const_t<T>, PlanTypes>::value;
+    public:
+        // Compile-time half of the plan: a Sparse-trait type anywhere in the query routes
+        // every iteration surface through the storage path (spec s6.3, s6.5).
+        static constexpr bool HasSparseArg = Detail::AnySparseTrait<PlanTypes>::value;
+    private:
+
         // Parallel execution thresholds - based on empirical testing
         static constexpr size_t AVG_ENTITIES_PER_CHUNK = 256;                           // Typical for 16KB chunks with ~50 byte entities
         static constexpr size_t MIN_CHUNKS_PER_THREAD = 4;                              // Each thread should process at least 4 chunks (64KB)
@@ -102,6 +125,7 @@ namespace Astra
             m_lastRefreshCounter(0),
             m_lastGeneration(0)
         {
+            BuildStoragePlan();
             if (manager)
             {
                 CollectArchetypes();
@@ -674,7 +698,7 @@ namespace Astra
             if (!m_archetypeManager) ASTRA_UNLIKELY return nullptr;
             const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
             if (!rec) return nullptr;   // dead/absent (GetEntityRecord checks version + archetype)
-            if (!QueryBuilder::Matches(rec->archetype->GetMask())) return nullptr;
+            if (!MatchesArchetype(rec->archetype->GetMask())) return nullptr;
             if constexpr (HasRequiredFilter)
             {
                 if (!EnabledVisible(rec)) return nullptr;
@@ -696,6 +720,80 @@ namespace Astra
             bool disabled = false;
             ((disabled = disabled || rec->chunk->IsDisabled(cm.idToColumn[TypeID<Fs>::Value()], idx)), ...);
             return !disabled;
+        }
+
+        // Effective kind of one named type. KindOf reads T's descriptor, so it is asked
+        // only for a REGISTERED id; an unregistered type cannot be Universal
+        // (AddUniversal registers it), so its trait decides.
+        template<typename T>
+        StorageKind ResolveKind(ComponentStorage* storage, const ComponentRegistry* creg) const
+        {
+            const ComponentID id = TypeID<T>::Value();
+            if (storage && creg && id < MAX_COMPONENTS && creg->GetComponentDescriptor(id) &&
+                storage->KindOf(id) == StorageKind::Universal)
+                return StorageKind::Universal;
+            return Detail::IsSparseArgV<T> ? StorageKind::Sparse : StorageKind::Table;
+        }
+
+        void BuildStoragePlan()
+        {
+            m_kinds.fill(StorageKind::Table);
+            m_matchRequired = QueryBuilder::GetTableRequiredMask();
+            m_matchExcluded = QueryBuilder::GetTableExcludedMask();
+            m_anyUniversal = false;
+            m_neverMatches = false;
+
+            ComponentStorage* storage = m_archetypeManager ? m_archetypeManager->GetComponentStorage() : nullptr;
+            std::shared_ptr<ComponentRegistry> creg =
+                m_archetypeManager ? m_archetypeManager->m_componentRegistry.lock() : nullptr;
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((m_kinds[PlanIndex<Ts>] = ResolveKind<Ts>(storage, creg.get())), ...);
+            }(static_cast<PlanTypes*>(nullptr));
+
+            // A Universal member is in no archetype mask: it leaves both masks.
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((m_kinds[PlanIndex<Ts>] == StorageKind::Universal
+                    ? (m_anyUniversal = true,
+                       m_matchRequired.Reset(TypeID<Ts>::Value()),
+                       m_matchExcluded.Reset(TypeID<Ts>::Value()))
+                    : void()), ...);
+            }(static_cast<PlanTypes*>(nullptr));
+
+            // Not<U> on a Universal U: every live entity holds U, so nothing matches.
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((m_neverMatches = m_neverMatches || m_kinds[PlanIndex<Ts>] == StorageKind::Universal), ...);
+            }(static_cast<ExcludedTypes*>(nullptr));
+
+            m_matchCount = m_matchRequired.Count();
+        }
+
+        // Archetype-level match against the plan's runtime masks: QueryBuilder::Matches
+        // with the Sparse/Universal members taken out (spec s6.1).
+        ASTRA_NODISCARD bool MatchesArchetype(const ComponentMask& mask) const
+        {
+            if (m_neverMatches) ASTRA_UNLIKELY
+                return false;
+            if (!mask.HasAll(m_matchRequired))
+                return false;
+            if ((mask & m_matchExcluded).Any())
+                return false;
+            return GroupsPass(mask);
+        }
+
+        // Any/OneOf at archetype level. Task 26 makes this storage-aware.
+        ASTRA_NODISCARD bool GroupsPass([[maybe_unused]] const ComponentMask& mask) const
+        {
+            constexpr size_t nAny = std::tuple_size_v<AnyGroupTypes>;
+            constexpr size_t nOne = std::tuple_size_v<OneOfGroupTypes>;
+            bool ok = true;
+            if constexpr (nAny > 0)
+                ok = QueryBuilder::template CheckAnyGroups<AnyGroupTypes>(mask, std::make_index_sequence<nAny>{});
+            if constexpr (nOne > 0)
+                ok = ok && QueryBuilder::template CheckOneOfGroups<OneOfGroupTypes>(mask, std::make_index_sequence<nOne>{});
+            return ok;
         }
 
         struct ArchetypeEntityCountComparator
@@ -730,7 +828,7 @@ namespace Astra
                 auto newArchetypes = m_archetypeManager->GetArchetypesSince(m_lastGeneration);
                 for (Archetype* arch : newArchetypes)
                 {
-                    if (QueryBuilder::Matches(arch->GetMask()))
+                    if (MatchesArchetype(arch->GetMask()))
                     {
                         m_archetypes.push_back(arch);
                     }
@@ -751,8 +849,6 @@ namespace Astra
             }
 
             auto archetypes = m_archetypeManager->GetArchetypes();
-            const size_t queryComponentCount =
-                (QueryBuilder::GetRequiredMask() | QueryBuilder::GetWithMask() | QueryBuilder::GetChangeMask()).Count();
 
             m_archetypes.reserve(archetypes.size());
 
@@ -761,11 +857,11 @@ namespace Astra
                 // NOTE: empty archetypes are deliberately KEPT — they may gain
                 // entities later without any archetype-creation event, and
                 // iterating an empty archetype is free (zero-count chunks).
-                if (archetype->GetComponentCount() < queryComponentCount) ASTRA_UNLIKELY
+                if (archetype->GetComponentCount() < m_matchCount) ASTRA_UNLIKELY
                 {
                     continue;
                 }
-                if (QueryBuilder::Matches(archetype->GetMask()))
+                if (MatchesArchetype(archetype->GetMask()))
                 {
                     m_archetypes.push_back(archetype);
                 }
@@ -1432,6 +1528,14 @@ namespace Astra
         uint32_t m_lastRefreshCounter = 0;
         uint32_t m_lastGeneration = 0;
         uint32_t m_lastRemovalCounter = 0;
+
+        // Storage plan (spec 2026-10-01 s6.1), built once by BuildStoragePlan().
+        std::array<StorageKind, NPlanSlots> m_kinds{};
+        ComponentMask m_matchRequired{};   // Table-kind required | With | Changed | Added
+        ComponentMask m_matchExcluded{};   // Table-kind Not<>
+        size_t m_matchCount = 0;           // m_matchRequired.Count(): CollectArchetypes' pre-filter
+        bool m_anyUniversal = false;       // some named type is Universal in this registry
+        bool m_neverMatches = false;       // Not<U> on a Universal U
     };
 
     // Compile-time read/write access sets of a View's type args, for the scheduler
