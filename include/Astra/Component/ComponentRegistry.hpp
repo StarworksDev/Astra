@@ -353,6 +353,11 @@ namespace Astra
             desc.isChangeTracked = IsChangeTrackedV<T>;
             desc.isTransientResource = IsTransientResourceV<T>;
 
+            // Storage trait snapshot (spec 2026-10-01 s3.2). Both registration paths
+            // (RegisterComponentImpl and ComponentModule::RegisterOneChecked) build
+            // through here, so both pick it up.
+            desc.storage = StorageOfV<T>;
+
             // An enableable component must carry storage: the disabled bit lives
             // per-entity in the chunk's column data, and an empty/tag type has no
             // column (idToColumn == -1) to hang that bit off of. A runtime guard
