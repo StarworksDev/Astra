@@ -853,12 +853,16 @@ namespace Astra
         {
             if (componentId >= MAX_COMPONENTS) ASTRA_UNLIKELY
                 return false;
-            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
-                return SetEnabledUniversal(entity, componentId, enable);
             // One validated record fetch (version + archetype); stale handle => null.
             auto* rec = const_cast<EntityRecord*>(m_archetypeManager->GetEntityRecord(entity));
             if (!rec || !rec->chunk) ASTRA_UNLIKELY
                 return false;
+            // A registry with no store never reads a descriptor kind (one bool check).
+            if (m_componentStorage->HasAnyStore())
+            {
+                if (const StorageKind kind = m_componentStorage->KindOf(componentId); kind != StorageKind::Table) ASTRA_UNLIKELY
+                    return SetEnabledInStore(entity, *rec, componentId, kind, enable);
+            }
             if (!rec->archetype->GetMask().Test(componentId)) ASTRA_UNLIKELY
                 return false;   // component absent
             const int col = rec->archetype->GetColumnMeta().idToColumn[componentId];
@@ -894,16 +898,22 @@ namespace Astra
         {
             if (componentId >= MAX_COMPONENTS) ASTRA_UNLIKELY
                 return false;
-            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
-            {
-                const UniversalColumn* column = m_componentStorage->FindUniversal(componentId);
-                if (!column || !column->IsLive(entity)) ASTRA_UNLIKELY
-                    return false;                         // stale or never constructed: not enabled
-                return !column->IsDisabled(entity);       // non-enableable: IsDisabled is false
-            }
             const auto* rec = m_archetypeManager->GetEntityRecord(entity);
             if (!rec || !rec->chunk) ASTRA_UNLIKELY
                 return false;
+            if (m_componentStorage->HasAnyStore())
+            {
+                if (const StorageKind kind = m_componentStorage->KindOf(componentId); kind != StorageKind::Table) ASTRA_UNLIKELY
+                {
+                    if (kind == StorageKind::Sparse)
+                    {
+                        const SparseSet* set = m_componentStorage->FindSparse(componentId);   // a read never creates a store
+                        return set && set->Contains(entity) && !set->IsDisabled(entity);
+                    }
+                    const UniversalColumn* column = m_componentStorage->FindUniversal(componentId);
+                    return column && column->IsLive(entity) && !column->IsDisabled(entity);   // non-enableable: IsDisabled is false
+                }
+            }
             if (!rec->archetype->GetMask().Test(componentId)) ASTRA_UNLIKELY
                 return false;   // absent => not enabled (behavior table)
             const int col = rec->archetype->GetColumnMeta().idToColumn[componentId];
@@ -2273,28 +2283,52 @@ namespace Astra
             return m_componentStorage->HasUniversals() && m_componentStorage->IsDeclaredUniversal(id);
         }
 
-        // Universal arm of SetEnabledByID (spec s3.3, s7.2). The column's per-slot flag is
-        // the truth (P3). Chunk C's enable task adds the chunk-side `disabled` mirror
-        // update here. Same answers as the Table path: true iff the live entity holds an
-        // enableable component, whether or not the state changed; the signal fires on a
-        // genuine change only.
-        bool SetEnabledUniversal(Entity entity, ComponentID componentId, bool enable)
+        // Storage policies (spec s7.2): SetEnabled for a Sparse or Universal id. The STORE
+        // flag is the truth; on a genuine change the chunk's disabled bit for the
+        // component's slot is updated as the P3 mirror. An enableable Universal component
+        // acquires its slot on its first disable and gets present == nullptr mirror blocks.
+        // Contract = the Table body's: true iff the live entity holds an enableable
+        // component, whether or not the state changed; signals fire on a genuine change
+        // only. Absent components create no set and take no slot (RULINGS G2).
+        bool SetEnabledInStore(Entity entity, const EntityRecord& rec, ComponentID id, StorageKind kind, bool enable)
         {
-            UniversalColumn* column = m_componentStorage->FindUniversal(componentId);
-            if (!column || !column->IsLive(entity)) ASTRA_UNLIKELY
-                return false;                             // stale handle: miss
-            if (!column->Descriptor().isEnableable) ASTRA_UNLIKELY
-                return false;                             // present but not enableable: nothing to toggle
-            const bool changed = column->SetDisabled(entity, !enable);   // SET == DISABLED
+            const ComponentDescriptor* desc = m_componentRegistry->GetComponentDescriptor(id);
+            if (!desc || !desc->isEnableable) ASTRA_UNLIKELY
+                return false;                                      // not enableable: nothing to toggle
+            int slot = m_componentStorage->SparseSlotOf(id);
+            bool changed = false;
+            void* element = nullptr;
+            if (kind == StorageKind::Sparse)
+            {
+                SparseSet* set = m_componentStorage->FindSparse(id);
+                if (!set || !set->Contains(entity))
+                    return false;                                  // absent
+                changed = set->SetDisabled(entity, !enable);       // SET == DISABLED
+                element = desc->size == 0 ? EmptyComponentSentinel() : set->Get(entity);
+            }
+            else
+            {
+                UniversalColumn* column = m_componentStorage->FindUniversal(id);
+                if (!column || !column->IsLive(entity))
+                    return false;                                  // stale or never constructed
+                if (!enable && slot < 0) ASTRA_UNLIKELY
+                {
+                    slot = m_componentStorage->AcquireSparseSlot(id);
+                    if (slot < 0) ASTRA_UNLIKELY
+                        return false;                              // slot cap exhausted (AcquireSparseSlot asserts)
+                }
+                changed = column->SetDisabled(entity, !enable);
+                element = desc->size == 0 ? EmptyComponentSentinel() : column->Get(entity);
+            }
             if (changed)
             {
+                ASTRA_ASSERT(slot >= 0, "SetEnabledInStore: a genuine change implies an assigned sparse slot");
+                rec.chunk->SetSparseDisabled(static_cast<uint16_t>(slot), rec.location.GetEntityIndex(), !enable);
                 const Signal flag = enable ? Signal::ComponentEnabled : Signal::ComponentDisabled;
                 if (m_signalManager.IsSignalEnabled(flag)) ASTRA_UNLIKELY
                 {
-                    // A present tag's payload is the sentinel on every by-ID path.
-                    void* component = column->Descriptor().size == 0 ? EmptyComponentSentinel() : column->Get(entity);
-                    if (enable) m_signalManager.Emit<Events::ComponentEnabled>(entity, componentId, component);
-                    else        m_signalManager.Emit<Events::ComponentDisabled>(entity, componentId, component);
+                    if (enable) m_signalManager.Emit<Events::ComponentEnabled>(entity, id, element);
+                    else        m_signalManager.Emit<Events::ComponentDisabled>(entity, id, element);
                 }
             }
             return true;

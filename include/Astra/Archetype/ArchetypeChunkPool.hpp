@@ -759,6 +759,10 @@ namespace Astra
             if (disabled)
             {
                 SparseBlock& b = GetOrCreateSparseBlock(slot, true);
+                // P3, present before disabled: a Sparse member's present bit is already set. A
+                // Universal mirror block has no present words (spec s5.1) and is exempt.
+                ASTRA_ASSERT(!b.present || TestSparseBit(b.present, index),
+                    "SetSparseDisabled: a non-member cannot be disabled (P3)");
                 return WriteSparseBit(b.disabled, b.disabledCount, index, true);
             }
             SparseBlock* b = FindSparseBlock(slot);
