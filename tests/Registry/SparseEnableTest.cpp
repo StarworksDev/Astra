@@ -189,6 +189,10 @@ TEST(SparseEnable, StaleHandleIsRefusedOnAddRemoveAndSetEnabled)
 TEST(SparseEnable, DisabledMirrorsSurviveSwapRemoveArchetypeMoveAndDefragment)
 {
     Astra::Registry reg(UniversalUnE());
+    // Filler first: the holders land near the tail of a LATER chunk, so the Defragment
+    // step below really compacts them into an earlier one (the CompactChunks carry).
+    std::vector<Astra::Entity> filler(3000);
+    reg.CreateEntities<Position>(3000, filler);
     constexpr int N = 8;
     Astra::Entity es[N];
     for (int i = 0; i < N; ++i)
@@ -225,9 +229,14 @@ TEST(SparseEnable, DisabledMirrorsSurviveSwapRemoveArchetypeMoveAndDefragment)
     reg.DestroyEntity(es[2]);
     reg.DestroyEntity(es[3]);
     reg.DestroyEntity(es[4]);
+    for (size_t i = 0; i < filler.size(); i += 2)
+        reg.DestroyEntity(filler[i]);                       // under-fill every chunk
+    ASSERT_GT(reg.FindArchetype<Position>()->GetChunkCount(), 1u);
     Astra::Registry::DefragmentationOptions opts;
     opts.minArchetypesToKeep = 0;
-    reg.Defragment(opts);
+    opts.chunkUtilizationThreshold = 1.0f;                  // compact every multi-chunk archetype
+    const auto result = reg.Defragment(opts);
+    EXPECT_GT(result.entitiesMoved, 0u);
     expectTargetDisabled();
     EXPECT_TRUE(reg.IsEnabled<SpE>(es[0]));
     EXPECT_FALSE(DisabledBit<SpE>(reg, es[0]));
