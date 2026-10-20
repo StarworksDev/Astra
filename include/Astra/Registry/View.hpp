@@ -560,6 +560,15 @@ namespace Astra
             EnsureArchetypes();
             // The iterator carries the current tick so it can apply the coarse
             // change-detection stamp on every chunk it enters (non-const yields only).
+            if (UsesStoragePath())
+            {
+                // s6.5: a Sparse argument (or a Universal member here) is walked in matching
+                // runs through the view's hooks; the required-enableable refusal above is
+                // unchanged and a required Sparse argument does not trigger it.
+                ResolveStores();
+                m_iterHooks = ViewIterHooks{ this, &View::IterChunkMask, &View::IterResolve, IterPerEntity() };
+                return Iterator(m_archetypes.data(), m_archetypes.size(), m_archetypeManager->CurrentTick(), &m_iterHooks);
+            }
             return Iterator(m_archetypes.data(), m_archetypes.size(), m_archetypeManager->CurrentTick());
         }
 
@@ -684,6 +693,9 @@ namespace Astra
         ASTRA_NODISCARD Result<AccessTuple, QueryError> Get(Entity e) const
         {
             static_assert(!HasChangeFilter, "Changed<T>/Added<T> views are iteration-only this stage: Size/Empty/Contains/Get/Single/range-for need a tick; use ForEach(ctx, fn) or Since(tick).ForEach(fn)");
+            if (UsesStoragePath())
+                return GetStorageImpl(e, std::make_index_sequence<std::tuple_size_v<RequiredTypes>>{},
+                                      std::make_index_sequence<std::tuple_size_v<OptionalTypes>>{});
             const EntityRecord* rec = VisibleRecord(e);
             if (!rec) ASTRA_UNLIKELY
                 return Result<AccessTuple, QueryError>::Err(QueryError::NotMatched);
@@ -732,6 +744,11 @@ namespace Astra
         // tested against the entity's OWN archetype mask.
         ASTRA_NODISCARD const EntityRecord* VisibleRecord(Entity e) const
         {
+            if (UsesStoragePath())
+            {
+                StoreArray st{};
+                return VisibleRecordWith(e, st);
+            }
             if (!m_archetypeManager) ASTRA_UNLIKELY return nullptr;
             const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
             if (!rec) return nullptr;   // dead/absent (GetEntityRecord checks version + archetype)
@@ -2613,6 +2630,145 @@ namespace Astra
                 });
         }
 
+        // ---- Random access (spec s6.5): Get / Single / Contains ----
+
+        // The record iff `e` is alive, matches at archetype level, and passes every
+        // per-entity constraint. `st` receives the stores the caller then fetches through.
+        ASTRA_NODISCARD const EntityRecord* VisibleRecordWith(Entity e, StoreArray& st) const
+        {
+            if (!m_archetypeManager) ASTRA_UNLIKELY
+                return nullptr;
+            const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+            if (!rec || !rec->chunk)
+                return nullptr;
+            if (!MatchesArchetype(rec->archetype->GetMask()))
+                return nullptr;
+            ResolveStoresInto(st);
+            return EntityPasses(rec, e, st, Tick{0}) ? rec : nullptr;   // Tick unused: change views refuse Get
+        }
+
+        // Get()'s Optional: a present tag yields its static instance (the pre-existing
+        // Table contract via ArchetypeChunk::GetComponent); otherwise the ForEach rule.
+        template<size_t K, typename F>
+        std::remove_const_t<std::tuple_element_t<K, OptionalTypes>>* GetOptionalAt(F& f, const EntityRecord* rec, Entity e,
+                                                                                   size_t i, const StoreArray& st) const
+        {
+            using Bare = std::remove_const_t<std::tuple_element_t<K, OptionalTypes>>;
+            if constexpr (std::is_empty_v<Bare>)
+            {
+                if (!EntityHolds<Bare>(rec, e, st))
+                    return nullptr;
+                if constexpr (IsEnableableV<Bare>)
+                {
+                    if (!EntityEnabled<Bare>(rec, e, st))
+                        return nullptr;
+                }
+                static Bare s_emptyInstance{};
+                return &s_emptyInstance;
+            }
+            else
+            {
+                return f.OptionalAt(e, i);
+            }
+        }
+
+        template<size_t K, typename F>
+        AccessElement<std::tuple_element_t<K, RequiredTypes>> AccessFrom([[maybe_unused]] F& f,
+                                                                         std::remove_const_t<std::tuple_element_t<K, RequiredTypes>>* p,
+                                                                         [[maybe_unused]] Entity e, [[maybe_unused]] size_t i,
+                                                                         [[maybe_unused]] Tick now) const
+        {
+            using R = std::tuple_element_t<K, RequiredTypes>;
+            if constexpr (Detail::IsMutableYield<R> && IsChangeTrackedV<R>)
+                return Mut<R>(p, TicksFor(f, e, i), now);   // marks on use, with the tick current at Get()
+            else
+                return p;
+        }
+
+        // Get() on the storage path: visibility per entity, the same write stamps a
+        // ForEach visit applies (a non-const request is a write, spec s3.3), Mut<T> for
+        // tracked elements.
+        template<size_t... ReqIs, size_t... OptIs>
+        Result<AccessTuple, QueryError> GetStorageImpl(Entity e, std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq) const
+        {
+            StoreArray st{};
+            const EntityRecord* rec = VisibleRecordWith(e, st);
+            if (!rec) ASTRA_UNLIKELY
+                return Result<AccessTuple, QueryError>::Err(QueryError::NotMatched);
+            ArchetypeChunk* chunk = rec->chunk;
+            const ArchetypeColumnMeta& cm = rec->archetype->GetColumnMeta();
+            const size_t i = rec->location.GetEntityIndex();
+            const Tick now = m_archetypeManager->CurrentTick();
+
+            StampVisit<false>(chunk, cm, now, reqSeq, optSeq);   // Task 25's shared stamp block
+            std::tuple<Fetch<std::tuple_element_t<ReqIs, RequiredTypes>>...> req{
+                MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, st)... };
+            std::tuple<Fetch<std::tuple_element_t<OptIs, OptionalTypes>>...> opt{
+                MakeFetch<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, st)... };
+            std::tuple<std::remove_const_t<std::tuple_element_t<ReqIs, RequiredTypes>>*...> rp{ std::get<ReqIs>(req).At(e, i)... };
+            std::tuple<std::remove_const_t<std::tuple_element_t<OptIs, OptionalTypes>>*...> op{
+                GetOptionalAt<OptIs>(std::get<OptIs>(opt), rec, e, i, st)... };
+            (StampRequiredStore<std::tuple_element_t<ReqIs, RequiredTypes>, false>(std::get<ReqIs>(req), e, now), ...);
+            (StampOptionalStore<std::tuple_element_t<OptIs, OptionalTypes>, false>(std::get<OptIs>(opt), std::get<OptIs>(op), e, i, now), ...);
+            return Result<AccessTuple, QueryError>::Ok(AccessTuple{
+                AccessFrom<ReqIs>(std::get<ReqIs>(req), std::get<ReqIs>(rp), e, i, now)...,
+                static_cast<std::tuple_element_t<OptIs, OptionalTypes>*>(std::get<OptIs>(op))... });
+        }
+
+        // ---- Range-for hooks (spec s6.5) ----
+
+        // Step one entity at a time when a non-empty yielded component lives in a store.
+        ASTRA_NODISCARD bool IterPerEntity() const noexcept
+        {
+            bool per = false;
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((per = per || (!std::is_empty_v<std::remove_const_t<Ts>> && m_kinds[PlanIndex<Ts>] != StorageKind::Table)), ...);
+            }(static_cast<RequiredTypes*>(nullptr));
+            return per;
+        }
+
+        static bool IterChunkMask(const void* self, Archetype* archetype, ArchetypeChunk* chunk, std::vector<uint64_t>& words)
+        {
+            const View* v = static_cast<const View*>(self);
+            const size_t count = chunk->GetCount();
+            if (count == 0)
+                return false;
+            ChunkFilter f;
+            if (!v->BuildChunkFilter(archetype, chunk, count, f))
+                return false;
+            words.assign((count + 63) >> 6, 0ull);
+            Detail::WriteMatchWords(f.exclude, f.nExclude, f.require, f.nRequire, count, words.data());
+            return true;
+        }
+
+        template<size_t... ReqIs>
+        bool IterResolveImpl(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, size_t index, [[maybe_unused]] void** out,
+                             std::index_sequence<ReqIs...>) const
+        {
+            const Entity e = chunk->GetEntities()[index];
+            std::tuple<Fetch<std::tuple_element_t<ReqIs, RequiredTypes>>...> req{
+                MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, m_stores)... };
+            bool ok = true;
+            ((out[ReqIs] = std::get<ReqIs>(req).At(e, index), ok = ok && out[ReqIs] != nullptr), ...);
+            if (ok)
+            {
+                // Range-for yields plain T& (tracked non-const yields are refused), so an
+                // untracked Sparse/Universal write is stamped here, like ForEach's visit.
+                const Tick now = m_archetypeManager->CurrentTick();
+                ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
+                (StampRequiredStore<std::tuple_element_t<ReqIs, RequiredTypes>, false>(std::get<ReqIs>(req), e, now), ...);
+                (StampSparseCoarse<std::tuple_element_t<ReqIs, RequiredTypes>, false, false>(chunk, storage, now), ...);
+            }
+            return ok;
+        }
+
+        static bool IterResolve(const void* self, Archetype* archetype, ArchetypeChunk* chunk, size_t index, void** out)
+        {
+            return static_cast<const View*>(self)->IterResolveImpl(chunk, archetype->GetColumnMeta(), index, out,
+                std::make_index_sequence<std::tuple_size_v<RequiredTypes>>{});
+        }
+
         // Size() over one archetype on the storage path: popcount of the match words.
         size_t SizeStorage(Archetype* archetype) const
         {
@@ -2687,6 +2843,7 @@ namespace Astra
         bool m_anyUniversal = false;       // some named type is Universal in this registry
         bool m_neverMatches = false;       // Not<U> on a Universal U
         StoreArray m_stores{};             // resolved per walk (ResolveStores)
+        ViewIterHooks m_iterHooks{};       // handed to range-for iterators by begin()
     };
 
     // Compile-time read/write access sets of a View's type args, for the scheduler
