@@ -240,6 +240,37 @@ namespace Astra
             Page& operator=(const Page&) = delete;
         };
 
+    public:
+        // Sequential-walk cursor (View's storage path): remembers the last page so a run of
+        // entities in one ASTRA_UNIVERSAL_PAGE_SLOTS page resolves the page once. The cursor
+        // must not outlive a structural change: a Destroy that empties a page frees it.
+        struct Cursor
+        {
+            const Page* page = nullptr;
+            std::size_t index = ~std::size_t(0);
+        };
+
+        // Get(e) with the page lookup cached in `c`. Still re-tests the slot's live bit and
+        // the stored handle for EVERY call (one bit test + one compare), so a slot that is
+        // not live -- a suspended universal after a module unload (spec s4.4), a stale
+        // handle -- answers nullptr instead of unconstructed memory.
+        ASTRA_NODISCARD void* GetCached(Entity e, Cursor& c) const noexcept
+        {
+            const std::size_t pageIndex = PageOf(e);
+            if (pageIndex != c.index) ASTRA_UNLIKELY
+            {
+                if (pageIndex >= m_pages.size() || !m_pages[pageIndex]) ASTRA_UNLIKELY
+                    return nullptr;                      // nothing cached: a miss re-resolves next call
+                c.page = m_pages[pageIndex].get();
+                c.index = pageIndex;
+            }
+            const std::size_t slot = SlotOf(e);
+            if (!TestBit(c.page->live, slot) || c.page->entities[slot] != e) ASTRA_UNLIKELY
+                return nullptr;
+            return SlotPtr(*c.page, slot);
+        }
+
+    private:
         static std::size_t PageOf(Entity e) noexcept { return static_cast<std::size_t>(e.GetID()) / PAGE_SLOTS; }
         static std::size_t SlotOf(Entity e) noexcept { return static_cast<std::size_t>(e.GetID()) % PAGE_SLOTS; }
 

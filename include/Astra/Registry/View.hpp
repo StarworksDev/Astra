@@ -68,9 +68,6 @@ namespace Astra
     public:
         static constexpr bool HasChangeFilter = (std::tuple_size_v<ChangedTypes> + std::tuple_size_v<AddedTypes>) > 0;
     private:
-        // Any per-chunk filter at all: routes iteration through VisitChunkFiltered.
-        static constexpr bool HasChunkFilter = HasEnabledFilter || HasChangeFilter;
-
         // Any Changed<T>/Added<T> term over a change-TRACKED T: inside a chunk that
         // passed the version reject, that term is evaluated per entity from the tick
         // column (spec §3.4 step 3). False for every untracked change filter, which
@@ -107,6 +104,15 @@ namespace Astra
         // every iteration surface through the storage path (spec s6.3, s6.5).
         static constexpr bool HasSparseArg = Detail::AnySparseTrait<PlanTypes>::value;
     private:
+        // Any per-chunk filter at all: routes iteration through VisitChunkFiltered. A
+        // Sparse argument always filters (presence words), so it joins the gate (s6.3).
+        static constexpr bool HasChunkFilter = HasEnabledFilter || HasChangeFilter || HasSparseArg;
+
+        // Sparse-trait members of the required (+ IncludeDisabled) and With<> sets --
+        // the presence words a chunk must carry -- and of the Not<> set.
+        using SparseRequiredTypes = Detail::FilterSparseTrait_t<decltype(std::tuple_cat(
+            std::declval<RequiredTypes>(), std::declval<WithTypes>()))>;
+        using SparseExcludedTypes = Detail::FilterSparseTrait_t<ExcludedTypes>;
 
         // Parallel execution thresholds - based on empirical testing
         static constexpr size_t AVG_ENTITIES_PER_CHUNK = 256;                           // Typical for 16KB chunks with ~50 byte entities
@@ -232,6 +238,8 @@ namespace Astra
                 return;  // Registry destroyed
 
             EnsureArchetypes();
+            if (UsesStoragePath())
+                ResolveStores();     // on this thread, before any worker reads m_stores
 
             if (m_archetypes.empty()) ASTRA_UNLIKELY
                 return;
@@ -362,6 +370,8 @@ namespace Astra
                 return 0;  // Registry destroyed
 
             EnsureArchetypes();
+            if (UsesStoragePath())
+                ResolveStores();     // on this thread, before any worker reads m_stores
 
             if (m_archetypes.empty()) ASTRA_UNLIKELY
                 return 0;
@@ -446,7 +456,7 @@ namespace Astra
             EnsureArchetypes();
 
             size_t total = 0;
-            if constexpr (!HasRequiredFilter)
+            if constexpr (!HasRequiredFilter && !HasSparseArg)
             {
                 // No required enableable filter: entity count is unaffected by
                 // disabled bits (optional filtering never removes entities), so
@@ -458,6 +468,8 @@ namespace Astra
             }
             else
             {
+                if (UsesStoragePath())
+                    ResolveStores();
                 for (Archetype* archetype : m_archetypes)
                 {
                     total += SizeFiltered(archetype);
@@ -722,15 +734,14 @@ namespace Astra
             return !disabled;
         }
 
-        // Effective kind of one named type. KindOf reads T's descriptor, so it is asked
-        // only for a REGISTERED id; an unregistered type cannot be Universal
-        // (AddUniversal registers it), so its trait decides.
+        // Effective kind of one named type, from masks only: Universal iff the registry
+        // declared it so (ComponentStorage::IsDeclaredUniversal tests the declaration mask
+        // and reads no descriptor, so it is valid before T is registered); otherwise the
+        // trait decides.
         template<typename T>
-        StorageKind ResolveKind(ComponentStorage* storage, const ComponentRegistry* creg) const
+        StorageKind ResolveKind(ComponentStorage* storage) const
         {
-            const ComponentID id = TypeID<T>::Value();
-            if (storage && creg && id < MAX_COMPONENTS && creg->GetComponentDescriptor(id) &&
-                storage->KindOf(id) == StorageKind::Universal)
+            if (storage && storage->HasUniversals() && storage->IsDeclaredUniversal(TypeID<T>::Value()))
                 return StorageKind::Universal;
             return Detail::IsSparseArgV<T> ? StorageKind::Sparse : StorageKind::Table;
         }
@@ -744,11 +755,9 @@ namespace Astra
             m_neverMatches = false;
 
             ComponentStorage* storage = m_archetypeManager ? m_archetypeManager->GetComponentStorage() : nullptr;
-            std::shared_ptr<ComponentRegistry> creg =
-                m_archetypeManager ? m_archetypeManager->m_componentRegistry.lock() : nullptr;
             [&]<typename... Ts>(std::tuple<Ts...>*)
             {
-                ((m_kinds[PlanIndex<Ts>] = ResolveKind<Ts>(storage, creg.get())), ...);
+                ((m_kinds[PlanIndex<Ts>] = ResolveKind<Ts>(storage)), ...);
             }(static_cast<PlanTypes*>(nullptr));
 
             // A Universal member is in no archetype mask: it leaves both masks.
@@ -928,6 +937,8 @@ namespace Astra
                 return;  // Registry destroyed
 
             EnsureArchetypes();
+            if (UsesStoragePath())
+                ResolveStores();     // before the Debug counter capture and before any chunk
 
 #ifdef ASTRA_BUILD_DEBUG
             // Captured AFTER EnsureArchetypes() so its own (legitimate) refresh
@@ -964,6 +975,17 @@ namespace Astra
                 // column per visited chunk (all-const: no stamp code). A tracked
                 // non-const yield (Mut<T>) needs the view-owned loop below, which
                 // already handles zero optionals.
+                if (m_anyUniversal) ASTRA_UNLIKELY
+                {
+                    // A Table-trait argument declared Universal in this registry: no
+                    // chunk column exists for it, so the archetype fast loops cannot run.
+                    const Tick now = m_archetypeManager->CurrentTick();
+                    for (auto& chunk : archetype->GetChunks())
+                        VisitChunkStorage<Stamp>(archetype, chunk.get(), func, now, since,
+                                                 std::make_index_sequence<sizeof...(Required)>{},
+                                                 std::make_index_sequence<sizeof...(Optional)>{});
+                    return;
+                }
                 (void)since;
                 if constexpr (sizeof...(Optional) == 0 && !HasTrackedYield)
                 {
@@ -1046,6 +1068,17 @@ namespace Astra
                 // Pre-existing chunk walk (invariant 1) plus the coarse change-
                 // detection stamp of every non-const yielded column for this chunk.
                 // A tracked non-const yield (Mut<T>) takes the view-owned loop.
+                if (m_anyUniversal) ASTRA_UNLIKELY
+                {
+                    // Interim until Task 28's parallel driver: a Universal member has no
+                    // chunk column, so route the one chunk through the storage walk.
+                    const auto& uchunks = archetype->GetChunks();
+                    if (chunkIndex < uchunks.size())
+                        VisitChunkStorage<true>(archetype, uchunks[chunkIndex].get(), func, m_archetypeManager->CurrentTick(), since,
+                                                std::make_index_sequence<sizeof...(Required)>{},
+                                                std::make_index_sequence<sizeof...(Optional)>{});
+                    return;
+                }
                 (void)since;
                 if constexpr (sizeof...(Optional) == 0 && !HasTrackedYield)
                 {
@@ -1374,14 +1407,29 @@ namespace Astra
                 : void()), ...);
         }
 
-        // Per-chunk filter for one chunk (shared by the serial and parallel paths):
+        // Per-chunk filtered visit. Storage-path views (a Sparse type, or a Universal
+        // member in this registry) take VisitChunkStorage; every other view keeps the
+        // pre-existing loop (VisitChunkTable), which a HasSparseArg view never instantiates.
+        template<bool Stamp, typename Func, size_t... ReqIs, size_t... OptIs>
+        ASTRA_FORCEINLINE void VisitChunkFiltered(Archetype* archetype, ArchetypeChunk* chunk, Func&& func, Tick now, Tick since,
+                                                  std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
+        {
+            if constexpr (HasSparseArg)
+                VisitChunkStorage<Stamp>(archetype, chunk, func, now, since, reqSeq, optSeq);
+            else if (m_anyUniversal) ASTRA_UNLIKELY
+                VisitChunkStorage<Stamp>(archetype, chunk, func, now, since, reqSeq, optSeq);
+            else
+                VisitChunkTable<Stamp>(archetype, chunk, func, now, since, reqSeq, optSeq);
+        }
+
+        // Pure-Table per-chunk filter for one chunk (shared by the serial and parallel paths):
         // the Changed/Added version reject, then the three-tier enabled-only filter.
         // count==0 chunks are no-ops. `now` is the caller's hoisted CurrentTick()
         // for the coarse change-detection stamp; Stamp=false (the internal count/
         // locate pass) instantiates no stamp at all. `since` is the change-filter
         // tick; a view without Changed/Added terms instantiates no reject code.
         template<bool Stamp, typename Func, size_t... ReqIs, size_t... OptIs>
-        ASTRA_FORCEINLINE void VisitChunkFiltered(Archetype* archetype, ArchetypeChunk* chunk, Func&& func, Tick now, Tick since,
+        ASTRA_FORCEINLINE void VisitChunkTable(Archetype* archetype, ArchetypeChunk* chunk, Func&& func, Tick now, Tick since,
                                                   std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
         {
             const size_t count = chunk->GetCount();
@@ -1483,10 +1531,417 @@ namespace Astra
                 });
         }
 
+        // ================= Storage path (spec 2026-10-01 s6.3, s6.4) =================
+        // ================= Storage path (spec 2026-10-01 s6.3, s6.4) =================
+        // Taken by every view naming a Sparse type, and by any view whose registry
+        // declares one of its types Universal (UsesStoragePath). A pure-Table view in a
+        // Universal-free registry instantiates it (the dispatcher names it) but never
+        // runs it: it pays one m_anyUniversal test per archetype walk.
+
+        // One resolved store per plan type. Refreshed on the walking thread before any
+        // chunk is visited and before any parallel dispatch: slots are acquired lazily
+        // (s3.2), so a sparse set may appear after the view was built. Workers only read.
+        struct StoreRef
+        {
+            int              slot = -1;            // sparse slot (Sparse; enableable Universal's mirror); -1 = none
+            SparseSet*       sparse = nullptr;     // Sparse kind with a slot
+            UniversalColumn* universal = nullptr;  // Universal kind
+        };
+        using StoreArray = std::array<StoreRef, NPlanSlots>;
+
+        ASTRA_NODISCARD bool UsesStoragePath() const noexcept
+        {
+            if constexpr (HasSparseArg)
+                return true;
+            else
+                return m_anyUniversal;
+        }
+
+        template<typename T>
+        void ResolveStore(ComponentStorage* storage, StoreRef& s) const
+        {
+            s = StoreRef{};
+            if (!storage)
+                return;
+            const ComponentID id = TypeID<T>::Value();
+            switch (m_kinds[PlanIndex<T>])
+            {
+            // Reads never create a store (RULINGS G2): a set or column that does not exist
+            // yet means no entity holds / has been given the component.
+            case StorageKind::Sparse:
+                s.slot = storage->SparseSlotOf(id);
+                s.sparse = storage->FindSparse(id);       // no slot => no member anywhere
+                break;
+            case StorageKind::Universal:
+                s.universal = storage->FindUniversal(id);
+                s.slot = storage->SparseSlotOf(id);       // enableable Universal: its disabled-mirror slot
+                break;
+            case StorageKind::Table:
+                break;
+            }
+        }
+
+        void ResolveStoresInto(StoreArray& out) const
+        {
+            ComponentStorage* storage = m_archetypeManager ? m_archetypeManager->GetComponentStorage() : nullptr;
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                (ResolveStore<Ts>(storage, out[PlanIndex<Ts>]), ...);
+            }(static_cast<PlanTypes*>(nullptr));
+        }
+
+        void ResolveStores() { ResolveStoresInto(m_stores); }
+
+        // ---- Per-chunk word sets, fed to Detail::ForEachMatchingRun ----
+        // Holds word POINTERS only, copied before any callback runs. No SparseBlock* is
+        // kept across a callback: a SetEnabled or sparse add made inside one may insert a
+        // block into the chunk's block list (Task 15's lifetime rule).
+        static constexpr size_t NGroups     = std::tuple_size_v<AnyGroupTypes> + std::tuple_size_v<OneOfGroupTypes>;
+        static constexpr size_t MaxWordSets = 3 * NPlanSlots + NGroups + 2;
+        struct ChunkFilter
+        {
+            const uint64_t* exclude[MaxWordSets];
+            const uint64_t* require[MaxWordSets];
+            size_t nExclude = 0;
+            size_t nRequire = 0;
+        };
+
+        // Required (or With<>) Sparse T: its block's present words. Returns false when no
+        // entity of the chunk holds T (missing block / no slot): the whole-chunk skip.
+        template<typename T>
+        bool RequirePresent(ArchetypeChunk* chunk, size_t count, ChunkFilter& f) const
+        {
+            if (m_kinds[PlanIndex<T>] == StorageKind::Universal)
+                return true;                                   // declared Universal here: always present
+            const StoreRef& s = m_stores[PlanIndex<T>];
+            if (s.slot < 0)
+                return false;
+            const auto* b = chunk->FindSparseBlock(static_cast<uint16_t>(s.slot));
+            if (!b || b->presentCount == 0)
+                return false;
+            if (b->presentCount != static_cast<uint32_t>(count))
+            {
+                ASTRA_ASSERT(f.nRequire < MaxWordSets, "View::ChunkFilter: require word-set capacity exceeded");
+                f.require[f.nRequire++] = b->present;          // all-present needs no words
+            }
+            return true;
+        }
+
+        // Not<Sparse T>: its present words are excluded. False when every entity holds T.
+        template<typename T>
+        bool ExcludePresent(ArchetypeChunk* chunk, size_t count, ChunkFilter& f) const
+        {
+            if (m_kinds[PlanIndex<T>] != StorageKind::Sparse)
+                return true;                                   // Not<Universal> never reaches a chunk (m_neverMatches)
+            const StoreRef& s = m_stores[PlanIndex<T>];
+            if (s.slot < 0)
+                return true;
+            const auto* b = chunk->FindSparseBlock(static_cast<uint16_t>(s.slot));
+            if (!b || b->presentCount == 0)
+                return true;
+            if (b->presentCount == static_cast<uint32_t>(count))
+                return false;
+            ASTRA_ASSERT(f.nExclude < MaxWordSets, "View::ChunkFilter: exclude word-set capacity exceeded");
+            f.exclude[f.nExclude++] = b->present;
+            return true;
+        }
+
+        // Enabled-only filter of one required enableable T (IncludeDisabled opts out
+        // upstream): the column's disabled words for Table, the chunk's disabled MIRROR
+        // (P3) for Sparse/Universal. False when every entity of the chunk is disabled.
+        template<typename T>
+        bool ExcludeDisabled(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, size_t count, ChunkFilter& f) const
+        {
+            using Bare = std::remove_const_t<T>;
+            const uint64_t* words = nullptr;
+            uint32_t dc = 0;
+            if (m_kinds[PlanIndex<Bare>] == StorageKind::Table)
+            {
+                const int col = cm.idToColumn[TypeID<Bare>::Value()];   // required => present
+                dc = chunk->GetDisabledCount(col);
+                words = chunk->GetDisabledWords(col);
+            }
+            else
+            {
+                const StoreRef& s = m_stores[PlanIndex<Bare>];
+                if (s.slot < 0)
+                    return true;
+                const auto* b = chunk->FindSparseBlock(static_cast<uint16_t>(s.slot));
+                if (!b || !b->disabled)
+                    return true;
+                dc = b->disabledCount;
+                words = b->disabled;
+            }
+            if (dc == 0)
+                return true;
+            if (dc == static_cast<uint32_t>(count))
+                return false;
+            ASTRA_ASSERT(f.nExclude < MaxWordSets, "View::ChunkFilter: exclude word-set capacity exceeded");
+            f.exclude[f.nExclude++] = words;
+            return true;
+        }
+
+        // Every per-chunk constraint. Returns false when nothing in the chunk can match.
+        bool BuildChunkFilter(Archetype* archetype, [[maybe_unused]] ArchetypeChunk* chunk,
+                              [[maybe_unused]] size_t count, [[maybe_unused]] ChunkFilter& f) const
+        {
+            [[maybe_unused]] const ArchetypeColumnMeta& cm = archetype->GetColumnMeta();
+            bool pass = true;
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((pass = pass && RequirePresent<std::remove_const_t<Ts>>(chunk, count, f)), ...);
+            }(static_cast<SparseRequiredTypes*>(nullptr));
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((pass = pass && ExcludeDisabled<Ts>(chunk, cm, count, f)), ...);
+            }(static_cast<EnabledRequiredFilter*>(nullptr));
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((pass = pass && ExcludePresent<std::remove_const_t<Ts>>(chunk, count, f)), ...);
+            }(static_cast<SparseExcludedTypes*>(nullptr));
+            return pass;
+        }
+
+        // ---- Fetching (spec s6.4) ----
+        // Per-chunk element source of one yielded type; At() is the per-entity fetch.
+        // The Table-vs-Sparse choice is made at COMPILE TIME from the trait (a Table
+        // type reads base[i], a Sparse type the set's dense element by entity), so
+        // neither pays a per-entity kind test. Universal is a per-chunk flag: a type
+        // declared Universal in this registry reads its slot-indexed page element
+        // through a page cursor (RULINGS Task 24: one loop-invariant branch accepted).
+        template<typename T>
+        struct Fetch
+        {
+            using Bare = std::remove_const_t<T>;
+            static constexpr bool SparseTrait = StorageOfV<Bare> == Storage::Sparse;
+
+            Bare*            base = nullptr;          // Table: column base in this chunk
+            ArchetypeChunk*  chunk = nullptr;         // Table: for the disabled-bit test
+            int              col = -1;                // Table: column ordinal, -1 = absent here
+            EntityTicks*     ticks = nullptr;         // Table: tick column (tracked only)
+            SparseSet*       sparse = nullptr;        // Sparse trait; null while no set exists
+            UniversalColumn* universal = nullptr;     // declared Universal here; null while no column exists
+            bool             isUniversal = false;     // the type is Universal in this registry
+            UniversalColumn::Cursor cursor{};         // Universal page cursor
+
+            ASTRA_FORCEINLINE Bare* At([[maybe_unused]] Entity e, [[maybe_unused]] size_t i) noexcept
+            {
+                if constexpr (std::is_empty_v<Bare>)
+                {
+                    static Bare s_emptyInstance{};    // a present tag (RequiredElement's contract)
+                    return &s_emptyInstance;
+                }
+                else
+                {
+                    if (isUniversal) ASTRA_UNLIKELY
+                        return universal ? static_cast<Bare*>(universal->GetCached(e, cursor)) : nullptr;
+                    if constexpr (SparseTrait)
+                        return sparse ? static_cast<Bare*>(sparse->Get(e)) : nullptr;
+                    else
+                        return base ? base + i : nullptr;
+                }
+            }
+
+            // Optional yield: null when absent, or disabled under an enableable T. An
+            // Optional TAG yields null, the pre-existing ForEach behaviour for Table tags
+            // (their column base is null), kept for parity (D2).
+            ASTRA_FORCEINLINE Bare* OptionalAt([[maybe_unused]] Entity e, [[maybe_unused]] size_t i) noexcept
+            {
+                if constexpr (std::is_empty_v<Bare>)
+                {
+                    return nullptr;
+                }
+                else
+                {
+                    Bare* p = At(e, i);
+                    if constexpr (IsEnableableV<Bare>)
+                    {
+                        if (p)
+                        {
+                            bool disabled;
+                            if (isUniversal)
+                                disabled = universal->IsDisabled(e);
+                            else if constexpr (SparseTrait)
+                                disabled = sparse->IsDisabled(e);
+                            else
+                                disabled = chunk->IsDisabled(col, i);
+                            if (disabled)
+                                return nullptr;
+                        }
+                    }
+                    return p;
+                }
+            }
+        };
+
+        template<typename T>
+        ASTRA_FORCEINLINE Fetch<T> MakeFetch(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, const StoreArray& st) const noexcept
+        {
+            using Bare = std::remove_const_t<T>;
+            Fetch<T> f;
+            const StoreRef& s = st[PlanIndex<Bare>];
+            if (m_kinds[PlanIndex<Bare>] == StorageKind::Universal)
+            {
+                f.isUniversal = true;
+                f.universal = s.universal;
+            }
+            else if constexpr (Fetch<T>::SparseTrait)
+            {
+                f.sparse = s.sparse;
+            }
+            else
+            {
+                f.chunk = chunk;
+                f.col = cm.idToColumn[TypeID<Bare>::Value()];
+                if constexpr (!std::is_empty_v<Bare>)
+                {
+                    if (f.col >= 0)
+                    {
+                        f.base = static_cast<Bare*>(chunk->GetComponentArrayByID(TypeID<Bare>::Value()));
+                        if constexpr (IsChangeTrackedV<Bare>)
+                            f.ticks = chunk->GetTicks(f.col);
+                    }
+                }
+            }
+            return f;
+        }
+
+        // Coarse stamp of the non-const TABLE-kind yields present on this archetype.
+        // Sparse/Universal elements have no chunk column; Task 25 stamps their stores.
+        template<typename T>
+        ASTRA_FORCEINLINE void StampTableYield([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
+                                               [[maybe_unused]] Tick now) const
+        {
+            if constexpr (Detail::IsMutableYield<T>)
+            {
+                using Bare = std::remove_const_t<T>;
+                if (m_kinds[PlanIndex<Bare>] != StorageKind::Table)
+                    return;
+                const int col = cm.idToColumn[TypeID<Bare>::Value()];
+                if (col >= 0)                                   // an Optional absent here has none
+                    chunk->StampColumn(col, now);
+            }
+        }
+        template<size_t... ReqIs, size_t... OptIs>
+        ASTRA_FORCEINLINE void StampChunkStorage([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
+                                                 [[maybe_unused]] Tick now, std::index_sequence<ReqIs...>, std::index_sequence<OptIs...>) const
+        {
+            (StampTableYield<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, now), ...);
+            (StampTableYield<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, now), ...);
+        }
+
+        // Tick slot for a Mut<T> yield, from the element's OWN store: the chunk's tick
+        // column for Table, SparseSet::Ticks / UniversalColumn::Ticks otherwise. A tracked
+        // type always has one; the scratch slot is only a Release-mode backstop so a
+        // broken invariant cannot write through null (Task 25 adds the coarse stamps).
+        template<typename T>
+        ASTRA_FORCEINLINE EntityTicks* TicksFor(Fetch<T>& f, Entity e, size_t i) const noexcept
+        {
+            EntityTicks* t = nullptr;
+            if (f.isUniversal)
+                t = f.universal ? f.universal->Ticks(e) : nullptr;
+            else if constexpr (Fetch<T>::SparseTrait)
+                t = f.sparse ? f.sparse->Ticks(e) : nullptr;
+            else
+                t = f.ticks ? f.ticks + i : nullptr;
+            ASTRA_ASSERT(t != nullptr, "View: a change-tracked Mut<T> yield has no tick slot in its store");
+            if (!t) ASTRA_UNLIKELY
+            {
+                thread_local EntityTicks s_backstop{};
+                return &s_backstop;
+            }
+            return t;
+        }
+
+        template<size_t K, typename F>
+        ASTRA_FORCEINLINE typename YieldType<std::tuple_element_t<K, RequiredTypes>>::type
+        MakeStorageYield([[maybe_unused]] F& f, std::remove_const_t<std::tuple_element_t<K, RequiredTypes>>* p,
+                         [[maybe_unused]] Entity e, [[maybe_unused]] size_t i, [[maybe_unused]] Tick now) const noexcept
+        {
+            using R = std::tuple_element_t<K, RequiredTypes>;
+            if constexpr (Detail::IsMutableYield<R> && IsChangeTrackedV<R>)
+                return Mut<R>(p, TicksFor(f, e, i), now);
+            else
+                return *p;
+        }
+
+        // One matching entity: fetch, yield, call. A required element missing HERE was
+        // removed by a structural change made inside this walk (the Debug guard reports
+        // it, s4.3, Task 25): the entity is skipped, never dereferenced.
+        template<bool Stamp, typename ReqTuple, typename OptTuple, typename Func, size_t... ReqIs, size_t... OptIs>
+        ASTRA_FORCEINLINE void InvokeStorageEntity(Entity e, size_t i, ReqTuple& req, OptTuple& opt, Func& func,
+                                                   [[maybe_unused]] Tick now,
+                                                   std::index_sequence<ReqIs...>, std::index_sequence<OptIs...>)
+        {
+            std::tuple<std::remove_const_t<std::tuple_element_t<ReqIs, RequiredTypes>>*...> rp{ std::get<ReqIs>(req).At(e, i)... };
+            if ((... || (std::get<ReqIs>(rp) == nullptr))) ASTRA_UNLIKELY
+                return;
+            std::tuple<std::remove_const_t<std::tuple_element_t<OptIs, OptionalTypes>>*...> op{ std::get<OptIs>(opt).OptionalAt(e, i)... };
+            std::tuple<typename YieldType<std::tuple_element_t<ReqIs, RequiredTypes>>::type...> y{
+                MakeStorageYield<ReqIs>(std::get<ReqIs>(req), std::get<ReqIs>(rp), e, i, now)... };
+            std::apply([&](auto&... r)
+            {
+                func(e, r..., static_cast<std::tuple_element_t<OptIs, OptionalTypes>*>(std::get<OptIs>(op))...);
+            }, y);
+        }
+
+        // The storage-path chunk visit (shared by the serial and parallel walks).
+        template<bool Stamp, typename Func, size_t... ReqIs, size_t... OptIs>
+        void VisitChunkStorage(Archetype* archetype, ArchetypeChunk* chunk, Func& func, Tick now, [[maybe_unused]] Tick since,
+                               std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
+        {
+            const size_t count = chunk->GetCount();
+            if (count == 0) ASTRA_UNLIKELY
+                return;
+            const ArchetypeColumnMeta& cm = archetype->GetColumnMeta();
+
+            ChunkFilter f;
+            if (!BuildChunkFilter(archetype, chunk, count, f))
+                return;                                   // Tier 2: nothing in this chunk can match
+
+            // Coarse stamp after every whole-chunk reject (Ruling B: a skipped chunk is
+            // not "visited" and must not be stamped).
+            if constexpr (Stamp)
+                StampChunkStorage(chunk, cm, now, reqSeq, optSeq);
+
+            std::tuple<Fetch<std::tuple_element_t<ReqIs, RequiredTypes>>...> req{
+                MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, m_stores)... };
+            std::tuple<Fetch<std::tuple_element_t<OptIs, OptionalTypes>>...> opt{
+                MakeFetch<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, m_stores)... };
+            const Entity* entities = chunk->GetEntities().data();
+
+            Detail::ForEachMatchingRun(f.exclude, f.nExclude, f.require, f.nRequire, count,
+                [&](size_t begin, size_t end)
+                {
+                    for (size_t i = begin; i < end; ++i)
+                        InvokeStorageEntity<Stamp>(entities[i], i, req, opt, func, now, reqSeq, optSeq);
+                });
+        }
+
+        // Size() over one archetype on the storage path: popcount of the match words.
+        size_t SizeStorage(Archetype* archetype) const
+        {
+            size_t total = 0;
+            for (auto& chunkPtr : archetype->GetChunks())
+            {
+                ArchetypeChunk* chunk = chunkPtr.get();
+                const size_t count = chunk->GetCount();
+                if (count == 0) ASTRA_UNLIKELY
+                    continue;
+                ChunkFilter f;
+                if (!BuildChunkFilter(archetype, chunk, count, f))
+                    continue;
+                total += Detail::CountMatching(f.exclude, f.nExclude, f.require, f.nRequire, count);
+            }
+            return total;
+        }
+
         // Exact visible-entity count for a required-filtered view: enabled-in-all
         // required enableable columns, per chunk. Called only when HasRequiredFilter.
         size_t SizeFiltered(Archetype* archetype)
         {
+            if (UsesStoragePath())
+                return SizeStorage(archetype);
             const ArchetypeColumnMeta& cm = archetype->GetColumnMeta();
             size_t total = 0;
             for (auto& chunkPtr : archetype->GetChunks())
@@ -1536,6 +1991,7 @@ namespace Astra
         size_t m_matchCount = 0;           // m_matchRequired.Count(): CollectArchetypes' pre-filter
         bool m_anyUniversal = false;       // some named type is Universal in this registry
         bool m_neverMatches = false;       // Not<U> on a Universal U
+        StoreArray m_stores{};             // resolved per walk (ResolveStores)
     };
 
     // Compile-time read/write access sets of a View's type args, for the scheduler
