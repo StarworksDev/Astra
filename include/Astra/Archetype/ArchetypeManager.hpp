@@ -683,6 +683,15 @@ namespace Astra
             return m_structuralChangeCounter.load(std::memory_order_acquire);
         }
 
+        ASTRA_NODISCARD uint32_t GetSparseStructuralCounter() const noexcept
+        {
+            return m_sparseStructuralCounter.load(std::memory_order_acquire);
+        }
+        void BumpSparseStructuralCounter() noexcept
+        {
+            m_sparseStructuralCounter.fetch_add(1, std::memory_order_release);
+        }
+
         // ---- Change-detection time (spec 2026-09-10 §3.1) ----
         // The one counter every stamp in this registry reads. Advanced by the
         // scheduler between system groups (SystemExecutor::BeginSystemGroup) or by
@@ -1656,6 +1665,12 @@ namespace Astra
         
         std::atomic<uint32_t> m_structuralChangeCounter{0};  // Fast path check
         std::atomic<uint32_t> m_archetypeRemovalCounter{0};  // Bumped when archetypes are deleted; views must fully re-collect
+        // Storage policies (spec s7.2/s4.3): bumped by every Sparse membership change
+        // (add, remove, destroy-walk erase, Clear). Sparse changes never touch the
+        // archetype set, so m_structuralChangeCounter stays put (no view-cache
+        // invalidation); this separate counter feeds the iteration-safety guard
+        // (Task 25) for views that walk sparse dense arrays.
+        std::atomic<uint32_t> m_sparseStructuralCounter{0};
         uint32_t m_generation = 1;  // Generation counter for new archetypes
         Tick m_tick = 1;   // change-detection time; see CurrentTick()
 
