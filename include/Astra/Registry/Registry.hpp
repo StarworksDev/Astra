@@ -1695,6 +1695,25 @@ namespace Astra
                 }
             }
 
+            // Universal side, spec-driven: an enableable Universal whose id never received a
+            // sparse slot is invisible to both loops above, yet a disabled flag on it still
+            // violates P3 (no slot means no mirror bit can exist). Find* only.
+            for (const UniversalSpec& spec : storage.UniversalSpecs())
+            {
+                const UniversalColumn* col = storage.FindUniversal(spec.id);
+                if (!col || !col->Descriptor().isEnableable) continue;
+                const int slot = storage.SparseSlotOf(spec.id);
+                col->ForEachLive([&](Entity e, const void*)
+                {
+                    if (!col->IsDisabled(e)) return;
+                    const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+                    if (slot < 0)
+                        fail("P3 universal disabled flag with no sparse slot (no mirror)", e, 0, rec && rec->chunk ? rec->location.GetEntityIndex() : 0);
+                    else if (rec && rec->chunk && !rec->chunk->IsSparseDisabled(static_cast<uint16_t>(slot), rec->location.GetEntityIndex()))
+                        fail("P3 universal disabled flag without its mirror bit", e, static_cast<uint16_t>(slot), rec->location.GetEntityIndex());
+                });
+            }
+
             if (violations > 32)
                 out += "... " + std::to_string(violations - 32) + " more violation(s)\n";
             return out;

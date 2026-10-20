@@ -195,3 +195,32 @@ TEST(SparseStructure, ValidatorIsSideEffectFree)
     EXPECT_TRUE(reg.ValidateStorageInvariants().empty());
     EXPECT_EQ(reg.GetComponentStorage()->UsedSparseSlotCount(), slots);
 }
+
+TEST(SparseStructure, UniversalStorageValidatorCatchesADisabledFlagWithNoMirror)
+{
+    Astra::Registry::Config cfg;
+    cfg.AddUniversal<UnE>();
+    Astra::Registry reg(cfg);
+    const Astra::Entity e = reg.CreateEntityWith(Position{});
+    ASSERT_TRUE(reg.ValidateStorageInvariants().empty());
+    Astra::UniversalColumn* col = reg.GetComponentStorage()->FindUniversal(Astra::TypeID<UnE>::Value());
+    ASSERT_NE(col, nullptr);
+    col->SetDisabled(e, true);   // corrupt P3: flag set, no slot and no mirror bit
+    const std::string report = reg.ValidateStorageInvariants();
+    EXPECT_NE(report.find("P3"), std::string::npos) << report;
+}
+
+TEST(SparseStructure, ValidatorReportsAStaleSparseMember)
+{
+    Astra::Registry reg;
+    const Astra::Entity keep = reg.CreateEntityWith(Position{});
+    reg.AddComponent<SpA>(keep, SpA{});
+    const Astra::Entity dead = reg.CreateEntityWith(Position{});
+    reg.DestroyEntity(dead);
+    ASSERT_TRUE(reg.ValidateStorageInvariants().empty());
+    Astra::SparseSet* set = reg.GetComponentStorage()->FindSparse(Astra::TypeID<SpA>::Value());
+    ASSERT_NE(set, nullptr);
+    set->Insert(dead);   // corrupt P1: a member whose entity is gone
+    const std::string report = reg.ValidateStorageInvariants();
+    EXPECT_NE(report.find("P1"), std::string::npos) << report;
+}
