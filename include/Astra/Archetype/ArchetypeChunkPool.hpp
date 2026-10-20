@@ -403,7 +403,7 @@ namespace Astra
                     void* srcPtr = base + lastIndex * stride;
 
                     // Destruct destination, move from source, then destruct the
-                    // moved-from source slot (mirrors Archetype::MoveEntitiesBetweenChunks).
+                    // moved-from source slot (the same pairing Archetype::CompactChunks uses).
                     desc.Destruct(dstPtr);
                     desc.MoveConstruct(dstPtr, srcPtr);
                     desc.Destruct(srcPtr);
@@ -600,7 +600,7 @@ namespace Astra
                 m_columnVersion[c] = tick;
         }
 
-        // Same-archetype relocation carry (CompactChunks / MoveEntitiesBetweenChunks):
+        // Same-archetype relocation carry (CompactChunks):
         // keep whichever of the two versions is newer so a recently-written entity
         // that gets repacked into a fresh chunk is never read as unchanged.
         ASTRA_FORCEINLINE void FoldColumnVersion(int column, Tick other) noexcept

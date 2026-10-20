@@ -1358,58 +1358,6 @@ namespace Astra
             }
         }
 
-        template<Component T, typename... Args>
-        void MoveEntitiesWithComponent(Archetype* srcArchetype, Archetype* dstArchetype, SmallVector<std::pair<Entity, EntityLocation>, 8>& entities, Args&&... args)
-        {
-            if (entities.empty())
-                return;
-            
-            size_t processedCount = 0;
-            for (size_t i = 0; i < entities.size(); ++i)
-            {
-                auto [entity, srcLocation] = entities[i];
-                
-                EntityLocation dstLocation = dstArchetype->AllocateEntitySlot(entity);
-                if (!dstLocation.IsValid()) ASTRA_UNLIKELY
-                {
-                    break;
-                }
-                
-                MoveAndAdd<T>(dstLocation, dstArchetype, srcLocation, srcArchetype, args...);
-                EntityRecord* rec = m_records->GetOrCreateRecord(entity.GetID());
-                SetRecordLocation(rec, dstArchetype, dstLocation);   // NEVER assign rec->version
-                ++processedCount;
-            }
-            
-            for (size_t idx = dstArchetype->m_firstNonFullChunkIndex; idx < dstArchetype->m_chunks.size(); ++idx)
-            {
-                if (!dstArchetype->m_chunks[idx]->IsFull())
-                {
-                    dstArchetype->m_firstNonFullChunkIndex = idx;
-                    break;
-                }
-            }
-            
-            // Sort processed entities by location in DESCENDING order before removal
-            // This ensures we remove from highest location to lowest, preventing
-            // swap-and-pop from invalidating locations we haven't processed yet
-            std::sort(entities.begin(), entities.begin() + processedCount,
-                [](const auto& a, const auto& b) { return a.second > b.second; });
-
-            // Remove processed entities from source archetype (now in descending location order)
-            for (size_t i = 0; i < processedCount; ++i)
-            {
-                auto& [entity, location] = entities[i];
-                if (auto movedEntity = srcArchetype->RemoveEntity(location)) ASTRA_LIKELY
-                {
-                    EntityRecord* movedRec = m_records->GetRecord(movedEntity->GetID());
-                    ASTRA_ASSERT(movedRec, "swap-moved entity must be live and located");
-                    SetRecordLocation(movedRec, srcArchetype, location);
-                }
-            }
-
-        }
-        
         template<typename Predicate>
         FlatMap<Archetype*, SmallVector<std::pair<Entity, EntityLocation>, 8>> GroupEntitiesByArchetype(std::span<Entity> entities, Predicate&& filter)
         {
@@ -1648,26 +1596,6 @@ namespace Astra
                     }
                 }
             }
-        }
-
-        /**
-         * Type-erased version of BatchMoveEntitiesWithComponent for CommandBuffer use.
-         */
-        size_t BatchMoveEntitiesWithComponentByID(Archetype* srcArchetype, Archetype* dstArchetype,
-                                                SmallVector<std::pair<Entity, EntityLocation>, 8>& entityBatch,
-                                                ComponentID componentId, const void* data, const ComponentDescriptor& desc)
-        {
-            return BatchMoveEntitiesInternal(srcArchetype, dstArchetype, entityBatch,
-                [componentId, data, &desc](Archetype* dst, const std::vector<EntityLocation>& locs)
-                {
-                    // Set the new component for all entities at their new locations
-                    for (const auto& location : locs)
-                    {
-                        auto [chunk, entityIdx] = dst->ResolveLocation(location);
-                        void* dstPtr = chunk->GetComponentPointer(componentId, entityIdx);
-                        desc.ConstructWith(dstPtr, data);
-                    }
-                });
         }
 
         // The ONLY sanctioned writers of a record's storage fields (archetype/chunk/
