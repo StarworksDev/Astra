@@ -7,11 +7,14 @@
 #include <utility>
 #include <vector>
 
+#include "../Archetype/ArchetypeChunkPool.hpp"
 #include "../Component/Component.hpp"
 #include "../Component/ComponentRegistry.hpp"
 #include "../Core/Assert.hpp"
 #include "../Core/Base.hpp"
+#include "../Core/Tick.hpp"
 #include "../Entity/Entity.hpp"
+#include "UniversalColumn.hpp"
 
 namespace Astra
 {
@@ -134,10 +137,106 @@ namespace Astra
 
         ASTRA_NODISCARD const std::vector<UniversalSpec>& UniversalSpecs() const noexcept { return m_universal; }
 
-        // Registry::Clear(): destroys every stored element IN PLACE (cached Views stay valid).
-        // Slot assignments and universal declarations survive (spec s7.3). There are no stores
-        // yet, so there is nothing to destroy; the SparseSet / UniversalColumn tasks extend it.
-        void Clear() noexcept {}
+        // ================= Universal columns (spec 2026-10-01 s4.2) =================
+
+        // Every store stamps change ticks from the owning ArchetypeManager's counter.
+        // The Registry sets this at construction and again in LoadInternal (a Load
+        // builds a new ArchetypeManager).
+        void SetTickSource(const Tick* tick) noexcept
+        {
+            m_tickSource = tick;
+            for (const UniversalSpec& spec : m_universal)
+                if (UniversalColumn* column = FindUniversal(spec.id))
+                    column->SetTickSource(tick);
+        }
+
+        ASTRA_NODISCARD bool HasUniversals() const noexcept { return !m_universal.empty(); }
+
+        // True once any universal column or sparse set exists. The Registry's destroy paths
+        // skip the storage walk entirely while this is false (G4: Table-only registries pay
+        // one predictable branch).
+        ASTRA_NODISCARD bool HasAnyStore() const noexcept { return m_storeCount != 0; }
+
+        // Lookup without creation. Read paths, which are const at the Registry, use this.
+        ASTRA_NODISCARD UniversalColumn* FindUniversal(ComponentID id) const noexcept
+        {
+            return id < MAX_COMPONENTS ? m_universalColumns[id].get() : nullptr;
+        }
+
+        // The column for a Universal-kind id, created on first use from the registered
+        // descriptor, which the column holds BY VALUE. Returns nullptr for any other kind,
+        // and for an id whose descriptor is not registered.
+        UniversalColumn* Universal(ComponentID id)
+        {
+            if (id >= MAX_COMPONENTS || KindOf(id) != StorageKind::Universal) ASTRA_UNLIKELY
+                return nullptr;
+            std::unique_ptr<UniversalColumn>& owned = m_universalColumns[id];
+            if (!owned) ASTRA_UNLIKELY
+            {
+                const ComponentDescriptor* desc = m_registry ? m_registry->GetComponentDescriptor(id) : nullptr;
+                if (!desc) ASTRA_UNLIKELY
+                    return nullptr;
+                owned = std::make_unique<UniversalColumn>(*desc);
+                owned->SetTickSource(m_tickSource);
+                ++m_storeCount;
+            }
+            return owned.get();
+        }
+
+        // Spec s4.2. Construction order for one freshly placed entity:
+        //   (1) every universal the caller did NOT supply is default-constructed;
+        //   (2) the registry's init runs for exactly those, never over a supplied value.
+        // A supplied value was already move-constructed by the caller (ConstructMove)
+        // before this runs. Two passes, so that an init may read any other universal of
+        // the same entity.
+        void ConstructUniversals(Entity e, const ComponentID* supplied, size_t suppliedCount)
+        {
+            const auto isSupplied = [supplied, suppliedCount](ComponentID id) noexcept
+            {
+                for (size_t i = 0; i < suppliedCount; ++i)
+                    if (supplied[i] == id)
+                        return true;
+                return false;
+            };
+            for (const UniversalSpec& spec : m_universal)
+            {
+                if (isSupplied(spec.id))
+                    continue;
+                if (UniversalColumn* column = Universal(spec.id)) ASTRA_LIKELY
+                    (void)column->Construct(e);
+            }
+            for (const UniversalSpec& spec : m_universal)
+            {
+                if (!spec.init || isSupplied(spec.id))
+                    continue;
+                if (UniversalColumn* column = FindUniversal(spec.id))
+                    if (void* component = column->Get(e))
+                        spec.init(e, component, spec.user);
+            }
+        }
+
+        // Destroy hook (spec s7.3). Called after EntityDestroyed and before the archetype
+        // swap-remove. Destroys e's slot in every universal column. Task 11 adds the
+        // sparse erase. Chunk C replaces that erase with the presence-block walk, which
+        // reads `chunk`/`index`.
+        void OnEntityDestroyed(Entity e, ArchetypeChunk& chunk, size_t index)
+        {
+            (void)chunk;
+            (void)index;
+            for (const UniversalSpec& spec : m_universal)
+                if (UniversalColumn* column = FindUniversal(spec.id))
+                    column->Destroy(e);
+        }
+
+        // Registry::Clear (spec s7.3): destroys every element IN PLACE (cached Views stay
+        // valid). The columns, their descriptors and the specs survive, and so do the
+        // sparse-slot assignments.
+        void Clear()
+        {
+            for (const UniversalSpec& spec : m_universal)
+                if (UniversalColumn* column = FindUniversal(spec.id))
+                    column->Clear();
+        }
 
     private:
         // One lookup loop: the mutable form goes through the const one.
@@ -152,5 +251,8 @@ namespace Astra
         std::array<int16_t, MAX_COMPONENTS> m_slotOf{};                      // id -> sparse slot, -1 = none
         std::array<ComponentID, MAX_SPARSE_COMPONENTS> m_componentOfSlot{};  // slot -> id, INVALID_COMPONENT = free
         size_t m_usedSlots = 0;
+        std::array<std::unique_ptr<UniversalColumn>, MAX_COMPONENTS> m_universalColumns{};
+        const Tick* m_tickSource = nullptr;
+        std::uint32_t m_storeCount = 0;   // columns + sparse sets created so far (HasAnyStore)
     };
 }

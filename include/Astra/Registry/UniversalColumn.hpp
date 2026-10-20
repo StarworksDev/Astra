@@ -120,6 +120,12 @@ namespace Astra
             return (page && page->ticks) ? &page->ticks[SlotOf(e)] : nullptr;
         }
 
+        ASTRA_NODISCARD const EntityTicks* Ticks(Entity e) const noexcept
+        {
+            const Page* page = FindLive(e);
+            return (page && page->ticks) ? &page->ticks[SlotOf(e)] : nullptr;
+        }
+
         // Write-side stamp (Registry::GetComponent / Modified / SetIfNeq): bump the page
         // version and, for a tracked type, the slot's `changed`. Returns false for an
         // absent or stale handle, or for a tag, which has no value (the Table rule for a

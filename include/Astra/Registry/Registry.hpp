@@ -35,6 +35,8 @@
 
 namespace Astra
 {
+    class CommandBuffer;   // friend: its create executors use the private creation funnel
+
     class Registry
     {
     public:
@@ -93,7 +95,9 @@ namespace Astra
             m_workScheduler(config.workScheduler),
             m_config(config),
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
-        {}
+        {
+            m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+        }
 
         Registry(const EntityManager::Config& entityConfig, const ArchetypeChunkPool::Config& chunkConfig) :
             m_entityManager(entityConfig),
@@ -105,7 +109,9 @@ namespace Astra
             m_workScheduler(nullptr),
             m_config{entityConfig, chunkConfig, {}, nullptr},
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
-        {}
+        {
+            m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+        }
 
         Registry(std::shared_ptr<ComponentRegistry> componentRegistry, const Config& config = {}) :
             m_entityManager(config.entityManagerConfig),
@@ -117,7 +123,9 @@ namespace Astra
             m_workScheduler(config.workScheduler),
             m_config(config),
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
-        {}
+        {
+            m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+        }
 
         // A Registry is a heavy, stateful container: copying is not supported (the old
         // (const Registry&, Config) ctor looked like a copy but silently produced an empty
@@ -134,14 +142,18 @@ namespace Astra
             Entity entity = m_entityManager.Create();
             if (!entity.IsValid()) ASTRA_UNLIKELY
                 return Entity::Invalid();
-            
-            // Use AddEntity for default-constructed components
-            m_archetypeManager->AddEntity<Components...>(entity);
-            
-            m_signalManager.Emit<Events::EntityCreated>(entity);
-            
-            if constexpr (sizeof...(Components) > 0)
+
+            if constexpr (sizeof...(Components) == 0)
             {
+                return CreateEntityInternal(entity);
+            }
+            else
+            {
+                m_archetypeManager->AddEntity<Components...>(entity);
+                ConstructUniversalsFor(entity, nullptr, 0);
+
+                m_signalManager.Emit<Events::EntityCreated>(entity);
+
                 if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
                 {
                     // Get the entity location to retrieve components for signals
@@ -151,11 +163,11 @@ namespace Astra
                         ((m_signalManager.Emit<Events::ComponentAdded>(entity, TypeID<Components>::Value(), record->archetype->GetComponent<Components>(record->location))), ...);
                     }
                 }
+                EmitUniversalAdded(entity);
+                return entity;
             }
-            
-            return entity;
         }
-        
+
         template<Component... Components>
         Entity CreateEntityWith(Components&&... components)
         {
@@ -166,6 +178,7 @@ namespace Astra
             
             // Use AddEntityWith for components with values
             m_archetypeManager->AddEntityWith(entity, std::forward<Components>(components)...);
+            ConstructUniversalsFor(entity, nullptr, 0);
             
             m_signalManager.Emit<Events::EntityCreated>(entity);
             
@@ -179,6 +192,8 @@ namespace Astra
                 }
             }
             
+            EmitUniversalAdded(entity);
+
             return entity;
         }
 
@@ -198,6 +213,11 @@ namespace Astra
 
             // Use unified batch AddEntities - handles archetype selection internally
             m_archetypeManager->AddEntities<Components...>(outEntities.subspan(0, created));
+            if (m_componentStorage->HasUniversals()) ASTRA_UNLIKELY
+            {
+                for (size_t i = 0; i < created; ++i)
+                    m_componentStorage->ConstructUniversals(outEntities[i], nullptr, 0);
+            }
 
             if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
             {
@@ -222,6 +242,9 @@ namespace Astra
                 }
             }
 
+            for (size_t i = 0; i < created; ++i)
+                EmitUniversalAdded(outEntities[i]);
+
             return created;
         }
 
@@ -240,6 +263,11 @@ namespace Astra
                 return 0;
 
             m_archetypeManager->AddEntitiesWith<Components...>(outEntities.subspan(0, created), std::forward<Generator>(generator));
+            if (m_componentStorage->HasUniversals()) ASTRA_UNLIKELY
+            {
+                for (size_t i = 0; i < created; ++i)
+                    m_componentStorage->ConstructUniversals(outEntities[i], nullptr, 0);
+            }
 
             if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
             {
@@ -261,6 +289,9 @@ namespace Astra
                 }
             }
 
+            for (size_t i = 0; i < created; ++i)
+                EmitUniversalAdded(outEntities[i]);
+
             return created;
         }
 
@@ -278,6 +309,16 @@ namespace Astra
             if (m_signalManager.IsSignalEnabled(Signal::EntityDestroyed)) ASTRA_UNLIKELY
             {
                 m_signalManager.Emit<Events::EntityDestroyed>(entity);
+            }
+
+            // Spec s7.3: storage teardown after EntityDestroyed (handlers can still read
+            // every component) and before the archetype swap-remove. Per-component
+            // ComponentRemoved is NOT emitted on destroy (today's behaviour).
+            if (m_componentStorage->HasAnyStore()) ASTRA_UNLIKELY
+            {
+                ASTRA_ASSERT(rec->chunk, "DestroyEntity: located record without a chunk");
+                if (rec->chunk)
+                    m_componentStorage->OnEntityDestroyed(entity, *rec->chunk, rec->location.GetEntityIndex());
             }
 
             m_archetypeManager->RemoveEntity(entity, rec);
@@ -332,6 +373,16 @@ namespace Astra
                 }
             }
                 
+            if (m_componentStorage->HasAnyStore()) ASTRA_UNLIKELY
+            {
+                for (Entity entity : validEntities)
+                {
+                    const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+                    if (rec && rec->chunk)
+                        m_componentStorage->OnEntityDestroyed(entity, *rec->chunk, rec->location.GetEntityIndex());
+                }
+            }
+
             m_archetypeManager->RemoveEntities(validEntities);
             
             for (Entity entity : validEntities)
@@ -572,6 +623,8 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return nullptr;
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreGet<T>(entity);
             return m_archetypeManager->GetComponentMut<T>(entity);
         }
 
@@ -581,6 +634,8 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return nullptr;
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreGet<T>(entity);
             return m_archetypeManager->GetComponent<T>(entity);
         }
 
@@ -590,6 +645,8 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return false;
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreLookup(entity, TypeID<T>::Value()) != nullptr;
             return m_archetypeManager->HasComponent<T>(entity);
         }
 
@@ -1321,7 +1378,7 @@ namespace Astra
         
         void Clear()
         {
-            m_componentStorage->Clear();   // in place -- slot assignments + universal declarations survive (spec s7.3)
+            m_componentStorage->Clear();   // destroy every store element first, in place; slot assignments + universal declarations survive (spec s7.3)
             m_archetypeManager->Clear();   // in place -- keeps cached Views/Relations valid
             m_relationshipGraph->Clear();
             m_entityManager.Clear();
@@ -1884,6 +1941,113 @@ namespace Astra
         }
 
     private:
+        friend class CommandBuffer;   // ExecuteCreateEntity/ExecuteCreateEntities -> CreateEntityInternal
+
+        // ---- Storage routing (spec 2026-10-01 s3.3) ----
+        // A component's effective kind in THIS registry. Out-of-range ids (a refused
+        // registration) are reported as Table, so the archetype path refuses them as it
+        // does today.
+        template<Component T>
+        ASTRA_NODISCARD StorageKind KindOfT() const noexcept
+        {
+            const ComponentID id = TypeID<T>::Value();
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return StorageKind::Table;
+            return m_componentStorage->KindOf(id);
+        }
+
+        // True when T's value lives in a ComponentStorage store rather than a chunk
+        // column. A Table-trait T is a store kind only when this registry declares it
+        // universal: one predictable bool load in a registry with no universal (G4).
+        // Task 11 adds the compile-time Sparse arm.
+        template<Component T>
+        ASTRA_NODISCARD bool RoutesToStore() const noexcept
+        {
+            return m_componentStorage->HasUniversals() && KindOfT<T>() == StorageKind::Universal;
+        }
+
+        // Non-stamping, type-erased store lookup: the element pointer (or
+        // EmptyComponentSentinel() for a present tag), or nullptr when absent or stale.
+        // Task 11 adds the Sparse arm.
+        ASTRA_NODISCARD void* StoreLookup(Entity entity, ComponentID id) const noexcept
+        {
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return nullptr;
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Universal:
+                {
+                    UniversalColumn* column = m_componentStorage->FindUniversal(id);
+                    return column ? column->Get(entity) : nullptr;
+                }
+                default:
+                    return nullptr;
+            }
+        }
+
+        // Typed twin of StoreLookup. A present tag yields a per-type static, the same
+        // convention ArchetypeChunk::GetComponent<T> uses for a column-less tag.
+        template<Component T>
+        ASTRA_NODISCARD T* StoreGet(Entity entity) const noexcept
+        {
+            void* p = StoreLookup(entity, TypeID<T>::Value());
+            if (!p)
+                return nullptr;
+            if constexpr (std::is_empty_v<T>)
+            {
+                static T emptyInstance{};
+                return &emptyInstance;
+            }
+            else
+            {
+                return static_cast<T*>(p);
+            }
+        }
+
+        // ---- Creation funnel (spec 2026-10-01 s4.2, s7.1) ----
+        // Universal construction for a freshly placed entity (steps 1-2). `supplied` lists
+        // the universal ids whose value the caller already moved in; those skip default
+        // and init. Costs one branch in a registry with no universal.
+        void ConstructUniversalsFor(Entity entity, const ComponentID* supplied, size_t suppliedCount)
+        {
+            if (m_componentStorage->HasUniversals()) ASTRA_UNLIKELY
+                m_componentStorage->ConstructUniversals(entity, supplied, suppliedCount);
+        }
+
+        // Step 3: ComponentAdded once for every universal of `entity`, after EntityCreated
+        // and after the pack's own ComponentAdded. Supplied or not, a universal is "added"
+        // at create (s3.3 signals row). By-id payload: a present tag yields
+        // EmptyComponentSentinel().
+        void EmitUniversalAdded(Entity entity)
+        {
+            if (!m_componentStorage->HasUniversals()) ASTRA_LIKELY
+                return;
+            if (!m_signalManager.IsSignalEnabled(Signal::ComponentAdded)) ASTRA_LIKELY
+                return;
+            for (const UniversalSpec& spec : m_componentStorage->UniversalSpecs())
+            {
+                UniversalColumn* column = m_componentStorage->FindUniversal(spec.id);
+                if (!column)
+                    continue;
+                if (void* component = column->Get(entity))
+                    m_signalManager.Emit<Events::ComponentAdded>(entity, spec.id, component);
+            }
+        }
+
+        // THE single-entity creation funnel. Every create path without a component pack
+        // ends here, including the CommandBuffer executors, so universal construction and
+        // init cannot be skipped. `preallocated` is a live id that has no location yet.
+        Entity CreateEntityInternal(Entity preallocated)
+        {
+            if (!preallocated.IsValid()) ASTRA_UNLIKELY
+                return Entity::Invalid();
+            m_archetypeManager->AddEntity(preallocated);   // root archetype
+            ConstructUniversalsFor(preallocated, nullptr, 0);
+            m_signalManager.Emit<Events::EntityCreated>(preallocated);
+            EmitUniversalAdded(preallocated);
+            return preallocated;
+        }
+
         /**
          * Internal helper to load registry from reader
          */
@@ -1926,6 +2090,9 @@ namespace Astra
             // m_archetypeManager->Deserialize. (Redundant with the ctor's store today; load-bearing
             // from Task 9, when the tick source points into the rebuilt ArchetypeManager.)
             registry->m_componentStorage = std::make_shared<ComponentStorage>(componentRegistry, config.universal);
+            // The stores stamp from the archetype manager's counter. Both were just
+            // rebuilt, so re-point them; a stale pointer would be a use-after-free.
+            registry->m_componentStorage->SetTickSource(registry->m_archetypeManager->TickSource());
             if (!registry->m_archetypeManager->Deserialize(reader))
             {
                 return Result<std::unique_ptr<Registry>, SerializationError>::Err(SerializationError::CorruptedData);

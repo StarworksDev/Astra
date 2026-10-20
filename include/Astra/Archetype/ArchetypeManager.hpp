@@ -697,6 +697,11 @@ namespace Astra
             return m_tick;
         }
 
+        // Address of the change-detection counter, for stores that stamp outside a chunk
+        // (ComponentStorage, spec 2026-10-01 s4). Stable for this manager's lifetime; a
+        // Load builds a new manager, so the registry re-points its stores (LoadInternal).
+        ASTRA_NODISCARD const Tick* TickSource() const noexcept { return &m_tick; }
+
         /**
          * Resets the manager to a freshly-constructed state IN PLACE: every
          * archetype (including the old root) is destroyed, the entity map,

@@ -1449,8 +1449,9 @@ namespace Astra
             // AddEntity(). Report+skip via the same false-return path.
             if (cmd->entity == Entity::Invalid())
                 return false;
-            m_registry->GetArchetypeManager()->AddEntity(cmd->entity);
-            m_registry->GetSignalManager()->Emit<Events::EntityCreated>(cmd->entity);
+            // The Registry's creation funnel (spec 2026-10-01 s7.1): root placement,
+            // universal construction + init, EntityCreated, universal ComponentAdded.
+            m_registry->CreateEntityInternal(cmd->entity);
             // Commit point: cmd->entity now has a live archetype row and must
             // be excluded from any later RollbackAllocatedEntities() in this
             // Execute() call. m_allocatedEntities is populated in the same
@@ -1474,9 +1475,6 @@ namespace Astra
             auto* cmd = reinterpret_cast<CreateEntitiesPayload*>(payload);
             Entity* entities = reinterpret_cast<Entity*>(cmd + 1);
 
-            auto* archetypeManager = m_registry->GetArchetypeManager();
-            auto* signalManager = m_registry->GetSignalManager();
-
             for (uint32_t i = 0; i < cmd->entityCount; ++i)
             {
                 // A deferred-mode placeholder whose flush-time allocation failed
@@ -1486,8 +1484,7 @@ namespace Astra
                 // fires for them.
                 if (entities[i] == Entity::Invalid())
                     continue;
-                archetypeManager->AddEntity(entities[i]);
-                signalManager->Emit<Events::EntityCreated>(entities[i]);
+                m_registry->CreateEntityInternal(entities[i]);
             }
             // Commit point for the whole batch: see ExecuteCreateEntity for
             // why this keeps m_allocatedEntities' committed set a prefix.
