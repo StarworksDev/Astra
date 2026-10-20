@@ -945,6 +945,9 @@ namespace Astra
             // of the counter is never mistaken for an in-loop structural change.
             const uint32_t debugStartStructuralChangeCounter =
                 m_archetypeManager->m_structuralChangeCounter.load(std::memory_order_acquire);
+            // Sparse adds/removes never touch the archetype set, so they have their own
+            // counter (Task 16); a sparse change inside the walk is reported like a table one.
+            const uint32_t debugStartSparseCounter = m_archetypeManager->GetSparseStructuralCounter();
 #endif
 
             if (m_archetypes.empty()) ASTRA_UNLIKELY
@@ -957,7 +960,8 @@ namespace Astra
             }
 
 #ifdef ASTRA_BUILD_DEBUG
-            ASTRA_ASSERT(m_archetypeManager->m_structuralChangeCounter.load(std::memory_order_acquire) == debugStartStructuralChangeCounter,
+            ASTRA_ASSERT(m_archetypeManager->m_structuralChangeCounter.load(std::memory_order_acquire) == debugStartStructuralChangeCounter &&
+                         m_archetypeManager->GetSparseStructuralCounter() == debugStartSparseCounter,
                 "Structural mutation (create/destroy entity, add/remove component) detected during View::ForEach. "
                 "Defer structural changes into a CommandBuffer and call Execute() after the loop.");
 #endif
@@ -1830,10 +1834,89 @@ namespace Astra
             (StampTableYield<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, now), ...);
         }
 
+        // ---- Write stamps for Sparse/Universal yields (spec s6.4) ----
+        // Mut<T> marks the element's own ticks (TicksFor). The helpers below stamp the
+        // sources Registry::IsChanged reads for the NON-tracked and raw-pointer yields.
+
+        // Coarse write stamp of a non-const UNTRACKED Sparse yield: the per-component
+        // version IsChanged reads for untracked Sparse (Task 20), once per visited chunk
+        // -- the Table column stamp's twin. SHARED LOCATION (Task 28 atomic_ref pass):
+        // ComponentStorage's coarse slot for this component.
+        template<typename T>
+        ASTRA_FORCEINLINE void StampSparseCoarse([[maybe_unused]] ComponentStorage* storage, [[maybe_unused]] Tick now) const
+        {
+            using Bare = std::remove_const_t<T>;
+            if constexpr (Detail::IsMutableYield<T> && !IsChangeTrackedV<Bare> && StorageOfV<Bare> == Storage::Sparse)
+            {
+                if (storage)
+                    storage->StampCoarse(TypeID<Bare>::Value(), now);
+            }
+        }
+
+        // The "stamp a visit" helper: everything a visited (not whole-chunk-rejected)
+        // chunk stamps once -- the Table column versions and the untracked-Sparse coarse
+        // versions. Tasks 28 and 29 call this instead of repeating the folds.
+        template<size_t... ReqIs, size_t... OptIs>
+        ASTRA_FORCEINLINE void StampVisit(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, Tick now,
+                                          std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq) const
+        {
+            StampChunkStorage(chunk, cm, now, reqSeq, optSeq);
+            ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
+            (StampSparseCoarse<std::tuple_element_t<ReqIs, RequiredTypes>>(storage, now), ...);
+            (StampSparseCoarse<std::tuple_element_t<OptIs, OptionalTypes>>(storage, now), ...);
+        }
+
+        // Per-entity write stamp of a non-const UNTRACKED Universal required yield: its
+        // page version, the per-entity twin of the column stamp. A tracked one is handed
+        // out as Mut<T>, which marks on use. SHARED LOCATION (Task 28 atomic_ref pass):
+        // the Universal page version.
+        template<typename T, typename F>
+        ASTRA_FORCEINLINE void StampRequiredStore([[maybe_unused]] F& f, [[maybe_unused]] Entity e, [[maybe_unused]] Tick now) const noexcept
+        {
+            if constexpr (Detail::IsMutableYield<T> && !IsChangeTrackedV<std::remove_const_t<T>>)
+            {
+                if (f.isUniversal && f.universal)
+                    f.universal->MarkWritten(e, now);
+            }
+        }
+
+        // A PRESENT non-const Optional (plan deviation 5: a tracked one is yielded as a
+        // raw pointer, so it marks unconditionally, for every kind); an untracked
+        // Universal one bumps its page (SHARED LOCATION, Task 28). Untracked Sparse:
+        // StampSparseCoarse; untracked Table: the chunk column stamp. `present` is the
+        // pointer about to be handed out (null when absent or disabled).
+        template<typename T, typename F>
+        ASTRA_FORCEINLINE void StampOptionalStore([[maybe_unused]] F& f, [[maybe_unused]] const void* present,
+                                                  [[maybe_unused]] Entity e, [[maybe_unused]] size_t i,
+                                                  [[maybe_unused]] Tick now) const noexcept
+        {
+            if constexpr (Detail::IsMutableYield<T>)
+            {
+                using Bare = std::remove_const_t<T>;
+                if (!present)
+                    return;
+                if (f.isUniversal)
+                {
+                    if (f.universal)
+                        f.universal->MarkWritten(e, now);
+                }
+                else if constexpr (IsChangeTrackedV<Bare>)
+                {
+                    if constexpr (F::SparseTrait)
+                    {
+                        if (EntityTicks* t = f.sparse->Ticks(e))
+                            t->changed = now;
+                    }
+                    else if (f.ticks)
+                        f.ticks[i].changed = now;
+                }
+            }
+        }
+
         // Tick slot for a Mut<T> yield, from the element's OWN store: the chunk's tick
         // column for Table, SparseSet::Ticks / UniversalColumn::Ticks otherwise. A tracked
         // type always has one; the scratch slot is only a Release-mode backstop so a
-        // broken invariant cannot write through null (Task 25 adds the coarse stamps).
+        // broken invariant cannot write through null.
         template<typename T>
         ASTRA_FORCEINLINE EntityTicks* TicksFor(Fetch<T>& f, Entity e, size_t i) const noexcept
         {
@@ -1877,6 +1960,11 @@ namespace Astra
             if ((... || (std::get<ReqIs>(rp) == nullptr))) ASTRA_UNLIKELY
                 return;
             std::tuple<std::remove_const_t<std::tuple_element_t<OptIs, OptionalTypes>>*...> op{ std::get<OptIs>(opt).OptionalAt(e, i)... };
+            if constexpr (Stamp)
+            {
+                (StampRequiredStore<std::tuple_element_t<ReqIs, RequiredTypes>>(std::get<ReqIs>(req), e, now), ...);
+                (StampOptionalStore<std::tuple_element_t<OptIs, OptionalTypes>>(std::get<OptIs>(opt), std::get<OptIs>(op), e, i, now), ...);
+            }
             std::tuple<typename YieldType<std::tuple_element_t<ReqIs, RequiredTypes>>::type...> y{
                 MakeStorageYield<ReqIs>(std::get<ReqIs>(req), std::get<ReqIs>(rp), e, i, now)... };
             std::apply([&](auto&... r)
@@ -1902,7 +1990,7 @@ namespace Astra
             // Coarse stamp after every whole-chunk reject (Ruling B: a skipped chunk is
             // not "visited" and must not be stamped).
             if constexpr (Stamp)
-                StampChunkStorage(chunk, cm, now, reqSeq, optSeq);
+                StampVisit(chunk, cm, now, reqSeq, optSeq);
 
             std::tuple<Fetch<std::tuple_element_t<ReqIs, RequiredTypes>>...> req{
                 MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, m_stores)... };
