@@ -1572,34 +1572,10 @@ namespace Astra
                     // Copy new component data - use memcpy for trivially copyable types. An
                     // enableable tag's bit-only column (size 0) has no data; the by-id add
                     // path may pass componentData == nullptr for a tag, so write nothing.
+                    // The shared ladder (memcpy / constructWith / copy / move-out-of-buffer
+                    // for a move-only type / default) lives on the descriptor.
                     if (newDesc.size != 0) ASTRA_LIKELY
-                    {
-                        if (newDesc.is_trivially_copyable)
-                        {
-                            std::memcpy(dstPtr, componentData, newDesc.size);
-                        }
-                        else if (newDesc.constructWith)
-                        {
-                            newDesc.constructWith(dstPtr, componentData);
-                        }
-                        else if (newDesc.copyConstruct)
-                        {
-                            newDesc.copyConstruct(dstPtr, componentData);
-                        }
-                        else if (newDesc.moveConstruct)
-                        {
-                            // Move-only component: the CommandBuffer move-constructed the
-                            // value into its own storage, so move it out (the buffer's copy
-                            // is destructed after flush). Without this the slot was left
-                            // uninitialized.
-                            newDesc.moveConstruct(dstPtr, const_cast<void*>(componentData));
-                        }
-                        else
-                        {
-                            // Never-UB floor (mirrors ComponentDescriptor::ConstructWith).
-                            newDesc.DefaultConstruct(dstPtr);
-                        }
-                    }
+                        newDesc.ConstructFromErased(dstPtr, componentData);
                 }
                 else
                 {

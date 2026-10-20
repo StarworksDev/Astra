@@ -277,6 +277,24 @@ namespace Astra
             }
         }
         
+        // Constructs into UNINITIALIZED `dst` from a type-erased source: the one
+        // construction ladder of the by-id add paths (ArchetypeManager::MoveAndAddByID,
+        // Registry's Sparse by-id add). memcpy for a trivially copyable type, else the
+        // specialized constructWith, copy, MOVE out of `src` for a move-only type (the
+        // CommandBuffer move-constructed the value into its own storage and destructs
+        // it after flush), and finally default construction (never-UB floor). A tag
+        // (size 0) has nothing to write.
+        inline void ConstructFromErased(void* dst, const void* src) const
+        {
+            if (size == 0)
+                return;
+            if (is_trivially_copyable)       std::memcpy(dst, src, size);
+            else if (constructWith)          constructWith(dst, src);
+            else if (copyConstruct)          copyConstruct(dst, src);
+            else if (moveConstruct)          moveConstruct(dst, const_cast<void*>(src));
+            else                             DefaultConstruct(dst);
+        }
+
         inline void BatchDefaultConstruct(void* ptr, size_t count) const
         {
             if (size == 0)

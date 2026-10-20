@@ -540,6 +540,16 @@ namespace Astra
             if (validEntities.empty())
                 return;
 
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                {
+                    SparseBatchAdd<T>(std::span<const Entity>(validEntities.data(), validEntities.size()),
+                                      [&component] { return T(component); });
+                    return;
+                }
+            }
+
             m_archetypeManager->AddComponents<T>(validEntities, component);
             
             // Emit signals for all entities if enabled
@@ -584,6 +594,19 @@ namespace Astra
             if (validEntities.empty())
                 return;
 
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                {
+                    // One value from `args`, copied to each entity (as the Table batch does);
+                    // so, like it, this needs a copyable T.
+                    const T prototype(std::forward<Args>(args)...);
+                    SparseBatchAdd<T>(std::span<const Entity>(validEntities.data(), validEntities.size()),
+                                      [&prototype] { return T(prototype); });
+                    return;
+                }
+            }
+
             // Batch add components
             m_archetypeManager->AddComponents<T>(validEntities, std::forward<Args>(args)...);
             
@@ -608,7 +631,12 @@ namespace Astra
                 return 0;
             if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
                 return RefuseUniversalRemoveBatch(entities);
-            
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                    return SparseBatchRemove<T>(entities);
+            }
+
             // Filter out invalid entities
             SmallVector<Entity, 256> validEntities;
             validEntities.reserve(entities.size());
@@ -901,6 +929,8 @@ namespace Astra
         {
             if (IsUniversalId(componentId)) ASTRA_UNLIKELY
                 return false;  // present on every entity: the by-id Table rule for a present component
+            if (IsSparseId(componentId)) ASTRA_UNLIKELY
+                return SparseAddByID(entity, componentId, data, dataSize, /*emit*/ true);
 
             bool result = m_archetypeManager->AddComponentByID(entity, componentId, data, dataSize);
 
@@ -951,6 +981,13 @@ namespace Astra
         {
             if (IsUniversalId(componentId)) ASTRA_UNLIKELY
                 return 0;
+            if (IsSparseId(componentId)) ASTRA_UNLIKELY
+            {
+                size_t added = 0;
+                for (Entity e : entities)
+                    added += SparseAddByID(e, componentId, data, dataSize, /*emit*/ false) ? 1u : 0u;
+                return added;
+            }
 
             return m_archetypeManager->AddComponentsByID(entities, componentId, data, dataSize);
         }
@@ -966,6 +1003,8 @@ namespace Astra
         {
             if (IsUniversalId(componentId)) ASTRA_UNLIKELY
                 return m_entityManager.IsValid(entity) ? RefuseUniversalRemove() : false;
+            if (IsSparseId(componentId)) ASTRA_UNLIKELY
+                return SparseRemoveByID(entity, componentId, /*emit*/ true);
 
             // Get component pointer before removal for signal emission
             void* componentPtr = nullptr;
@@ -1016,6 +1055,13 @@ namespace Astra
         {
             if (IsUniversalId(componentId)) ASTRA_UNLIKELY
                 return RefuseUniversalRemoveBatch(entities);
+            if (IsSparseId(componentId)) ASTRA_UNLIKELY
+            {
+                size_t removed = 0;
+                for (Entity e : entities)
+                    removed += SparseRemoveByID(e, componentId, /*emit*/ false) ? 1u : 0u;
+                return removed;
+            }
 
             return m_archetypeManager->RemoveComponentsByID(entities, componentId);
         }
@@ -2411,6 +2457,139 @@ namespace Astra
             rec.chunk->SetSparsePresent(static_cast<uint16_t>(slot), rec.location.GetEntityIndex(), false);
             m_archetypeManager->BumpSparseStructuralCounter();
             return true;
+        }
+
+        // True when `id` is a Sparse component in this registry (a Universal declaration
+        // wins, so a Sparse-trait type declared Universal is not). Runtime twin of
+        // ResolveKind<T>() == Sparse for the type-erased paths.
+        ASTRA_NODISCARD bool IsSparseId(ComponentID id) const noexcept
+        {
+            return m_componentStorage->KindOf(id) == StorageKind::Sparse;
+        }
+
+        // Overwrites a default-constructed element with the type-erased source through
+        // the descriptor's shared construction ladder (also MoveAndAddByID's).
+        static void AssignErased(const ComponentDescriptor& desc, void* dst, const void* src)
+        {
+            if (!desc.is_trivially_copyable)
+                desc.Destruct(dst);
+            desc.ConstructFromErased(dst, src);
+        }
+
+        // By-id Sparse add with ArchetypeManager::AddComponentByID contract: false for
+        // an unknown id, a size mismatch, a stale handle, an id the entity already holds,
+        // or a slot-cap refusal. `emit` gates ComponentAdded (the batch form never emits).
+        bool SparseAddByID(Entity entity, ComponentID id, const void* data, size_t dataSize, bool emit)
+        {
+            const ComponentDescriptor* desc = m_componentRegistry->GetComponentDescriptor(id);
+            if (!desc) ASTRA_UNLIKELY
+                return false;
+            if (dataSize != desc->size && desc->size > 0) ASTRA_UNLIKELY
+                return false;
+            if (!m_entityManager.IsValid(entity)) ASTRA_UNLIKELY
+                return false;                              // SparseSet::Insert takes only a LIVE handle
+            const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+            if (!rec || !rec->chunk) ASTRA_UNLIKELY
+                return false;
+            if (const SparseSet* set = m_componentStorage->FindSparse(id); set && set->Contains(entity))
+                return false;
+            void* element = SparseAttach(entity, *rec, id, nullptr);   // default-constructed
+            if (!element) ASTRA_UNLIKELY
+                return false;
+            if (desc->size > 0 && data)
+                AssignErased(*desc, element, data);
+            if (emit && m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
+                m_signalManager.Emit<Events::ComponentAdded>(entity, id, element);
+            return true;
+        }
+
+        // By-id Sparse remove: ComponentRemoved (when `emit`) BEFORE the erase, with the
+        // element pointer (the sentinel for a tag); false when stale or absent.
+        // Non-creating (G2).
+        bool SparseRemoveByID(Entity entity, ComponentID id, bool emit)
+        {
+            const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+            SparseSet* set = m_componentStorage->FindSparse(id);
+            if (!rec || !rec->chunk || !set || !set->Contains(entity))
+                return false;
+            if (emit && m_signalManager.IsSignalEnabled(Signal::ComponentRemoved)) ASTRA_UNLIKELY
+            {
+                void* element = set->Descriptor().size == 0 ? EmptyComponentSentinel() : set->Get(entity);
+                m_signalManager.Emit<Events::ComponentRemoved>(entity, id, element);
+                rec = m_archetypeManager->GetEntityRecord(entity);   // a handler may have moved/destroyed it
+                if (!rec || !rec->chunk || !set->Contains(entity))
+                    return false;
+            }
+            return SparseDetach(entity, *rec, id);
+        }
+
+        // Typed batch add over de-duplicated live entities. Absent -> attach a fresh value
+        // from make(); present -> untouched. Then ComponentAdded for every entity HOLDING
+        // T: the exact post-pass rule of Registry::AddComponents for Table. A slot-cap
+        // refusal is dropped in Release (AcquireSparseSlot asserts in Debug; the batch
+        // add is void).
+        template<Component T, typename MakeFn>
+        void SparseBatchAdd(std::span<const Entity> entities, MakeFn&& make)
+        {
+            const ComponentID id = TypeID<T>::Value();
+            for (Entity e : entities)
+            {
+                const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+                if (!rec || !rec->chunk) ASTRA_UNLIKELY
+                    continue;
+                if (const SparseSet* set = m_componentStorage->FindSparse(id); set && set->Contains(e))
+                    continue;
+                if constexpr (std::is_empty_v<T>)
+                {
+                    (void)make;
+                    SparseAttach(e, *rec, id, nullptr);
+                }
+                else
+                {
+                    T value = make();
+                    SparseAttach(e, *rec, id, &value);
+                }
+            }
+            if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
+            {
+                SparseSet* set = m_componentStorage->FindSparse(id);
+                if (!set)
+                    return;
+                for (Entity e : entities)
+                    if (set->Contains(e))
+                        m_signalManager.Emit<Events::ComponentAdded>(e, id, SparseTypedPtr<T>(set->Get(e)));
+            }
+        }
+
+        // Typed batch remove, mirroring Registry::RemoveComponents for Table:
+        // ComponentRemoved fires per occurrence BEFORE anything is erased (a duplicated
+        // entity double-signals, the documented Table quirk); erasure runs once per
+        // de-duplicated member. Returns the number removed. Non-creating (G2).
+        template<Component T>
+        size_t SparseBatchRemove(std::span<Entity> entities)
+        {
+            const ComponentID id = TypeID<T>::Value();
+            SparseSet* set = m_componentStorage->FindSparse(id);
+            if (!set) ASTRA_UNLIKELY
+                return 0;
+            const bool emit = m_signalManager.IsSignalEnabled(Signal::ComponentRemoved);
+            SmallVector<Entity, 256> members;
+            members.reserve(entities.size());
+            for (Entity e : entities)
+            {
+                if (!m_entityManager.IsValid(e) || !set->Contains(e))
+                    continue;
+                if (emit) ASTRA_UNLIKELY
+                    m_signalManager.Emit<Events::ComponentRemoved>(e, id, SparseTypedPtr<T>(set->Get(e)));
+                members.push_back(e);
+            }
+            std::sort(members.begin(), members.end());
+            members.erase(std::unique(members.begin(), members.end()), members.end());
+            size_t removed = 0;
+            for (Entity e : members)
+                if (const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e); rec && rec->chunk)
+                    removed += SparseDetach(e, *rec, id) ? 1u : 0u;
+            return removed;
         }
 
         // ---- Creation funnel (spec 2026-10-01 s4.2, s7.1) ----
