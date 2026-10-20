@@ -212,3 +212,122 @@ TEST(ComponentStorage, SparseSlotCapRefusesBeyondMaxSparseComponents)
     EXPECT_EQ(storage.UsedSparseSlotCount(), Astra::MAX_SPARSE_COMPONENTS);
     EXPECT_EQ(storage.AcquireSparseSlot(5), 5);                   // existing assignments still answer
 }
+
+// ---------------- Registry::Config::AddUniversal + Registry ownership (spec s3.2, s4) ----------------
+
+TEST(StorageConfig, AddUniversalRecordsTheSpecAndChains)
+{
+    using Astra::Test::Name;
+    Astra::Registry::Config config;
+    int token = 0;
+    const Astra::Registry::Config::UniversalInitFn init = +[](Astra::Entity, void*, void*) {};
+    Astra::Registry::Config& chained = config.AddUniversal<Name>(init, &token);
+    EXPECT_EQ(&chained, &config);
+    ASSERT_EQ(config.universal.size(), 1u);
+    EXPECT_EQ(config.universal[0].id, Astra::TypeID<Name>::Value());
+    EXPECT_TRUE(config.universal[0].init == init);
+    EXPECT_EQ(config.universal[0].user, static_cast<void*>(&token));
+    EXPECT_TRUE(config.universal[0].registerComponent != nullptr);
+
+    config.AddUniversal<Name>();                                  // re-declare: replaces, never duplicates
+    ASSERT_EQ(config.universal.size(), 1u);
+    EXPECT_TRUE(config.universal[0].init == nullptr);
+    EXPECT_EQ(config.universal[0].user, nullptr);
+}
+
+TEST(StorageConfig, RegistryRegistersAndClassifiesDeclaredUniversals)
+{
+    using Astra::StorageKind;
+    Astra::Registry::Config config;
+    config.AddUniversal<Astra::Test::Name>();
+    config.AddUniversal<Astra::Test::PosS>();                     // a Sparse-trait type declared universal
+    Astra::Registry reg(config);
+    const Astra::ComponentID name = Astra::TypeID<Astra::Test::Name>::Value();
+    const Astra::ComponentID posS = Astra::TypeID<Astra::Test::PosS>::Value();
+    const Astra::ComponentID pos  = Astra::TypeID<Astra::Test::Position>::Value();
+
+    ASSERT_NE(reg.GetComponentStorage(), nullptr);
+    EXPECT_NE(reg.GetComponentRegistry()->GetComponentDescriptor(name), nullptr);   // registered by the Registry
+    EXPECT_NE(reg.GetComponentRegistry()->GetComponentDescriptor(posS), nullptr);
+    EXPECT_EQ(reg.GetComponentStorage()->KindOf(name), StorageKind::Universal);
+    EXPECT_EQ(reg.GetComponentStorage()->KindOf(posS), StorageKind::Universal);    // universal overrides the trait
+    EXPECT_EQ(reg.GetComponentStorage()->KindOf(pos), StorageKind::Table);
+
+    Astra::Registry plain;                                        // no declaration: the trait decides
+    plain.GetComponentRegistry()->RegisterComponent<Astra::Test::PosS>();
+    EXPECT_EQ(plain.GetComponentStorage()->KindOf(name), StorageKind::Table);
+    EXPECT_EQ(plain.GetComponentStorage()->KindOf(posS), StorageKind::Sparse);
+
+    Astra::Registry legacy(Astra::EntityManager::Config{}, Astra::ArchetypeChunkPool::Config{});   // the two-config ctor
+    ASSERT_NE(legacy.GetComponentStorage(), nullptr);
+    EXPECT_TRUE(legacy.GetComponentStorage()->UniversalSpecs().empty());
+}
+
+TEST(StorageConfig, SharedComponentRegistryDoesNotShareUniversalityOrSlots)
+{
+    using Astra::StorageKind;
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponents<Astra::Test::PosS, Astra::Test::Velocity>();
+    Astra::Registry::Config withName;
+    withName.AddUniversal<Astra::Test::Name>();
+    Astra::Registry a(creg, withName);
+    Astra::Registry b(creg);
+    const Astra::ComponentID name = Astra::TypeID<Astra::Test::Name>::Value();
+    const Astra::ComponentID posS = Astra::TypeID<Astra::Test::PosS>::Value();
+    const Astra::ComponentID vel  = Astra::TypeID<Astra::Test::Velocity>::Value();
+
+    EXPECT_EQ(a.GetComponentStorage()->KindOf(name), StorageKind::Universal);
+    EXPECT_EQ(b.GetComponentStorage()->KindOf(name), StorageKind::Table);   // D1: universality is per registry
+    EXPECT_EQ(a.GetComponentStorage()->AcquireSparseSlot(posS), 0);
+    EXPECT_EQ(b.GetComponentStorage()->AcquireSparseSlot(vel), 0);
+    EXPECT_EQ(b.GetComponentStorage()->AcquireSparseSlot(posS), 1);
+    EXPECT_EQ(a.GetComponentStorage()->SparseSlotOf(posS), 0);
+    EXPECT_EQ(a.GetComponentStorage()->SparseSlotOf(vel), -1);
+}
+
+TEST(StorageConfig, ClearKeepsDeclarationsAndSlotsInPlace)
+{
+    Astra::Registry::Config config;
+    config.AddUniversal<Astra::Test::Name>();
+    Astra::Registry reg(config);
+    reg.GetComponentRegistry()->RegisterComponent<Astra::Test::PosS>();
+    const Astra::ComponentID name = Astra::TypeID<Astra::Test::Name>::Value();
+    const Astra::ComponentID posS = Astra::TypeID<Astra::Test::PosS>::Value();
+    ASSERT_EQ(reg.GetComponentStorage()->AcquireSparseSlot(posS), 0);
+    const Astra::ComponentStorage* before = reg.GetComponentStorage();
+    reg.CreateEntity<Astra::Test::Position>();
+
+    reg.Clear();
+    EXPECT_EQ(reg.GetComponentStorage(), before);                 // cleared in place, never replaced
+    EXPECT_EQ(reg.GetComponentStorage()->KindOf(name), Astra::StorageKind::Universal);
+    EXPECT_EQ(reg.GetComponentStorage()->SparseSlotOf(posS), 0);
+    EXPECT_EQ(reg.Size(), 0u);
+}
+
+TEST(StorageConfig, LoadRebuildsStorageFromTheCallersConfig)
+{
+    using Astra::StorageKind;
+    Astra::Registry::Config config;
+    config.AddUniversal<Astra::Test::Name>();
+    Astra::Registry src(config);
+    src.CreateEntity<Astra::Test::Position>();
+    auto saved = src.Save();
+    ASSERT_TRUE(saved.IsOk());
+    const Astra::ComponentID name = Astra::TypeID<Astra::Test::Name>::Value();
+
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponent<Astra::Test::Position>();
+    auto loaded = Astra::Registry::Load(std::span<const std::byte>(*saved.GetValue()), creg, config);
+    ASSERT_TRUE(loaded.IsOk());
+    Astra::Registry& reg = **loaded.GetValue();
+    ASSERT_NE(reg.GetComponentStorage(), nullptr);
+    EXPECT_EQ(reg.GetComponentStorage()->KindOf(name), StorageKind::Universal);
+    EXPECT_NE(creg->GetComponentDescriptor(name), nullptr);       // the Config registered Name in the LOADING registry
+    EXPECT_EQ(reg.Size(), 1u);
+
+    auto creg2 = std::make_shared<Astra::ComponentRegistry>();
+    creg2->RegisterComponents<Astra::Test::Position, Astra::Test::Name>();
+    auto plain = Astra::Registry::Load(std::span<const std::byte>(*saved.GetValue()), creg2);   // default Config
+    ASSERT_TRUE(plain.IsOk());
+    EXPECT_EQ((*plain.GetValue())->GetComponentStorage()->KindOf(name), StorageKind::Table);
+}

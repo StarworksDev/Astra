@@ -27,6 +27,7 @@
 #include "../Serialization/BinaryReader.hpp"
 #include "../Serialization/BinaryWriter.hpp"
 #include "../Serialization/SerializationError.hpp"
+#include "ComponentStorage.hpp"
 #include "Query.hpp"
 #include "Relations.hpp"
 #include "RelationshipGraph.hpp"
@@ -47,12 +48,46 @@ namespace Astra
             // Hosts inject one shared instance (e.g. an enkiTS adapter) -- and in
             // multi-module (DLL) setups, the SAME instance into every module.
             std::shared_ptr<IWorkScheduler> workScheduler;
+
+            // Universal components (spec 2026-10-01 s3.2, D1): every entity of a registry built
+            // from this Config holds them, in a slot-indexed column rather than an archetype
+            // column. Retained in m_config, so it survives Clear(); Load builds the new registry
+            // with the caller's Config, so Load honours it too. No NSDMI here on purpose: the
+            // `const Config& = {}` default arguments below need Config free of NSDMIs on gcc/clang.
+            using UniversalInitFn = Astra::UniversalInitFn;
+            using UniversalSpec = Astra::UniversalSpec;
+            std::vector<UniversalSpec> universal;
+
+            // Declares T universal. `init` (optional) runs, with `user`, for each new entity that
+            // was NOT given a T value (spec s4.2). Re-declaring T replaces init/user (last wins).
+            // Registers nothing itself: the Registry registers T in ITS ComponentRegistry when
+            // it is constructed (UniversalSpec::registerComponent).
+            template<Component T>
+            Config& AddUniversal(UniversalInitFn init = nullptr, void* user = nullptr)
+            {
+                const ComponentID id = TypeID<T>::Value();
+                if (!ASTRA_ENSURE(id < MAX_COMPONENTS, "AddUniversal: the type has no valid ComponentID")) ASTRA_UNLIKELY
+                    return *this;
+                for (UniversalSpec& spec : universal)
+                {
+                    if (spec.id == id)
+                    {
+                        spec.init = init;
+                        spec.user = user;
+                        return *this;
+                    }
+                }
+                universal.push_back(UniversalSpec{id, init, user,
+                    +[](ComponentRegistry& registry) { registry.RegisterComponent<T>(); }});
+                return *this;
+            }
         };
         
         explicit Registry(const Config& config = {}) :
             m_entityManager(config.entityManagerConfig),
             m_componentRegistry(std::make_shared<ComponentRegistry>()),
             m_archetypeManager(std::make_shared<ArchetypeManager>(m_componentRegistry, config.chunkPoolConfig, &m_entityManager.GetRecordTable())),
+            m_componentStorage(std::make_shared<ComponentStorage>(m_componentRegistry, config.universal)),
             m_relationshipGraph(std::make_shared<RelationshipGraph>()),
             m_resourceStorage(m_componentRegistry, config.resourceStorageConfig),
             m_workScheduler(config.workScheduler),
@@ -64,6 +99,7 @@ namespace Astra
             m_entityManager(entityConfig),
             m_componentRegistry(std::make_shared<ComponentRegistry>()),
             m_archetypeManager(std::make_shared<ArchetypeManager>(m_componentRegistry, chunkConfig, &m_entityManager.GetRecordTable())),
+            m_componentStorage(std::make_shared<ComponentStorage>(m_componentRegistry, std::vector<UniversalSpec>{})),
             m_relationshipGraph(std::make_shared<RelationshipGraph>()),
             m_resourceStorage(m_componentRegistry),
             m_workScheduler(nullptr),
@@ -75,6 +111,7 @@ namespace Astra
             m_entityManager(config.entityManagerConfig),
             m_componentRegistry(std::move(componentRegistry)),
             m_archetypeManager(std::make_shared<ArchetypeManager>(m_componentRegistry, config.chunkPoolConfig, &m_entityManager.GetRecordTable())),
+            m_componentStorage(std::make_shared<ComponentStorage>(m_componentRegistry, config.universal)),
             m_relationshipGraph(std::make_shared<RelationshipGraph>()),
             m_resourceStorage(m_componentRegistry, config.resourceStorageConfig),
             m_workScheduler(config.workScheduler),
@@ -1280,6 +1317,7 @@ namespace Astra
         
         void Clear()
         {
+            m_componentStorage->Clear();   // in place -- slot assignments + universal declarations survive (spec s7.3)
             m_archetypeManager->Clear();   // in place -- keeps cached Views/Relations valid
             m_relationshipGraph->Clear();
             m_entityManager.Clear();
@@ -1313,6 +1351,11 @@ namespace Astra
         ASTRA_NODISCARD std::shared_ptr<ComponentRegistry> ShareComponentRegistry() const noexcept { return m_componentRegistry; }
         ASTRA_NODISCARD ArchetypeManager* GetArchetypeManager() noexcept { return m_archetypeManager.get(); }
         ASTRA_NODISCARD const ArchetypeManager* GetArchetypeManager() const noexcept { return m_archetypeManager.get(); }
+
+        // Storage policies (spec 2026-10-01 s4): component kinds, sparse slots, and the
+        // sparse / universal stores of THIS registry.
+        ASTRA_NODISCARD ComponentStorage* GetComponentStorage() noexcept { return m_componentStorage.get(); }
+        ASTRA_NODISCARD const ComponentStorage* GetComponentStorage() const noexcept { return m_componentStorage.get(); }
 
         // Change-detection time (spec 2026-09-10 §3.1): forwarded from the owning
         // ArchetypeManager so views (which hold the manager) and the registry agree.
@@ -1873,6 +1916,12 @@ namespace Astra
             // Create new ArchetypeManager pointing at the (now version-restored)
             // shared record table, then deserialize archetype/location into it.
             registry->m_archetypeManager = std::make_shared<ArchetypeManager>(componentRegistry, config.chunkPoolConfig, &registry->m_entityManager.GetRecordTable());
+            // Storage policies (spec 2026-10-01 s4): rebuilt fresh beside the archetype manager,
+            // from the CALLER's Config, so the loaded registry's universal set is the loading
+            // build's (storage-agnostic load, s8.3), never the archive's. Must stay BEFORE
+            // m_archetypeManager->Deserialize. (Redundant with the ctor's store today; load-bearing
+            // from Task 9, when the tick source points into the rebuilt ArchetypeManager.)
+            registry->m_componentStorage = std::make_shared<ComponentStorage>(componentRegistry, config.universal);
             if (!registry->m_archetypeManager->Deserialize(reader))
             {
                 return Result<std::unique_ptr<Registry>, SerializationError>::Err(SerializationError::CorruptedData);
@@ -1908,6 +1957,10 @@ namespace Astra
         EntityManager m_entityManager;
         std::shared_ptr<ComponentRegistry> m_componentRegistry;
         std::shared_ptr<ArchetypeManager> m_archetypeManager;
+        // Storage policies (spec 2026-10-01 s4): built in every ctor from Config::universal,
+        // cleared in place by Clear(), rebuilt fresh by LoadInternal. Declared right after
+        // m_archetypeManager: every ctor initializes it in that order.
+        std::shared_ptr<ComponentStorage> m_componentStorage;
         std::shared_ptr<RelationshipGraph> m_relationshipGraph;
         SignalManager m_signalManager;
         ResourceStorage m_resourceStorage;
