@@ -792,17 +792,54 @@ namespace Astra
             return GroupsPass(mask);
         }
 
-        // Any/OneOf at archetype level. Task 26 makes this storage-aware.
-        ASTRA_NODISCARD bool GroupsPass([[maybe_unused]] const ComponentMask& mask) const
+        // Archetype-level verdict of one Any/OneOf group (spec s6.3): how many members the
+        // archetype is KNOWN to hold -- Table members in its mask, plus Universal members,
+        // which every live entity holds -- and whether Sparse members leave the rest to a
+        // per-entity test. For a pure-Table group this is exactly QueryBuilder's mask test.
+        struct GroupVerdict { uint32_t known = 0; bool hasSparse = false; };
+
+        template<typename T>
+        void CountGroupMember(const ComponentMask& mask, GroupVerdict& v) const
         {
-            constexpr size_t nAny = std::tuple_size_v<AnyGroupTypes>;
-            constexpr size_t nOne = std::tuple_size_v<OneOfGroupTypes>;
-            bool ok = true;
-            if constexpr (nAny > 0)
-                ok = QueryBuilder::template CheckAnyGroups<AnyGroupTypes>(mask, std::make_index_sequence<nAny>{});
-            if constexpr (nOne > 0)
-                ok = ok && QueryBuilder::template CheckOneOfGroups<OneOfGroupTypes>(mask, std::make_index_sequence<nOne>{});
-            return ok;
+            switch (m_kinds[PlanIndex<T>])
+            {
+            case StorageKind::Table:     v.known += mask.Test(TypeID<std::remove_const_t<T>>::Value()) ? 1u : 0u; break;
+            case StorageKind::Universal: ++v.known; break;
+            case StorageKind::Sparse:    v.hasSparse = true; break;
+            }
+        }
+
+        template<typename Group>
+        GroupVerdict GroupAtArchetype([[maybe_unused]] const ComponentMask& mask) const
+        {
+            GroupVerdict v;
+            [&]<typename... Ts>(std::tuple<Ts...>*) { (CountGroupMember<Ts>(mask, v), ...); }(static_cast<Group*>(nullptr));
+            return v;
+        }
+
+        // Any: a member is known, or a Sparse member may supply it per entity.
+        template<typename G>
+        bool AnyGroupPasses(const ComponentMask& mask) const
+        {
+            const GroupVerdict v = GroupAtArchetype<G>(mask);
+            return v.known > 0 || v.hasSparse;
+        }
+        // OneOf: exactly one known, or none known and a Sparse member may be the one.
+        template<typename G>
+        bool OneOfGroupPasses(const ComponentMask& mask) const
+        {
+            const GroupVerdict v = GroupAtArchetype<G>(mask);
+            return v.known == 1 || (v.known == 0 && v.hasSparse);
+        }
+        template<typename... Gs>
+        bool AnyGroupsPass([[maybe_unused]] const ComponentMask& mask, std::tuple<Gs...>*) const { return (AnyGroupPasses<Gs>(mask) && ...); }
+        template<typename... Gs>
+        bool OneOfGroupsPass([[maybe_unused]] const ComponentMask& mask, std::tuple<Gs...>*) const { return (OneOfGroupPasses<Gs>(mask) && ...); }
+
+        ASTRA_NODISCARD bool GroupsPass(const ComponentMask& mask) const
+        {
+            return AnyGroupsPass(mask, static_cast<AnyGroupTypes*>(nullptr))
+                && OneOfGroupsPass(mask, static_cast<OneOfGroupTypes*>(nullptr));
         }
 
         struct ArchetypeEntityCountComparator
@@ -1601,13 +1638,28 @@ namespace Astra
         // kept across a callback: a SetEnabled or sparse add made inside one may insert a
         // block into the chunk's block list (Task 15's lifetime rule).
         static constexpr size_t NGroups     = std::tuple_size_v<AnyGroupTypes> + std::tuple_size_v<OneOfGroupTypes>;
-        static constexpr size_t MaxWordSets = 3 * NPlanSlots + NGroups + 2;
+        // Sum of the Any/OneOf group arities: a OneOf group whose archetype already holds one
+        // member appends one exclude word set per Sparse member, so several groups sharing
+        // Sparse members need arity-many slots each, not one.
+        template<typename... Gs>
+        static constexpr size_t GroupArity(std::tuple<Gs...>*) { return (std::tuple_size_v<Gs> + ... + size_t(0)); }
+        static constexpr size_t GroupMemberTotal =
+            GroupArity(static_cast<AnyGroupTypes*>(nullptr)) + GroupArity(static_cast<OneOfGroupTypes*>(nullptr));
+        static constexpr size_t MaxWordSets = 3 * NPlanSlots + GroupMemberTotal + NGroups + 2;
         struct ChunkFilter
         {
             const uint64_t* exclude[MaxWordSets];
             const uint64_t* require[MaxWordSets];
             size_t nExclude = 0;
             size_t nRequire = 0;
+            // Owned words for Any/OneOf groups whose verdict is per entity (Task 26).
+            struct GroupScratch
+            {
+                std::array<SmallVector<uint64_t, 16>, NGroups == 0 ? 1 : NGroups> words;
+                SmallVector<uint64_t, 16> twos;    // OneOf "seen twice" scratch
+            };
+            struct NoGroupScratch {};
+            [[no_unique_address]] std::conditional_t<(NGroups > 0), GroupScratch, NoGroupScratch> groups;
         };
 
         // Required (or With<>) Sparse T: its block's present words. Returns false when no
@@ -1648,6 +1700,144 @@ namespace Astra
             ASTRA_ASSERT(f.nExclude < MaxWordSets, "View::ChunkFilter: exclude word-set capacity exceeded");
             f.exclude[f.nExclude++] = b->present;
             return true;
+        }
+
+        // The chunk's presence block of Sparse member T, or null when T is not Sparse here
+        // or no entity of the chunk holds it.
+        template<typename T>
+        auto SparsePresenceBlock(ArchetypeChunk* chunk) const
+        {
+            using BlockPtr = decltype(chunk->FindSparseBlock(uint16_t{}));
+            if (m_kinds[PlanIndex<T>] != StorageKind::Sparse)
+                return BlockPtr{};
+            const StoreRef& s = m_stores[PlanIndex<T>];
+            if (s.slot < 0)
+                return BlockPtr{};
+            BlockPtr b = chunk->FindSparseBlock(static_cast<uint16_t>(s.slot));
+            return (b && b->presentCount != 0) ? b : BlockPtr{};
+        }
+
+        // OR of a group's Sparse members' presence words into `out`.
+        template<typename T>
+        void OrSparsePresence(ArchetypeChunk* chunk, size_t nw, uint64_t* out, bool& any) const
+        {
+            const auto* b = SparsePresenceBlock<T>(chunk);
+            if (!b)
+                return;
+            for (size_t w = 0; w < nw; ++w)
+                out[w] |= b->present[w];
+            any = true;
+        }
+
+        // "Exactly one" accumulation over a group's Sparse members: twos |= ones & m; ones |= m.
+        template<typename T>
+        void CountSparsePresence(ArchetypeChunk* chunk, size_t nw, uint64_t* ones, uint64_t* twos, bool& any) const
+        {
+            const auto* b = SparsePresenceBlock<T>(chunk);
+            if (!b)
+                return;
+            for (size_t w = 0; w < nw; ++w)
+            {
+                const uint64_t m = b->present[w];
+                twos[w] |= ones[w] & m;
+                ones[w] |= m;
+            }
+            any = true;
+        }
+
+        // Any group: nothing to add when a Table/Universal member is known here; else the
+        // OR of the Sparse members' presence (false when no member has a block here).
+        template<typename Group>
+        bool BuildAnyGroupWords(ArchetypeChunk* chunk, const ComponentMask& mask, size_t count, ChunkFilter& f, size_t g) const
+        {
+            if (GroupAtArchetype<Group>(mask).known > 0)
+                return true;
+            auto& words = f.groups.words[g];
+            const size_t nw = (count + 63) >> 6;
+            words.assign(nw, 0ull);
+            bool any = false;
+            [&]<typename... Ts>(std::tuple<Ts...>*) { (OrSparsePresence<Ts>(chunk, nw, words.data(), any), ...); }(static_cast<Group*>(nullptr));
+            if (!any)
+                return false;
+            ASTRA_ASSERT(f.nRequire < MaxWordSets, "View::ChunkFilter: require word-set capacity exceeded");
+            f.require[f.nRequire++] = words.data();
+            return true;
+        }
+
+        // OneOf group: one member known here => every Sparse member must be absent
+        // (exclude their presence); none known => exactly one Sparse member per entity.
+        template<typename Group>
+        bool BuildOneOfGroupWords(ArchetypeChunk* chunk, const ComponentMask& mask, size_t count, ChunkFilter& f, size_t g) const
+        {
+            const GroupVerdict v = GroupAtArchetype<Group>(mask);
+            if (!v.hasSparse)
+                return v.known == 1;
+            if (v.known > 1)
+                return false;
+            if (v.known == 1)
+            {
+                bool pass = true;
+                [&]<typename... Ts>(std::tuple<Ts...>*) { ((pass = pass && ExcludePresent<std::remove_const_t<Ts>>(chunk, count, f)), ...); }(static_cast<Group*>(nullptr));
+                return pass;
+            }
+            const size_t nw = (count + 63) >> 6;
+            auto& ones = f.groups.words[g];
+            ones.assign(nw, 0ull);
+            f.groups.twos.assign(nw, 0ull);
+            bool any = false;
+            [&]<typename... Ts>(std::tuple<Ts...>*) { (CountSparsePresence<Ts>(chunk, nw, ones.data(), f.groups.twos.data(), any), ...); }(static_cast<Group*>(nullptr));
+            if (!any)
+                return false;
+            for (size_t w = 0; w < nw; ++w)
+                ones[w] &= ~f.groups.twos[w];
+            ASTRA_ASSERT(f.nRequire < MaxWordSets, "View::ChunkFilter: require word-set capacity exceeded");
+            f.require[f.nRequire++] = ones.data();
+            return true;
+        }
+
+        // Per-entity membership of one named type, any kind: the archetype mask (Table),
+        // always (Universal: a live entity holds every universal), the set (Sparse).
+        template<typename T>
+        ASTRA_NODISCARD bool EntityHolds(const EntityRecord* rec, Entity e, const StoreArray& st) const
+        {
+            switch (m_kinds[PlanIndex<T>])
+            {
+            case StorageKind::Table:     return rec->archetype->GetMask().Test(TypeID<std::remove_const_t<T>>::Value());
+            case StorageKind::Universal: return true;
+            case StorageKind::Sparse:
+            {
+                const StoreRef& s = st[PlanIndex<T>];
+                return s.sparse && s.sparse->Contains(e);
+            }
+            }
+            return false;
+        }
+
+        template<typename G>
+        ASTRA_NODISCARD uint32_t EntityGroupCount(const EntityRecord* rec, Entity e, const StoreArray& st) const
+        {
+            uint32_t n = 0;
+            [&]<typename... Ts>(std::tuple<Ts...>*) { ((n += EntityHolds<Ts>(rec, e, st) ? 1u : 0u), ...); }(static_cast<G*>(nullptr));
+            return n;
+        }
+        template<typename... Gs>
+        ASTRA_NODISCARD bool EntityAnyGroups([[maybe_unused]] const EntityRecord* rec, [[maybe_unused]] Entity e,
+                                             [[maybe_unused]] const StoreArray& st, std::tuple<Gs...>*) const
+        {
+            return ((EntityGroupCount<Gs>(rec, e, st) > 0) && ...);
+        }
+        template<typename... Gs>
+        ASTRA_NODISCARD bool EntityOneOfGroups([[maybe_unused]] const EntityRecord* rec, [[maybe_unused]] Entity e,
+                                               [[maybe_unused]] const StoreArray& st, std::tuple<Gs...>*) const
+        {
+            return ((EntityGroupCount<Gs>(rec, e, st) == 1) && ...);
+        }
+
+        // Every Any/OneOf group, decided for one entity.
+        ASTRA_NODISCARD bool EntityGroupsPass(const EntityRecord* rec, Entity e, const StoreArray& st) const
+        {
+            return EntityAnyGroups(rec, e, st, static_cast<AnyGroupTypes*>(nullptr))
+                && EntityOneOfGroups(rec, e, st, static_cast<OneOfGroupTypes*>(nullptr));
         }
 
         // Enabled-only filter of one required enableable T (IncludeDisabled opts out
@@ -1703,6 +1893,22 @@ namespace Astra
             {
                 ((pass = pass && ExcludePresent<std::remove_const_t<Ts>>(chunk, count, f)), ...);
             }(static_cast<SparseExcludedTypes*>(nullptr));
+            if constexpr (NGroups > 0)
+            {
+                if (!pass)
+                    return false;
+                const ComponentMask& mask = archetype->GetMask();
+                [&]<typename... Gs>(std::tuple<Gs...>*)
+                {
+                    size_t g = 0;   // a failed group short-circuits the rest, so the index never matters after it
+                    ((pass = pass && BuildAnyGroupWords<Gs>(chunk, mask, count, f, g++)), ...);
+                }(static_cast<AnyGroupTypes*>(nullptr));
+                [&]<typename... Gs>(std::tuple<Gs...>*)
+                {
+                    size_t g = std::tuple_size_v<AnyGroupTypes>;
+                    ((pass = pass && BuildOneOfGroupWords<Gs>(chunk, mask, count, f, g++)), ...);
+                }(static_cast<OneOfGroupTypes*>(nullptr));
+            }
             return pass;
         }
 
