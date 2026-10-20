@@ -1,7 +1,9 @@
 #include <gtest/gtest.h>
 #include <Astra/Astra.hpp>
 #include <set>
+#include <atomic>
 #include <vector>
+#include "../Support/TestWorkerPool.hpp"
 #include "StorageQueryComponents.hpp"
 
 using namespace Astra::Test;
@@ -112,4 +114,53 @@ TEST(StorageViewChange, UntrackedUniversalIsPageCoarse)
     EXPECT_EQ(count(), 0u);
     ASSERT_TRUE(reg->Modified<Health>(es[0]));
     EXPECT_EQ(count(), 3u);    // ids 0..2 share one 1024-slot page
+}
+
+// Task 28 fix round 1: the Par=true READ side (EntityChangeTermPasses / ChangeChunkPassesStorage)
+// through a real parallel dispatch. Non-regression pin: passes before the helper change.
+TEST(StorageViewChange, ParallelChangedOverUntrackedSparseAndUniversal)
+{
+    auto reg = MakeRegistry<Health>(std::make_shared<Astra::Testing::TestWorkerPool>());
+    std::vector<Astra::Entity> es;
+    for (int i = 0; i < 3000; ++i)
+    {
+        es.push_back(reg->CreateEntity<Position>());
+        reg->AddComponent(es.back(), PosS{});
+    }
+    const Astra::Tick t0 = reg->CurrentTick();
+    reg->AdvanceTick();
+    std::atomic<size_t> n{0};
+    auto sparse = [&] {
+        n = 0;
+        reg->CreateView<const PosS, Astra::Changed<PosS>>().Since(t0).ParallelForEach([&](Astra::Entity, const PosS&) { n.fetch_add(1, std::memory_order_relaxed); });
+        return n.load();
+    };
+    auto universal = [&] {
+        n = 0;
+        reg->CreateView<const Position, const Health, Astra::Changed<Health>>().Since(t0).ParallelForEach([&](Astra::Entity, const Position&, const Health&) { n.fetch_add(1, std::memory_order_relaxed); });
+        return n.load();
+    };
+    EXPECT_EQ(sparse(), 0u);
+    EXPECT_EQ(universal(), 0u);
+    ASSERT_TRUE(reg->Modified<PosS>(es[10]));
+    ASSERT_TRUE(reg->Modified<Health>(es[10]));
+    EXPECT_EQ(sparse(), es.size());      // untracked Sparse: coarse, every member answers
+    // untracked Universal: page-coarse -- only the written page's live slots answer; match the serial walk.
+    size_t serial = 0;
+    reg->CreateView<const Position, const Health, Astra::Changed<Health>>().Since(t0).ForEach([&](Astra::Entity, const Position&, const Health&) { ++serial; });
+    EXPECT_GT(serial, 0u);
+    EXPECT_LT(serial, es.size());
+    EXPECT_EQ(universal(), serial);
+}
+
+// StampTickShared: check-before-store -- an equal tick leaves the slot, a newer tick stores.
+TEST(StorageViewChange, StampTickSharedStoresOnlyWhenDifferent)
+{
+    Astra::Tick slot = 5;
+    Astra::StampTickShared(slot, 5);
+    EXPECT_EQ(slot, 5u);
+    Astra::StampTickShared(slot, 9);
+    EXPECT_EQ(slot, 9u);
+    Astra::StampTickShared(slot, 9);
+    EXPECT_EQ(slot, 9u);
 }

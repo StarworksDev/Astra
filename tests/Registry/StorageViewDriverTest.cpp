@@ -215,3 +215,29 @@ TEST(StorageViewDriver, SparseDrivenOneOfWithAUniversalMember)
     EXPECT_FALSE(expected.empty());
     EXPECT_EQ(Visited(reg->CreateView<PosS, Astra::OneOf<Health, SpB>>()), expected);
 }
+
+// Task 28 fix round 1: above MIN_ENTITIES_FOR_PARALLEL the pool-dispatch branch of
+// ParallelSparseDrivenWithContext runs (the test above is inline). 20000 entities, PosS on every
+// 5th => 4000 members => 4 work items of 1024.
+TEST(StorageViewDriver, ParallelForEachWithContextSparseDrivenDispatchesItems)
+{
+    Astra::Registry::Config cfg;
+    cfg.workScheduler = std::make_shared<Astra::Testing::TestWorkerPool>();
+    Astra::Registry reg(cfg);
+    std::vector<Astra::Entity> members;
+    for (int i = 0; i < 20000; ++i)
+    {
+        Astra::Entity e = reg.CreateEntity<Position>();
+        if (i % 5 == 0) { reg.AddComponent(e, PosS{0.0f, 0.0f, 0.0f}); members.push_back(e); }
+    }
+    ASSERT_EQ(members.size(), 4000u);
+    std::mutex mu;
+    std::set<uint32_t> items;
+    const size_t n = reg.CreateView<PosS>().ParallelForEachWithContext(
+        [&](uint32_t idx) { std::lock_guard lock(mu); items.insert(idx); return idx; },
+        [&](Astra::Entity, PosS& s, uint32_t) { s.x += 1.0f; });
+    EXPECT_EQ(n, 4u);
+    EXPECT_EQ(items, (std::set<uint32_t>{0, 1, 2, 3}));
+    for (Astra::Entity e : members)
+        ASSERT_FLOAT_EQ(std::as_const(reg).GetComponent<PosS>(e)->x, 1.0f);   // exactly once each
+}
