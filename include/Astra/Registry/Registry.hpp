@@ -588,7 +588,17 @@ namespace Astra
             if (!m_entityManager.IsValid(entity))
                 return nullptr;
             if (RoutesToStore<T>()) ASTRA_UNLIKELY
-                return StoreGet<T>(entity);
+            {
+                // A mutable fetch is a write (spec s3.3), as for a chunk column. A tag has
+                // no value to stamp.
+                T* component = StoreGet<T>(entity);
+                if constexpr (!std::is_empty_v<T>)
+                {
+                    if (component) ASTRA_LIKELY
+                        (void)MarkStoreWritten(entity, TypeID<T>::Value());
+                }
+                return component;
+            }
             return m_archetypeManager->GetComponentMut<T>(entity);
         }
 
@@ -622,7 +632,7 @@ namespace Astra
         {
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity)) return false;
-            return m_archetypeManager->MarkWritten(entity, TypeID<T>::Value());
+            return MarkWrittenRouted(entity, TypeID<T>::Value());
         }
 
         // Type-erased twin of Modified<T>: for hash/descriptor-driven writers (an
@@ -635,7 +645,7 @@ namespace Astra
         {
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity)) return false;
-            return m_archetypeManager->MarkWritten(entity, id);
+            return MarkWrittenRouted(entity, id);
         }
 
         // Per-entity change query OUTSIDE a view (spec 2026-09-11 Arcane adoption
@@ -648,6 +658,8 @@ namespace Astra
         ASTRA_NODISCARD bool IsChanged(Entity entity, Tick since) const
         {
             AssertContextAffinity();
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreTickNewer(entity, TypeID<T>::Value(), since, /*added=*/false);
             const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
             if (!rec || !rec->chunk) return false;
             const ComponentID id = TypeID<T>::Value();
@@ -666,6 +678,8 @@ namespace Astra
         ASTRA_NODISCARD bool IsAdded(Entity entity, Tick since) const
         {
             AssertContextAffinity();
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreTickNewer(entity, TypeID<T>::Value(), since, /*added=*/true);
             const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
             if (!rec || !rec->chunk) return false;
             const ComponentID id = TypeID<T>::Value();
@@ -686,11 +700,12 @@ namespace Astra
         {
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity)) return false;
-            T* current = m_archetypeManager->GetComponent<T>(entity);   // non-stamping fetch
+            T* current = RoutesToStore<T>() ? StoreGet<T>(entity)                       // non-stamping fetch,
+                                            : m_archetypeManager->GetComponent<T>(entity);   // either storage
             if (!current) return false;
             if (*current == value) return false;
             *current = value;
-            m_archetypeManager->MarkWritten(entity, TypeID<T>::Value());
+            (void)MarkWrittenRouted(entity, TypeID<T>::Value());
             return true;
         }
 
@@ -2014,6 +2029,54 @@ namespace Astra
                 }
             }
             return true;
+        }
+
+        // Write-side stamp routed by kind: Table -> the chunk column (today's
+        // ArchetypeManager::MarkWritten); store kinds -> the store. Same false paths
+        // everywhere: invalid/stale handle, absent component, tag. A registry with no
+        // store never reads a descriptor kind (one bool check).
+        bool MarkWrittenRouted(Entity entity, ComponentID id)
+        {
+            if (m_componentStorage->HasAnyStore() && id < MAX_COMPONENTS
+                && m_componentStorage->KindOf(id) != StorageKind::Table) ASTRA_UNLIKELY
+                return MarkStoreWritten(entity, id);
+            return m_archetypeManager->MarkWritten(entity, id);
+        }
+
+        bool MarkStoreWritten(Entity entity, ComponentID id)
+        {
+            if (!m_entityManager.IsValid(entity)) ASTRA_UNLIKELY
+                return false;
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Universal:
+                {
+                    UniversalColumn* column = m_componentStorage->FindUniversal(id);
+                    return column && column->MarkWritten(entity, CurrentTick());
+                }
+                default:
+                    return false;   // Sparse: Task 20 replaces this arm with `case StorageKind::Sparse`
+            }
+        }
+
+        // IsChanged/IsAdded for a store kind. Never stamps. Tracked: the slot's exact
+        // tick; untracked: the page version (page-coarse); tag, stale or absent: false.
+        ASTRA_NODISCARD bool StoreTickNewer(Entity entity, ComponentID id, Tick since, bool added) const
+        {
+            if (id >= MAX_COMPONENTS || !m_entityManager.IsValid(entity)) ASTRA_UNLIKELY
+                return false;
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Universal:
+                {
+                    const UniversalColumn* column = m_componentStorage->FindUniversal(id);
+                    if (!column || column->Descriptor().size == 0 || !column->IsLive(entity)) ASTRA_UNLIKELY
+                        return false;
+                    return IsNewer(added ? column->AddedTick(entity) : column->ChangedTick(entity), since);
+                }
+                default:
+                    return false;   // Sparse: Task 20 replaces this arm with `case StorageKind::Sparse`
+            }
         }
 
         // Non-stamping, type-erased store lookup: the element pointer (or

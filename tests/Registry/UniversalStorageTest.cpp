@@ -446,3 +446,103 @@ TEST(UniversalStorageStaleHandle, SetEnabledMissesAndNeverTogglesTheOccupant)
     EXPECT_FALSE(reg.SetEnabled<Timer>(fresh, false));
     EXPECT_TRUE(reg.IsEnabled<Timer>(afterClear));
 }
+
+namespace
+{
+    void AdvanceTo(Registry& reg, Astra::Tick t)
+    {
+        while (reg.CurrentTick() < t)
+            reg.AdvanceTick();
+    }
+
+    Registry::Config TickConfig()
+    {
+        Registry::Config cfg;
+        cfg.AddUniversal<Astra::Test::TrackedPos>();   // change-tracked: exact
+        cfg.AddUniversal<Position>();                  // untracked: page-coarse
+        cfg.AddUniversal<Astra::Test::Player>();       // tag: no value
+        return cfg;
+    }
+}
+
+TEST(UniversalStorageTicks, TrackedIsExactPerEntity)
+{
+    using Astra::Test::TrackedPos;
+    Registry reg(TickConfig());
+    AdvanceTo(reg, 2);
+    const Entity a = reg.CreateEntity();
+    const Entity b = reg.CreateEntity();
+    EXPECT_TRUE(reg.IsAdded<TrackedPos>(a, 1));           // added at 2
+    EXPECT_FALSE(reg.IsAdded<TrackedPos>(a, 2));
+    EXPECT_FALSE(reg.IsChanged<TrackedPos>(a, 2));
+
+    AdvanceTo(reg, 3);
+    reg.GetComponent<TrackedPos>(a)->x = 1.0f;            // a mutable Get is a write
+    EXPECT_TRUE(reg.IsChanged<TrackedPos>(a, 2));
+    EXPECT_FALSE(reg.IsChanged<TrackedPos>(b, 2));        // exact: b untouched
+    EXPECT_FALSE(reg.IsChanged<TrackedPos>(a, 3));        // not newer than its own tick
+    EXPECT_FALSE(reg.IsAdded<TrackedPos>(a, 2));          // a write is not a re-add
+
+    AdvanceTo(reg, 4);
+    (void)std::as_const(reg).GetComponent<TrackedPos>(b); // a const Get never stamps
+    (void)reg.IsChanged<TrackedPos>(b, 0);                // nor does the query
+    EXPECT_FALSE(reg.IsChanged<TrackedPos>(b, 3));
+    EXPECT_TRUE(reg.Modified<TrackedPos>(b));
+    EXPECT_TRUE(reg.IsChanged<TrackedPos>(b, 3));
+    EXPECT_TRUE(reg.Modified(a, Astra::TypeID<TrackedPos>::Value()));
+    EXPECT_TRUE(reg.IsChanged<TrackedPos>(a, 3));
+}
+
+TEST(UniversalStorageTicks, UntrackedIsPageCoarse)
+{
+    Registry reg(TickConfig());
+    AdvanceTo(reg, 2);
+    const Entity a = reg.CreateEntity();
+    const Entity b = reg.CreateEntity();
+    AdvanceTo(reg, 3);
+    EXPECT_FALSE(reg.IsChanged<Position>(a, 2));
+    reg.GetComponent<Position>(a)->x = 1.0f;
+    EXPECT_TRUE(reg.IsChanged<Position>(a, 2));
+    EXPECT_TRUE(reg.IsChanged<Position>(b, 2));           // same page: coarse, like a chunk column version
+    EXPECT_TRUE(reg.IsAdded<Position>(b, 2));             // untracked IsAdded reads the same version (README caveat)
+}
+
+TEST(UniversalStorageTicks, SetIfNeqStampsOnlyOnInequality)
+{
+    Registry reg(TickConfig());
+    AdvanceTo(reg, 2);
+    const Entity e = reg.CreateEntity();
+    AdvanceTo(reg, 3);
+    EXPECT_FALSE(reg.SetIfNeq<Position>(e, Position{}));               // equal: no store, no stamp
+    EXPECT_FALSE(reg.IsChanged<Position>(e, 2));
+    EXPECT_TRUE(reg.SetIfNeq<Position>(e, Position{9.0f, 0.0f, 0.0f})); // different: stored + stamped
+    EXPECT_TRUE(reg.IsChanged<Position>(e, 2));
+    EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(e)->x, 9.0f);
+    EXPECT_TRUE(reg.SetIfNeq<Astra::Test::TrackedPos>(e, Astra::Test::TrackedPos{1.0f, 0.0f, 0.0f}));
+    EXPECT_TRUE(reg.IsChanged<Astra::Test::TrackedPos>(e, 2));
+}
+
+TEST(UniversalStorageTicks, TagStaleAndInvalidAnswerFalseAndNeverStampTheOccupant)
+{
+    using Astra::Test::Player;
+    Registry reg(TickConfig());
+    AdvanceTo(reg, 2);
+    const Entity e = reg.CreateEntity();
+    EXPECT_FALSE(reg.Modified<Player>(e));                    // a tag has no value (Table: no column)
+    EXPECT_FALSE(reg.Modified(e, Astra::TypeID<Player>::Value()));
+    EXPECT_FALSE(reg.IsChanged<Player>(e, 0));
+    EXPECT_FALSE(reg.IsAdded<Player>(e, 0));
+    EXPECT_FALSE(reg.Modified<Position>(Astra::Entity{}));
+    EXPECT_FALSE(reg.IsChanged<Position>(Astra::Entity{}, 0));
+
+    // Review Focus 1 (Universal), tick arm: the recycled id's stale handle stamps nothing.
+    reg.DestroyEntity(e);
+    const Entity fresh = reg.CreateEntity();
+    ASSERT_EQ(fresh.GetID(), e.GetID());
+    AdvanceTo(reg, 5);
+    EXPECT_FALSE(reg.Modified<Position>(e));
+    EXPECT_FALSE(reg.IsChanged<Position>(e, 0));
+    EXPECT_FALSE(reg.SetIfNeq<Position>(e, Position{1.0f, 1.0f, 1.0f}));
+    EXPECT_FALSE(reg.IsChanged<Position>(fresh, 4));          // the occupant was not stamped
+    EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(fresh)->x, 0.0f);
+}
