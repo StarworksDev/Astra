@@ -166,6 +166,7 @@ namespace Astra
         template<Component... Components>
         Entity CreateEntityWith(Components&&... components)
         {
+            static_assert(sizeof...(Components) > 0, "CreateEntityWith requires at least one component");
             AssertContextAffinity();
             Entity entity = m_entityManager.Create();
             if (!entity.IsValid()) ASTRA_UNLIKELY
@@ -173,7 +174,7 @@ namespace Astra
 
             // Universal members the caller supplied: moved in by PlaceWith, so they skip
             // default + init (spec s4.2: an explicitly supplied value is never overwritten).
-            ComponentID supplied[sizeof...(Components) > 0 ? sizeof...(Components) : 1]{};
+            ComponentID supplied[sizeof...(Components)];
             size_t suppliedCount = 0;
             PlaceWith(entity, supplied, suppliedCount, std::forward<Components>(components)...);
             ConstructUniversalsFor(entity, supplied, suppliedCount);
