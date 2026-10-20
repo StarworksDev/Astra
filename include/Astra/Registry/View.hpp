@@ -1842,14 +1842,30 @@ namespace Astra
         // version IsChanged reads for untracked Sparse (Task 20), once per visited chunk
         // -- the Table column stamp's twin. SHARED LOCATION (Task 28 atomic_ref pass):
         // ComponentStorage's coarse slot for this component.
-        template<typename T>
-        ASTRA_FORCEINLINE void StampSparseCoarse([[maybe_unused]] ComponentStorage* storage, [[maybe_unused]] Tick now) const
+        // `Gated` (Optional yields): stamp only when this chunk holds the type -- Table
+        // parity, where an Optional absent from the archetype has no column to stamp.
+        // Required args are already guaranteed present by RequirePresent. A Sparse-trait
+        // type declared Universal in this registry is skipped: its coarse version is
+        // never read (StoreTickNewer reads the page version).
+        template<typename T, bool Gated>
+        ASTRA_FORCEINLINE void StampSparseCoarse([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] ComponentStorage* storage,
+                                                 [[maybe_unused]] Tick now) const
         {
             using Bare = std::remove_const_t<T>;
             if constexpr (Detail::IsMutableYield<T> && !IsChangeTrackedV<Bare> && StorageOfV<Bare> == Storage::Sparse)
             {
-                if (storage)
-                    storage->StampCoarse(TypeID<Bare>::Value(), now);
+                if (!storage || m_kinds[PlanIndex<Bare>] != StorageKind::Sparse)
+                    return;
+                if constexpr (Gated)
+                {
+                    const StoreRef& s = m_stores[PlanIndex<Bare>];
+                    if (s.slot < 0)
+                        return;
+                    const auto* b = chunk->FindSparseBlock(static_cast<uint16_t>(s.slot));
+                    if (!b || b->presentCount == 0)
+                        return;
+                }
+                storage->StampCoarse(TypeID<Bare>::Value(), now);
             }
         }
 
@@ -1862,8 +1878,8 @@ namespace Astra
         {
             StampChunkStorage(chunk, cm, now, reqSeq, optSeq);
             ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
-            (StampSparseCoarse<std::tuple_element_t<ReqIs, RequiredTypes>>(storage, now), ...);
-            (StampSparseCoarse<std::tuple_element_t<OptIs, OptionalTypes>>(storage, now), ...);
+            (StampSparseCoarse<std::tuple_element_t<ReqIs, RequiredTypes>, false>(chunk, storage, now), ...);
+            (StampSparseCoarse<std::tuple_element_t<OptIs, OptionalTypes>, true>(chunk, storage, now), ...);
         }
 
         // Per-entity write stamp of a non-const UNTRACKED Universal required yield: its

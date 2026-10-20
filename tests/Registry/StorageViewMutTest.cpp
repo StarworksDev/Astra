@@ -81,3 +81,30 @@ TEST(StorageViewMut, UntrackedYieldsStampOnlyWhenNonConst)
     ureg->CreateView<const Position, Health>().ForEach([](Astra::Entity, const Position&, Health&) {});
     EXPECT_TRUE(ureg->IsChanged<Health>(u, since));
 }
+
+// Table parity (D2): an Optional the visited chunk does not hold stamps nothing. The
+// only PosS holder lives in an archetype the view never visits.
+TEST(StorageViewMut, AbsentUntrackedSparseOptionalDoesNotStamp)
+{
+    Astra::Registry reg;
+    Astra::Entity holder = reg.CreateEntity<Health>();
+    reg.AddComponent(holder, PosS{});
+    reg.CreateEntity<Position>();
+    const Astra::Tick since = reg.CurrentTick();
+    reg.AdvanceTick();
+    reg.CreateView<Position, Astra::Optional<PosS>>().ForEach([](Astra::Entity, Position&, PosS*) {});
+    EXPECT_FALSE(reg.IsChanged<PosS>(holder, since));
+}
+
+// Positive twin: a visited chunk that DOES hold the Optional stamps it.
+TEST(StorageViewMut, PresentUntrackedSparseOptionalStamps)
+{
+    Astra::Registry reg;
+    Astra::Entity holder = reg.CreateEntity<Position>();
+    reg.AddComponent(holder, PosS{});
+    reg.CreateEntity<Position>();
+    const Astra::Tick since = reg.CurrentTick();
+    reg.AdvanceTick();
+    reg.CreateView<Position, Astra::Optional<PosS>>().ForEach([](Astra::Entity, Position&, PosS*) {});
+    EXPECT_TRUE(reg.IsChanged<PosS>(holder, since));
+}
