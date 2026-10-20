@@ -271,8 +271,9 @@ namespace Astra
             if (m_componentStorage->HasAnyStore()) ASTRA_UNLIKELY
             {
                 ASTRA_ASSERT(rec->chunk, "DestroyEntity: located record without a chunk");
-                if (rec->chunk)
-                    m_componentStorage->OnEntityDestroyed(entity, *rec->chunk, rec->location.GetEntityIndex());
+                if (rec->chunk
+                    && m_componentStorage->OnEntityDestroyed(entity, *rec->chunk, rec->location.GetEntityIndex()))
+                    m_archetypeManager->BumpSparseStructuralCounter();   // a sparse holder's membership changed
             }
 
             m_archetypeManager->RemoveEntity(entity, rec);
@@ -327,14 +328,19 @@ namespace Astra
                 }
             }
                 
+            // Walk every doomed entity BEFORE any swap-remove; locations are stable until
+            // RemoveEntities. The counter bumps only if a doomed entity HELD a sparse member.
             if (m_componentStorage->HasAnyStore()) ASTRA_UNLIKELY
             {
+                bool sparseMembershipChanged = false;
                 for (Entity entity : validEntities)
                 {
                     const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
                     if (rec && rec->chunk)
-                        m_componentStorage->OnEntityDestroyed(entity, *rec->chunk, rec->location.GetEntityIndex());
+                        sparseMembershipChanged |= m_componentStorage->OnEntityDestroyed(entity, *rec->chunk, rec->location.GetEntityIndex());
                 }
+                if (sparseMembershipChanged)
+                    m_archetypeManager->BumpSparseStructuralCounter();
             }
 
             m_archetypeManager->RemoveEntities(validEntities);
@@ -1512,8 +1518,11 @@ namespace Astra
         
         void Clear()
         {
+            const bool hadStores = m_componentStorage->HasAnyStore();
             m_componentStorage->Clear();   // destroy every store element first, in place; slot assignments + universal declarations survive (spec s7.3)
-            m_archetypeManager->Clear();   // in place -- keeps cached Views/Relations valid
+            m_archetypeManager->Clear();   // in place -- keeps cached Views/Relations valid; chunks free their presence blocks
+            if (hadStores) ASTRA_UNLIKELY
+                m_archetypeManager->BumpSparseStructuralCounter();
             m_relationshipGraph->Clear();
             m_entityManager.Clear();
         }

@@ -258,22 +258,28 @@ namespace Astra
             return owned.get();
         }
 
-        // Destroy hook (spec s7.3). Called after EntityDestroyed and before the archetype
-        // swap-remove. Destroys e's slot in every universal column and erases e from
-        // every sparse set. Chunk C replaces the sparse erase with the presence-block
-        // walk, which reads `chunk`/`index`.
-        void OnEntityDestroyed(Entity e, ArchetypeChunk& chunk, size_t index)
+        // Destroy walk (spec s7.3). Called after EntityDestroyed and BEFORE the archetype
+        // swap-remove (whose SwapRemoveSparseBits fixes the chunk bits). The chunk's
+        // presence blocks name exactly the sparse sets holding `e` (P1), so destroy costs
+        // O(blocks in the chunk), not O(sparse components). Then e's slot is destructed
+        // in every universal column. Non-creating lookups: a destroy never builds a store,
+        // and a slot/column released by a module unload is skipped. No ComponentRemoved.
+        // Returns true when at least one SPARSE membership was erased: the caller bumps
+        // the sparse structural counter on that, never for a bystander (spec s4.3 parity).
+        bool OnEntityDestroyed(Entity e, ArchetypeChunk& chunk, size_t index)
         {
-            (void)chunk;
-            (void)index;
+            bool erasedSparse = false;
+            for (const ArchetypeChunk::SparseBlock& b : chunk.GetSparseBlocks())
+            {
+                if (!b.present || !chunk.IsSparsePresent(b.slot, index))
+                    continue;                                  // mirror-only block, or not a member
+                if (SparseSet* set = FindSparse(ComponentOfSlot(b.slot)))
+                    erasedSparse |= set->Erase(e);
+            }
             for (const UniversalSpec& spec : m_universal)
                 if (UniversalColumn* column = FindUniversal(spec.id))
                     column->Destroy(e);
-            // Interim: erase from every existing set (O(sets)). Chunk C's destroy-walk
-            // task replaces this loop with the walk over `chunk`'s presence blocks at
-            // `index` (spec s7.3).
-            for (ComponentID id : m_sparseIds)
-                (void)m_sparseSets[id]->Erase(e);
+            return erasedSparse;
         }
 
         // Registry::Clear (spec s7.3): destroys every element IN PLACE (cached Views stay
