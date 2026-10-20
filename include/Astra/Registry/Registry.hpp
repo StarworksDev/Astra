@@ -380,6 +380,8 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return false;
+            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+                return true;   // always present: today's present-component rule, no signal (s3.3, s12.2)
 
             T* newComponent = m_archetypeManager->AddComponent<T>(entity, component);
 
@@ -397,6 +399,8 @@ namespace Astra
             // See AddComponent (IM-24): stale/invalid handle -> graceful false, no abort.
             if (!m_entityManager.IsValid(entity))
                 return false;
+            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+                return true;   // always present: see AddComponent
 
             T* component = m_archetypeManager->AddComponent<T>(entity, std::forward<Args>(args)...);
 
@@ -411,6 +415,8 @@ namespace Astra
         bool RemoveComponent(Entity entity)
         {
             AssertContextAffinity();
+            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+                return m_entityManager.IsValid(entity) ? RefuseUniversalRemove() : false;
             if (m_signalManager.IsSignalEnabled(Signal::ComponentRemoved)) ASTRA_UNLIKELY
             {
                 // Cold arm: the signal needs the PRE-removal pointer. The validated
@@ -436,6 +442,8 @@ namespace Astra
         {
             if (entities.empty())
                 return;
+            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+                return;        // present on every entity: a no-op, no signal
 
             SmallVector<Entity, 256> validEntities;
             validEntities.reserve(entities.size());
@@ -476,6 +484,8 @@ namespace Astra
         {
             if (entities.empty())
                 return;
+            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+                return;        // present on every entity: a no-op, no signal
             
             // Filter out invalid entities
             SmallVector<Entity, 256> validEntities;
@@ -518,6 +528,8 @@ namespace Astra
         {
             if (entities.empty())
                 return 0;
+            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+                return RefuseUniversalRemoveBatch(entities);
             
             // Filter out invalid entities
             SmallVector<Entity, 256> validEntities;
@@ -785,6 +797,9 @@ namespace Astra
          */
         bool AddComponentByID(Entity entity, ComponentID componentId, const void* data, size_t dataSize)
         {
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return false;  // present on every entity: the by-id Table rule for a present component
+
             bool result = m_archetypeManager->AddComponentByID(entity, componentId, data, dataSize);
 
             if (result && m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
@@ -832,6 +847,9 @@ namespace Astra
          */
         size_t AddComponentsByID(std::span<Entity> entities, ComponentID componentId, const void* data, size_t dataSize)
         {
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return 0;
+
             return m_archetypeManager->AddComponentsByID(entities, componentId, data, dataSize);
         }
 
@@ -844,6 +862,9 @@ namespace Astra
          */
         bool RemoveComponentByID(Entity entity, ComponentID componentId)
         {
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return m_entityManager.IsValid(entity) ? RefuseUniversalRemove() : false;
+
             // Get component pointer before removal for signal emission
             void* componentPtr = nullptr;
             if (m_signalManager.IsSignalEnabled(Signal::ComponentRemoved))
@@ -891,6 +912,9 @@ namespace Astra
          */
         size_t RemoveComponentsByID(std::span<Entity> entities, ComponentID componentId)
         {
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return RefuseUniversalRemoveBatch(entities);
+
             return m_archetypeManager->RemoveComponentsByID(entities, componentId);
         }
 
@@ -1920,6 +1944,40 @@ namespace Astra
                 return true;
             else
                 return m_componentStorage->HasUniversals() && m_componentStorage->IsDeclaredUniversal(TypeID<T>::Value());
+        }
+
+        // D2's single exception (spec 2026-10-01 s3.3, s12.3): a universal component is
+        // present on every entity and cannot be removed. Debug: ASTRA_ASSERT. Release:
+        // false. Never a signal. Callers check the handle FIRST, so a stale handle is a
+        // quiet miss, never a refusal.
+        static bool RefuseUniversalRemove() noexcept
+        {
+            ASTRA_ASSERT(false, "RemoveComponent on a Universal component is refused: it is present on every entity (spec 2026-10-01 s3.3)");
+            return false;
+        }
+
+        // Batch form: one refusal per call if any handle is live (a batch of only stale
+        // handles misses quietly). Returns 0, the removed count. (A CommandBuffer batch
+        // remove executes per entity, so it refuses once per live entity.)
+        size_t RefuseUniversalRemoveBatch(std::span<Entity> entities) const noexcept
+        {
+            for (Entity entity : entities)
+            {
+                if (m_entityManager.IsValid(entity))
+                {
+                    (void)RefuseUniversalRemove();
+                    break;
+                }
+            }
+            return 0;
+        }
+
+        // True when `id` is declared Universal in this registry (a bool load plus a
+        // descriptor-kind read; false in a registry with no universal).
+        ASTRA_NODISCARD bool IsUniversalId(ComponentID id) const noexcept
+        {
+            return id < MAX_COMPONENTS && m_componentStorage->HasUniversals()
+                && m_componentStorage->KindOf(id) == StorageKind::Universal;
         }
 
         // Non-stamping, type-erased store lookup: the element pointer (or

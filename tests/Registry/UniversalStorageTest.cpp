@@ -242,3 +242,113 @@ TEST(UniversalStorageStaleHandle, ClearRecycleMissesOnGetAndHas)
     ASSERT_NE(now, nullptr);
     EXPECT_FLOAT_EQ(now->x, 0.0f);
 }
+
+namespace
+{
+    struct AssertCount { int n = 0; };
+
+    Astra::AssertAction CountAndContinue(const Astra::AssertContext&, void* user) noexcept
+    {
+        ++static_cast<AssertCount*>(user)->n;
+        return Astra::AssertAction::Continue;
+    }
+
+#if MOSAIC_ASSERTS_ACTIVE
+    constexpr int kAssertsPerRefusal = 1;   // Debug (or a checked build): the refusal asserts
+#else
+    constexpr int kAssertsPerRefusal = 0;   // Release: compiled out, returns false
+#endif
+}
+
+TEST(UniversalStorage, AddOnAPresentUniversalIsANoOpReturningTrue)
+{
+    Registry reg(UniversalPositionConfig(nullptr));
+    const Entity e = reg.CreateEntity();
+    reg.GetComponent<Position>(e)->x = 4.0f;
+    reg.EnableSignals(Astra::Signal::ComponentAdded);
+    int added = 0;
+    auto h = reg.GetSignalManager()->On<Astra::Events::ComponentAdded>().Register(
+        [&](const Astra::Events::ComponentAdded&) { ++added; });
+
+    EXPECT_TRUE(reg.AddComponent<Position>(e, Position{9.0f, 9.0f, 9.0f}));
+    EXPECT_TRUE(reg.EmplaceComponent<Position>(e, 8.0f, 8.0f, 8.0f));
+    std::vector<Entity> one{e};
+    reg.AddComponents<Position>(std::span{one}, Position{7.0f, 7.0f, 7.0f});
+    reg.EmplaceComponents<Position>(std::span{one}, 6.0f, 6.0f, 6.0f);
+    const Position value(5.0f, 5.0f, 5.0f);
+    EXPECT_FALSE(reg.AddComponentByID(e, Astra::TypeID<Position>::Value(), &value, sizeof(Position)));   // by-id Table rule for "present"
+    EXPECT_EQ(reg.AddComponentsByID(std::span{one}, Astra::TypeID<Position>::Value(), &value, sizeof(Position)), 0u);
+
+    EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(e)->x, 4.0f);   // untouched
+    EXPECT_EQ(added, 0);                                                     // no signal
+    reg.GetSignalManager()->On<Astra::Events::ComponentAdded>().Unregister(h);
+}
+
+TEST(UniversalStorage, RemoveIsRefusedOnEveryFormWithoutASignal)
+{
+    Registry reg(UniversalPositionConfig(nullptr));
+    const Entity e = reg.CreateEntity();
+    reg.GetComponent<Position>(e)->x = 4.0f;
+    reg.EnableSignals(Astra::Signal::ComponentRemoved);
+    int removed = 0;
+    auto h = reg.GetSignalManager()->On<Astra::Events::ComponentRemoved>().Register(
+        [&](const Astra::Events::ComponentRemoved&) { ++removed; });
+
+    AssertCount count;
+    {
+        Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &count);
+        std::vector<Entity> one{e};
+        EXPECT_FALSE(reg.RemoveComponent<Position>(e));
+        EXPECT_EQ(reg.RemoveComponents<Position>(std::span{one}), 0u);
+        EXPECT_FALSE(reg.RemoveComponentByID(e, Astra::TypeID<Position>::Value()));
+        EXPECT_EQ(reg.RemoveComponentsByID(std::span{one}, Astra::TypeID<Position>::Value()), 0u);
+    }
+    EXPECT_EQ(count.n, 4 * kAssertsPerRefusal);   // one refusal per call
+    EXPECT_EQ(removed, 0);
+    ASSERT_TRUE(reg.HasComponent<Position>(e));
+    EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(e)->x, 4.0f);
+    reg.GetSignalManager()->On<Astra::Events::ComponentRemoved>().Unregister(h);
+}
+
+TEST(UniversalStorage, CommandBufferRemoveOfAUniversalIsRefusedAtExecute)
+{
+    Registry reg(UniversalPositionConfig(nullptr));
+    const Entity e = reg.CreateEntity();
+    AssertCount count;
+    {
+        Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &count);
+        Astra::CommandBuffer cb(&reg);
+        cb.RemoveComponent<Position>(e);
+        (void)cb.Execute();   // the executor reports the refusal as a failed command
+    }
+    EXPECT_EQ(count.n, kAssertsPerRefusal);
+    EXPECT_TRUE(reg.HasComponent<Position>(e));
+}
+
+// ---- Review Focus 1 (Universal), Add/Remove arms ----
+TEST(UniversalStorageStaleHandle, AddAndRemoveMissQuietlyAndNeverTouchTheOccupant)
+{
+    Registry reg(UniversalPositionConfig(nullptr));
+    const Entity stale = reg.CreateEntity();
+    reg.DestroyEntity(stale);
+    const Entity fresh = reg.CreateEntity();
+    ASSERT_EQ(fresh.GetID(), stale.GetID());
+    reg.GetComponent<Position>(fresh)->x = 3.0f;
+
+    AssertCount count;
+    {
+        Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &count);
+        std::vector<Entity> staleOnly{stale};
+        const Position value(9.0f, 9.0f, 9.0f);
+        EXPECT_FALSE(reg.AddComponent<Position>(stale, value));
+        EXPECT_FALSE(reg.EmplaceComponent<Position>(stale, 9.0f, 9.0f, 9.0f));
+        EXPECT_FALSE(reg.AddComponentByID(stale, Astra::TypeID<Position>::Value(), &value, sizeof(Position)));
+        EXPECT_FALSE(reg.RemoveComponent<Position>(stale));
+        EXPECT_EQ(reg.RemoveComponents<Position>(std::span{staleOnly}), 0u);
+        EXPECT_FALSE(reg.RemoveComponentByID(stale, Astra::TypeID<Position>::Value()));
+        EXPECT_EQ(reg.RemoveComponentsByID(std::span{staleOnly}, Astra::TypeID<Position>::Value()), 0u);
+    }
+    EXPECT_EQ(count.n, 0);                     // a stale handle is a miss, not a refusal
+    ASSERT_TRUE(reg.HasComponent<Position>(fresh));
+    EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(fresh)->x, 3.0f);
+}
