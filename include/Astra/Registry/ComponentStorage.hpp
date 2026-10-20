@@ -299,14 +299,28 @@ namespace Astra
         // and storing SetIfNeq of the component; read by IsChanged / IsAdded for an
         // untracked Sparse element. 0 == never. Survives Clear() (a version is a time,
         // not a value). SparseSet keeps no coarse tick of its own.
+        // `Par`: accessed from a parallel view driver where every worker shares this slot
+        // (relaxed atomic_ref, RULINGS Task 28).
+        template<bool Par = false>
         ASTRA_NODISCARD Tick CoarseVersion(ComponentID id) const noexcept
         {
-            return id < MAX_COMPONENTS ? m_coarseVersion[id] : Tick{0};
+            if (id >= MAX_COMPONENTS)
+                return Tick{0};
+            if constexpr (Par)
+                return LoadTickRelaxed(m_coarseVersion[id]);
+            else
+                return m_coarseVersion[id];
         }
+        template<bool Par = false>
         void StampCoarse(ComponentID id, Tick tick) noexcept
         {
             if (id < MAX_COMPONENTS) ASTRA_LIKELY
-                m_coarseVersion[id] = tick;
+            {
+                if constexpr (Par)
+                    StoreTickRelaxed(m_coarseVersion[id], tick);
+                else
+                    m_coarseVersion[id] = tick;
+            }
         }
 
     private:

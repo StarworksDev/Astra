@@ -833,16 +833,26 @@ namespace Astra
         // in the chunk arena right after the column data (see InitializeColumns) and
         // is zero-initialised: version 0 == "never stamped". Stamps are plain stores.
 
+        // `Par`: a parallel driver whose workers can share this chunk (a sparse-driven
+        // dense range is not chunk-partitioned) uses relaxed atomic access (RULINGS Task 28).
+        template<bool Par = false>
         ASTRA_NODISCARD ASTRA_FORCEINLINE Tick GetColumnVersion(int column) const noexcept
         {
             ASTRA_ASSERT(column >= 0 && column < m_meta->columnCount, "column ordinal out of range");
-            return m_columnVersion[column];
+            if constexpr (Par)
+                return LoadTickRelaxed(m_columnVersion[column]);
+            else
+                return m_columnVersion[column];
         }
 
+        template<bool Par = false>
         ASTRA_FORCEINLINE void StampColumn(int column, Tick tick) noexcept
         {
             ASTRA_ASSERT(column >= 0 && column < m_meta->columnCount, "column ordinal out of range");
-            m_columnVersion[column] = tick;
+            if constexpr (Par)
+                StoreTickRelaxed(m_columnVersion[column], tick);
+            else
+                m_columnVersion[column] = tick;
         }
 
         // Every storage column at once: the structural-write stamp (a slot in this

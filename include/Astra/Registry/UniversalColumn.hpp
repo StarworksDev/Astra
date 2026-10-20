@@ -130,6 +130,10 @@ namespace Astra
         // version and, for a tracked type, the slot's `changed`. Returns false for an
         // absent or stale handle, or for a tag, which has no value (the Table rule for a
         // column-less tag).
+        // `Par`: a parallel view driver (workers on different chunks share a page): the page
+        // version goes through a relaxed atomic_ref store (RULINGS Task 28); the per-slot
+        // tick belongs to this entity alone and stays plain.
+        template<bool Par = false>
         bool MarkWritten(Entity e, Tick now) noexcept
         {
             if (m_desc.size == 0) ASTRA_UNLIKELY
@@ -137,7 +141,10 @@ namespace Astra
             Page* page = FindLive(e);
             if (!page) ASTRA_UNLIKELY
                 return false;
-            page->version = now;
+            if constexpr (Par)
+                StoreTickRelaxed(page->version, now);
+            else
+                page->version = now;
             if (page->ticks)
                 page->ticks[SlotOf(e)].changed = now;
             return true;
@@ -146,18 +153,24 @@ namespace Astra
         // Exact for a tracked type. For an untracked type, the page version is returned:
         // every live slot of a stamped page answers it, the same trade a chunk's column
         // version makes. Returns 0 ("never") when e is not live.
+        template<bool Par = false>
         ASTRA_NODISCARD Tick AddedTick(Entity e) const noexcept
         {
             const Page* page = FindLive(e);
             if (!page) return Tick{0};
-            return page->ticks ? page->ticks[SlotOf(e)].added : page->version;
+            if (page->ticks) return page->ticks[SlotOf(e)].added;
+            if constexpr (Par) return LoadTickRelaxed(page->version);
+            else               return page->version;
         }
 
+        template<bool Par = false>
         ASTRA_NODISCARD Tick ChangedTick(Entity e) const noexcept
         {
             const Page* page = FindLive(e);
             if (!page) return Tick{0};
-            return page->ticks ? page->ticks[SlotOf(e)].changed : page->version;
+            if (page->ticks) return page->ticks[SlotOf(e)].changed;
+            if constexpr (Par) return LoadTickRelaxed(page->version);
+            else               return page->version;
         }
 
         ASTRA_NODISCARD std::size_t LiveCount() const noexcept { return m_liveCount; }

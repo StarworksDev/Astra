@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <tuple>
@@ -245,6 +246,19 @@ namespace Astra
                 return;
 
             auto adapted = MakeEntityOptionalAdapter(func);
+            if constexpr (HasSparseArg)
+            {
+                // s6.2/s6.5: no Table-kind required argument and a required Sparse one =>
+                // the smallest required set drives; an empty required set matches nothing.
+                const SparseDriver d = PickSparseDriver();
+                if (d.empty)
+                    return;
+                if (d.set)
+                {
+                    ParallelSparseDriven(d.set, adapted, since);
+                    return;
+                }
+            }
 
             // Quick check: if we have very few matching entities, don't even try parallel
             size_t quickCount = 0;
@@ -375,6 +389,15 @@ namespace Astra
 
             if (m_archetypes.empty()) ASTRA_UNLIKELY
                 return 0;
+
+            if constexpr (HasSparseArg)
+            {
+                const SparseDriver d = PickSparseDriver();
+                if (d.empty)
+                    return 0;
+                if (d.set)
+                    return ParallelSparseDrivenWithContext(d.set, since, factory, body);
+            }
 
             size_t quickCount = 0;
             for (Archetype* archetype : m_archetypes)
@@ -991,9 +1014,26 @@ namespace Astra
                 return;
 
             auto adapted = MakeEntityOptionalAdapter(func);
-            for (Archetype* archetype : m_archetypes)
+            bool walked = false;
+            if constexpr (HasSparseArg)
             {
-                ForEachImpl<Stamp>(archetype, adapted, since, RequiredTypes{}, OptionalTypes{});
+                // s6.2: no Table-kind required argument and a required Sparse one => the
+                // smallest required set drives; an empty required set matches nothing.
+                const SparseDriver d = PickSparseDriver();
+                if (d.empty)
+                    walked = true;
+                else if (d.set)
+                {
+                    VisitSparseRange<Stamp>(d.set, 0, (std::numeric_limits<size_t>::max)(), adapted, m_archetypeManager->CurrentTick(), since);
+                    walked = true;
+                }
+            }
+            if (!walked)
+            {
+                for (Archetype* archetype : m_archetypes)
+                {
+                    ForEachImpl<Stamp>(archetype, adapted, since, RequiredTypes{}, OptionalTypes{});
+                }
             }
 
 #ifdef ASTRA_BUILD_DEBUG
@@ -1111,11 +1151,12 @@ namespace Astra
                 // A tracked non-const yield (Mut<T>) takes the view-owned loop.
                 if (m_anyUniversal) ASTRA_UNLIKELY
                 {
-                    // Interim until Task 28's parallel driver: a Universal member has no
-                    // chunk column, so route the one chunk through the storage walk.
+                    // A Universal member has no chunk column: route the one chunk through
+                    // the storage walk. Workers on different chunks can share a Universal
+                    // page and a coarse version slot, hence Par=true (relaxed atomic_ref).
                     const auto& uchunks = archetype->GetChunks();
                     if (chunkIndex < uchunks.size())
-                        VisitChunkStorage<true>(archetype, uchunks[chunkIndex].get(), func, m_archetypeManager->CurrentTick(), since,
+                        VisitChunkStorage<true, true>(archetype, uchunks[chunkIndex].get(), func, m_archetypeManager->CurrentTick(), since,
                                                 std::make_index_sequence<sizeof...(Required)>{},
                                                 std::make_index_sequence<sizeof...(Optional)>{});
                     return;
@@ -1137,7 +1178,7 @@ namespace Astra
                 const auto& chunks = archetype->GetChunks();
                 if (chunkIndex >= chunks.size()) ASTRA_UNLIKELY
                     return;
-                VisitChunkFiltered<true>(archetype, chunks[chunkIndex].get(), func, m_archetypeManager->CurrentTick(), since,
+                VisitChunkFiltered<true, true>(archetype, chunks[chunkIndex].get(), func, m_archetypeManager->CurrentTick(), since,
                                          std::make_index_sequence<sizeof...(Required)>{},
                                          std::make_index_sequence<sizeof...(Optional)>{});
             }
@@ -1451,14 +1492,14 @@ namespace Astra
         // Per-chunk filtered visit. Storage-path views (a Sparse type, or a Universal
         // member in this registry) take VisitChunkStorage; every other view keeps the
         // pre-existing loop (VisitChunkTable), which a HasSparseArg view never instantiates.
-        template<bool Stamp, typename Func, size_t... ReqIs, size_t... OptIs>
+        template<bool Stamp, bool Par = false, typename Func, size_t... ReqIs, size_t... OptIs>
         ASTRA_FORCEINLINE void VisitChunkFiltered(Archetype* archetype, ArchetypeChunk* chunk, Func&& func, Tick now, Tick since,
                                                   std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
         {
             if constexpr (HasSparseArg)
-                VisitChunkStorage<Stamp>(archetype, chunk, func, now, since, reqSeq, optSeq);
+                VisitChunkStorage<Stamp, Par>(archetype, chunk, func, now, since, reqSeq, optSeq);
             else if (m_anyUniversal) ASTRA_UNLIKELY
-                VisitChunkStorage<Stamp>(archetype, chunk, func, now, since, reqSeq, optSeq);
+                VisitChunkStorage<Stamp, Par>(archetype, chunk, func, now, since, reqSeq, optSeq);
             else
                 VisitChunkTable<Stamp>(archetype, chunk, func, now, since, reqSeq, optSeq);
         }
@@ -1843,6 +1884,235 @@ namespace Astra
                 && EntityOneOfGroups(rec, e, st, static_cast<OneOfGroupTypes*>(nullptr));
         }
 
+        // Enabled-only filter of one required enableable T, for one entity.
+        template<typename T>
+        ASTRA_NODISCARD bool EntityEnabled(const EntityRecord* rec, Entity e, const StoreArray& st) const
+        {
+            using Bare = std::remove_const_t<T>;
+            const StoreRef& s = st[PlanIndex<Bare>];
+            switch (m_kinds[PlanIndex<Bare>])
+            {
+            case StorageKind::Table:
+                return !rec->chunk->IsDisabled(rec->archetype->GetColumnMeta().idToColumn[TypeID<Bare>::Value()],
+                                               rec->location.GetEntityIndex());
+            case StorageKind::Sparse:    return !(s.sparse && s.sparse->IsDisabled(e));
+            case StorageKind::Universal: return !(s.universal && s.universal->IsDisabled(e));
+            }
+            return true;
+        }
+
+        // One Changed/Added term for one entity: the chunk tier and the per-entity tier
+        // of VisitChunkStorage folded together (Task 27's table of sources). `Par`: the
+        // shared version locations are read with relaxed atomic loads (RULINGS Task 28).
+        template<bool UseAdded, bool Par, typename T>
+        ASTRA_NODISCARD bool EntityChangeTermPasses(const EntityRecord* rec, Entity e, const StoreArray& st, Tick since) const
+        {
+            using Bare = std::remove_const_t<T>;
+            const StoreRef& s = st[PlanIndex<Bare>];
+            switch (m_kinds[PlanIndex<Bare>])
+            {
+            case StorageKind::Table:
+            {
+                const int col = rec->archetype->GetColumnMeta().idToColumn[TypeID<Bare>::Value()];
+                if (!IsNewer(rec->chunk->template GetColumnVersion<Par>(col), since))
+                    return false;
+                if constexpr (IsChangeTrackedV<Bare>)
+                {
+                    const EntityTicks& t = rec->chunk->GetTicks(col)[rec->location.GetEntityIndex()];
+                    return IsNewer(UseAdded ? t.added : t.changed, since);
+                }
+                else
+                    return true;
+            }
+            case StorageKind::Sparse:
+                if constexpr (IsChangeTrackedV<Bare>)
+                {
+                    const EntityTicks* t = s.sparse ? std::as_const(*s.sparse).Ticks(e) : nullptr;
+                    return t && IsNewer(UseAdded ? t->added : t->changed, since);
+                }
+                else
+                {
+                    ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
+                    return storage && IsNewer(storage->template CoarseVersion<Par>(TypeID<Bare>::Value()), since);
+                }
+            case StorageKind::Universal:
+                return s.universal && IsNewer(UseAdded ? s.universal->template AddedTick<Par>(e) : s.universal->template ChangedTick<Par>(e), since);
+            }
+            return true;
+        }
+
+        // Every per-entity constraint (spec s6.2). The caller has already checked the
+        // record's archetype with MatchesArchetype. Used by the sparse-driven walk and by
+        // Get()/Contains() (Task 29).
+        template<bool Par = false>
+        ASTRA_NODISCARD bool EntityPasses(const EntityRecord* rec, Entity e, const StoreArray& st, [[maybe_unused]] Tick since) const
+        {
+            bool ok = true;
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((ok = ok && EntityHolds<std::remove_const_t<Ts>>(rec, e, st)), ...);
+            }(static_cast<SparseRequiredTypes*>(nullptr));
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((ok = ok && !(m_kinds[PlanIndex<std::remove_const_t<Ts>>] == StorageKind::Sparse
+                               && EntityHolds<std::remove_const_t<Ts>>(rec, e, st))), ...);
+            }(static_cast<SparseExcludedTypes*>(nullptr));
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((ok = ok && EntityEnabled<Ts>(rec, e, st)), ...);
+            }(static_cast<EnabledRequiredFilter*>(nullptr));
+            ok = ok && EntityGroupsPass(rec, e, st);
+            if constexpr (HasChangeFilter)
+            {
+                [&]<typename... Ts>(std::tuple<Ts...>*)
+                {
+                    ((ok = ok && EntityChangeTermPasses<false, Par, Ts>(rec, e, st, since)), ...);
+                }(static_cast<ChangedTypes*>(nullptr));
+                [&]<typename... Ts>(std::tuple<Ts...>*)
+                {
+                    ((ok = ok && EntityChangeTermPasses<true, Par, Ts>(rec, e, st, since)), ...);
+                }(static_cast<AddedTypes*>(nullptr));
+            }
+            return ok;
+        }
+
+        // ---- Sparse-driven walk (spec s6.2) ----
+        static constexpr size_t SPARSE_WORK_ITEM = 1024;   // dense entries per parallel work item (s6.5)
+
+        // The required Sparse set with the fewest members, when no Table-kind argument is
+        // required. `empty`: a required Sparse type has no member at all (nothing matches).
+        struct SparseDriver { SparseSet* set = nullptr; bool empty = false; };
+
+        template<typename T>
+        void ConsiderDriver(SparseDriver& d) const
+        {
+            if (m_kinds[PlanIndex<T>] != StorageKind::Sparse)
+                return;                                       // declared Universal here: never a driver
+            SparseSet* s = m_stores[PlanIndex<T>].sparse;
+            if (!s || s->Size() == 0)
+            {
+                d.empty = true;
+                return;
+            }
+            if (!d.set || s->Size() < d.set->Size())
+                d.set = s;
+        }
+
+        ASTRA_NODISCARD SparseDriver PickSparseDriver() const
+        {
+            SparseDriver d;
+            if constexpr (std::tuple_size_v<SparseRequiredTypes> > 0)
+            {
+                if (m_matchRequired.None())                  // no Table-kind required/With/Changed/Added
+                {
+                    [&]<typename... Ts>(std::tuple<Ts...>*)
+                    {
+                        (ConsiderDriver<std::remove_const_t<Ts>>(d), ...);
+                    }(static_cast<SparseRequiredTypes*>(nullptr));
+                }
+            }
+            if (d.empty)
+                d.set = nullptr;
+            return d;
+        }
+
+        // One candidate entity: archetype match, per-entity constraints, stamp, fetch, call.
+        // Par: this runs on a parallel worker (shared stamp locations go through atomic_ref).
+        template<bool Stamp, bool Par, typename Func, size_t... ReqIs, size_t... OptIs>
+        void VisitEntityStorageImpl(Entity e, Func& func, Tick now, Tick since,
+                                    std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
+        {
+            const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+            if (!rec || !rec->chunk) ASTRA_UNLIKELY
+                return;
+            if (!MatchesArchetype(rec->archetype->GetMask()) || !EntityPasses<Par>(rec, e, m_stores, since))
+                return;
+            ArchetypeChunk* chunk = rec->chunk;
+            const ArchetypeColumnMeta& cm = rec->archetype->GetColumnMeta();
+            const size_t i = rec->location.GetEntityIndex();
+            if constexpr (Stamp)
+                StampVisit<Par>(chunk, cm, now, reqSeq, optSeq);
+            std::tuple<Fetch<std::tuple_element_t<ReqIs, RequiredTypes>>...> req{
+                MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, m_stores)... };
+            std::tuple<Fetch<std::tuple_element_t<OptIs, OptionalTypes>>...> opt{
+                MakeFetch<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, m_stores)... };
+            InvokeStorageEntity<Stamp, Par>(e, i, req, opt, func, now, reqSeq, optSeq);
+        }
+
+        // Dense range [lo, hi) of the driving set. Index-based, re-reading Size() and
+        // Entities() every step: a sparse add/remove made inside the callback (refused by
+        // the Debug guard, s4.3) may swap-and-pop or reallocate the dense arrays, and this
+        // walk never holds a pointer across a call.
+        template<bool Stamp, bool Par = false, typename Func>
+        void VisitSparseRange(SparseSet* set, size_t lo, size_t hi, Func& func, Tick now, Tick since)
+        {
+            for (size_t d = lo; d < hi && d < set->Size(); ++d)
+                VisitEntityStorageImpl<Stamp, Par>(set->Entities()[d], func, now, since,
+                                                   std::make_index_sequence<std::tuple_size_v<RequiredTypes>>{},
+                                                   std::make_index_sequence<std::tuple_size_v<OptionalTypes>>{});
+        }
+
+        // Sparse-driven ParallelForEach: fixed SPARSE_WORK_ITEM dense ranges. Each entity
+        // owns its own slot in every store, so workers write disjoint elements; the
+        // locations several workers share (chunk column versions, the coarse version slot,
+        // Universal page versions) use relaxed atomic_ref stores (Par, RULINGS Task 28).
+        template<typename Func>
+        void ParallelSparseDriven(SparseSet* set, Func& adapted, Tick since)
+        {
+            const size_t n = set->Size();
+            if (!m_scheduler || n < MIN_ENTITIES_FOR_PARALLEL)
+            {
+                ForEachSince(since, adapted);
+                return;
+            }
+            const Tick now = m_archetypeManager->CurrentTick();
+            const size_t items = (n + SPARSE_WORK_ITEM - 1) / SPARSE_WORK_ITEM;
+            m_scheduler->ParallelFor(items, 1, [&](size_t begin, size_t end, uint32_t /*worker*/)
+            {
+                for (size_t w = begin; w < end; ++w)
+                    VisitSparseRange<true, true>(set, w * SPARSE_WORK_ITEM, (std::min)(n, (w + 1) * SPARSE_WORK_ITEM), adapted, now, since);
+            });
+        }
+
+        // Sparse-driven ParallelForEachWithContext: the FLAT work-item index `w` is the
+        // sub-context's iteration index (deterministic: the dense order is). Returns the
+        // number of work items, identical on the inline and the dispatch paths.
+        template<typename Factory, typename Body>
+        size_t ParallelSparseDrivenWithContext(SparseSet* set, Tick since, Factory& factory, Body& body)
+        {
+            const size_t n = set->Size();
+            if (n == 0)
+                return 0;
+            const size_t items = (n + SPARSE_WORK_ITEM - 1) / SPARSE_WORK_ITEM;
+            const Tick now = m_archetypeManager->CurrentTick();
+            const bool dispatch = m_scheduler && n >= MIN_ENTITIES_FOR_PARALLEL && items >= 2;
+            auto runItem = [&](size_t w)
+            {
+                auto sub = factory(static_cast<uint32_t>(w));
+                auto wrapped = [&body, &sub](Astra::Entity e, auto&&... comps)
+                {
+                    body(e, std::forward<decltype(comps)>(comps)..., sub);
+                };
+                const size_t hi = (std::min)(n, (w + 1) * SPARSE_WORK_ITEM);
+                if (dispatch)
+                    VisitSparseRange<true, true>(set, w * SPARSE_WORK_ITEM, hi, wrapped, now, since);
+                else
+                    VisitSparseRange<true, false>(set, w * SPARSE_WORK_ITEM, hi, wrapped, now, since);
+            };
+            if (!dispatch)
+            {
+                for (size_t w = 0; w < items; ++w)
+                    runItem(w);
+                return items;
+            }
+            m_scheduler->ParallelFor(items, 1, [&](size_t begin, size_t end, uint32_t /*worker*/)
+            {
+                for (size_t w = begin; w < end; ++w)
+                    runItem(w);
+            });
+            return items;
+        }
+
         // Enabled-only filter of one required enableable T (IncludeDisabled opts out
         // upstream): the column's disabled words for Table, the chunk's disabled MIRROR
         // (P3) for Sparse/Universal. False when every entity of the chunk is disabled.
@@ -1920,42 +2190,43 @@ namespace Astra
         // untracked Sparse term on the per-component coarse version (the source
         // Registry::IsChanged reads). Tracked Sparse and Universal terms are decided per
         // entity.
-        template<typename T>
+        template<typename T, bool Par = false>
         bool ChangeTermChunkPasses(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, Tick since) const
         {
             using Bare = std::remove_const_t<T>;
             switch (m_kinds[PlanIndex<Bare>])
             {
             case StorageKind::Table:
-                return IsNewer(chunk->GetColumnVersion(cm.idToColumn[TypeID<Bare>::Value()]), since);
+                return IsNewer(chunk->template GetColumnVersion<Par>(cm.idToColumn[TypeID<Bare>::Value()]), since);
             case StorageKind::Sparse:
                 if constexpr (IsChangeTrackedV<Bare>)
                     return true;
                 else
                 {
                     ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
-                    return storage && IsNewer(storage->CoarseVersion(TypeID<Bare>::Value()), since);
+                    return storage && IsNewer(storage->template CoarseVersion<Par>(TypeID<Bare>::Value()), since);
                 }
             case StorageKind::Universal:
                 return true;
             }
             return true;
         }
-        template<typename... Ts>
+        template<bool Par, typename... Ts>
         bool AllChangeTermsPass([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
                                 [[maybe_unused]] Tick since, std::tuple<Ts...>*) const
         {
-            return (ChangeTermChunkPasses<Ts>(chunk, cm, since) && ...);
+            return (ChangeTermChunkPasses<Ts, Par>(chunk, cm, since) && ...);
         }
+        template<bool Par = false>
         bool ChangeChunkPassesStorage(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, Tick since) const
         {
-            return AllChangeTermsPass(chunk, cm, since, static_cast<ChangedTypes*>(nullptr))
-                && AllChangeTermsPass(chunk, cm, since, static_cast<AddedTypes*>(nullptr));
+            return AllChangeTermsPass<Par>(chunk, cm, since, static_cast<ChangedTypes*>(nullptr))
+                && AllChangeTermsPass<Par>(chunk, cm, since, static_cast<AddedTypes*>(nullptr));
         }
 
         // Per-entity tier of one term: set the bit of every entity whose tick is NOT newer
         // than `since` (an absent element fails; the presence words exclude it anyway).
-        template<bool UseAdded, typename T>
+        template<bool UseAdded, bool Par, typename T>
         void ExcludeNotNewerStorage([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
                                     [[maybe_unused]] size_t count, [[maybe_unused]] Tick since,
                                     [[maybe_unused]] uint64_t* excluded, [[maybe_unused]] bool& anyExcluded) const
@@ -1986,7 +2257,7 @@ namespace Astra
                 const UniversalColumn* col = m_stores[PlanIndex<Bare>].universal;
                 for (size_t i = 0; i < count; ++i)
                 {
-                    const Tick t = col ? (UseAdded ? col->AddedTick(es[i]) : col->ChangedTick(es[i])) : Tick{0};
+                    const Tick t = col ? (UseAdded ? col->template AddedTick<Par>(es[i]) : col->template ChangedTick<Par>(es[i])) : Tick{0};
                     const bool fails = !IsNewer(t, since);
                     excluded[i >> 6] |= static_cast<uint64_t>(fails) << (i & 63);
                     anyExcluded |= fails;
@@ -1995,12 +2266,12 @@ namespace Astra
             }
             }
         }
-        template<bool UseAdded, typename... Ts>
+        template<bool UseAdded, bool Par, typename... Ts>
         void BuildChangeExcludedStorage([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
                                         [[maybe_unused]] size_t count, [[maybe_unused]] Tick since,
                                         [[maybe_unused]] uint64_t* excluded, [[maybe_unused]] bool& anyExcluded, std::tuple<Ts...>*) const
         {
-            (ExcludeNotNewerStorage<UseAdded, Ts>(chunk, cm, count, since, excluded, anyExcluded), ...);
+            (ExcludeNotNewerStorage<UseAdded, Par, Ts>(chunk, cm, count, since, excluded, anyExcluded), ...);
         }
 
         // ---- Fetching (spec s6.4) ----
@@ -2109,7 +2380,7 @@ namespace Astra
 
         // Coarse stamp of the non-const TABLE-kind yields present on this archetype.
         // Sparse/Universal elements have no chunk column; Task 25 stamps their stores.
-        template<typename T>
+        template<typename T, bool Par>
         ASTRA_FORCEINLINE void StampTableYield([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
                                                [[maybe_unused]] Tick now) const
         {
@@ -2120,15 +2391,15 @@ namespace Astra
                     return;
                 const int col = cm.idToColumn[TypeID<Bare>::Value()];
                 if (col >= 0)                                   // an Optional absent here has none
-                    chunk->StampColumn(col, now);
+                    chunk->template StampColumn<Par>(col, now);
             }
         }
-        template<size_t... ReqIs, size_t... OptIs>
+        template<bool Par, size_t... ReqIs, size_t... OptIs>
         ASTRA_FORCEINLINE void StampChunkStorage([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
                                                  [[maybe_unused]] Tick now, std::index_sequence<ReqIs...>, std::index_sequence<OptIs...>) const
         {
-            (StampTableYield<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, now), ...);
-            (StampTableYield<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, now), ...);
+            (StampTableYield<std::tuple_element_t<ReqIs, RequiredTypes>, Par>(chunk, cm, now), ...);
+            (StampTableYield<std::tuple_element_t<OptIs, OptionalTypes>, Par>(chunk, cm, now), ...);
         }
 
         // ---- Write stamps for Sparse/Universal yields (spec s6.4) ----
@@ -2144,7 +2415,7 @@ namespace Astra
         // Required args are already guaranteed present by RequirePresent. A Sparse-trait
         // type declared Universal in this registry is skipped: its coarse version is
         // never read (StoreTickNewer reads the page version).
-        template<typename T, bool Gated>
+        template<typename T, bool Gated, bool Par>
         ASTRA_FORCEINLINE void StampSparseCoarse([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] ComponentStorage* storage,
                                                  [[maybe_unused]] Tick now) const
         {
@@ -2162,34 +2433,34 @@ namespace Astra
                     if (!b || b->presentCount == 0)
                         return;
                 }
-                storage->StampCoarse(TypeID<Bare>::Value(), now);
+                storage->template StampCoarse<Par>(TypeID<Bare>::Value(), now);
             }
         }
 
         // The "stamp a visit" helper: everything a visited (not whole-chunk-rejected)
         // chunk stamps once -- the Table column versions and the untracked-Sparse coarse
         // versions. Tasks 28 and 29 call this instead of repeating the folds.
-        template<size_t... ReqIs, size_t... OptIs>
+        template<bool Par = false, size_t... ReqIs, size_t... OptIs>
         ASTRA_FORCEINLINE void StampVisit(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, Tick now,
                                           std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq) const
         {
-            StampChunkStorage(chunk, cm, now, reqSeq, optSeq);
+            StampChunkStorage<Par>(chunk, cm, now, reqSeq, optSeq);
             ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
-            (StampSparseCoarse<std::tuple_element_t<ReqIs, RequiredTypes>, false>(chunk, storage, now), ...);
-            (StampSparseCoarse<std::tuple_element_t<OptIs, OptionalTypes>, true>(chunk, storage, now), ...);
+            (StampSparseCoarse<std::tuple_element_t<ReqIs, RequiredTypes>, false, Par>(chunk, storage, now), ...);
+            (StampSparseCoarse<std::tuple_element_t<OptIs, OptionalTypes>, true, Par>(chunk, storage, now), ...);
         }
 
         // Per-entity write stamp of a non-const UNTRACKED Universal required yield: its
         // page version, the per-entity twin of the column stamp. A tracked one is handed
         // out as Mut<T>, which marks on use. SHARED LOCATION (Task 28 atomic_ref pass):
         // the Universal page version.
-        template<typename T, typename F>
+        template<typename T, bool Par, typename F>
         ASTRA_FORCEINLINE void StampRequiredStore([[maybe_unused]] F& f, [[maybe_unused]] Entity e, [[maybe_unused]] Tick now) const noexcept
         {
             if constexpr (Detail::IsMutableYield<T> && !IsChangeTrackedV<std::remove_const_t<T>>)
             {
                 if (f.isUniversal && f.universal)
-                    f.universal->MarkWritten(e, now);
+                    f.universal->template MarkWritten<Par>(e, now);
             }
         }
 
@@ -2198,7 +2469,7 @@ namespace Astra
         // Universal one bumps its page (SHARED LOCATION, Task 28). Untracked Sparse:
         // StampSparseCoarse; untracked Table: the chunk column stamp. `present` is the
         // pointer about to be handed out (null when absent or disabled).
-        template<typename T, typename F>
+        template<typename T, bool Par, typename F>
         ASTRA_FORCEINLINE void StampOptionalStore([[maybe_unused]] F& f, [[maybe_unused]] const void* present,
                                                   [[maybe_unused]] Entity e, [[maybe_unused]] size_t i,
                                                   [[maybe_unused]] Tick now) const noexcept
@@ -2211,7 +2482,7 @@ namespace Astra
                 if (f.isUniversal)
                 {
                     if (f.universal)
-                        f.universal->MarkWritten(e, now);
+                        f.universal->template MarkWritten<Par>(e, now);
                 }
                 else if constexpr (IsChangeTrackedV<Bare>)
                 {
@@ -2264,7 +2535,7 @@ namespace Astra
         // One matching entity: fetch, yield, call. A required element missing HERE was
         // removed by a structural change made inside this walk (the Debug guard reports
         // it, s4.3, Task 25): the entity is skipped, never dereferenced.
-        template<bool Stamp, typename ReqTuple, typename OptTuple, typename Func, size_t... ReqIs, size_t... OptIs>
+        template<bool Stamp, bool Par, typename ReqTuple, typename OptTuple, typename Func, size_t... ReqIs, size_t... OptIs>
         ASTRA_FORCEINLINE void InvokeStorageEntity(Entity e, size_t i, ReqTuple& req, OptTuple& opt, Func& func,
                                                    [[maybe_unused]] Tick now,
                                                    std::index_sequence<ReqIs...>, std::index_sequence<OptIs...>)
@@ -2275,8 +2546,8 @@ namespace Astra
             std::tuple<std::remove_const_t<std::tuple_element_t<OptIs, OptionalTypes>>*...> op{ std::get<OptIs>(opt).OptionalAt(e, i)... };
             if constexpr (Stamp)
             {
-                (StampRequiredStore<std::tuple_element_t<ReqIs, RequiredTypes>>(std::get<ReqIs>(req), e, now), ...);
-                (StampOptionalStore<std::tuple_element_t<OptIs, OptionalTypes>>(std::get<OptIs>(opt), std::get<OptIs>(op), e, i, now), ...);
+                (StampRequiredStore<std::tuple_element_t<ReqIs, RequiredTypes>, Par>(std::get<ReqIs>(req), e, now), ...);
+                (StampOptionalStore<std::tuple_element_t<OptIs, OptionalTypes>, Par>(std::get<OptIs>(opt), std::get<OptIs>(op), e, i, now), ...);
             }
             std::tuple<typename YieldType<std::tuple_element_t<ReqIs, RequiredTypes>>::type...> y{
                 MakeStorageYield<ReqIs>(std::get<ReqIs>(req), std::get<ReqIs>(rp), e, i, now)... };
@@ -2287,7 +2558,7 @@ namespace Astra
         }
 
         // The storage-path chunk visit (shared by the serial and parallel walks).
-        template<bool Stamp, typename Func, size_t... ReqIs, size_t... OptIs>
+        template<bool Stamp, bool Par = false, typename Func, size_t... ReqIs, size_t... OptIs>
         void VisitChunkStorage(Archetype* archetype, ArchetypeChunk* chunk, Func& func, Tick now, [[maybe_unused]] Tick since,
                                std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
         {
@@ -2299,7 +2570,7 @@ namespace Astra
             {
                 // Chunk reject first: before the enabled reject and before the stamp -- a
                 // rejected chunk is not "visited".
-                if (!ChangeChunkPassesStorage(chunk, cm, since))
+                if (!ChangeChunkPassesStorage<Par>(chunk, cm, since))
                     return;
             }
 
@@ -2312,8 +2583,8 @@ namespace Astra
                 // chunk is still visited, Ruling B).
                 f.changeExcluded.assign((count + 63) >> 6, 0ull);
                 bool anyExcluded = false;
-                BuildChangeExcludedStorage<false>(chunk, cm, count, since, f.changeExcluded.data(), anyExcluded, static_cast<ChangedTypes*>(nullptr));
-                BuildChangeExcludedStorage<true >(chunk, cm, count, since, f.changeExcluded.data(), anyExcluded, static_cast<AddedTypes*>(nullptr));
+                BuildChangeExcludedStorage<false, Par>(chunk, cm, count, since, f.changeExcluded.data(), anyExcluded, static_cast<ChangedTypes*>(nullptr));
+                BuildChangeExcludedStorage<true , Par>(chunk, cm, count, since, f.changeExcluded.data(), anyExcluded, static_cast<AddedTypes*>(nullptr));
                 if (anyExcluded)
                 {
                     ASTRA_ASSERT(f.nExclude < MaxWordSets, "View::ChunkFilter: exclude word-set capacity exceeded");
@@ -2324,7 +2595,7 @@ namespace Astra
             // Coarse stamp after every whole-chunk reject (Ruling B: a skipped chunk is
             // not "visited" and must not be stamped).
             if constexpr (Stamp)
-                StampVisit(chunk, cm, now, reqSeq, optSeq);
+                StampVisit<Par>(chunk, cm, now, reqSeq, optSeq);
 
             std::tuple<Fetch<std::tuple_element_t<ReqIs, RequiredTypes>>...> req{
                 MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, m_stores)... };
@@ -2336,7 +2607,7 @@ namespace Astra
                 [&](size_t begin, size_t end)
                 {
                     for (size_t i = begin; i < end; ++i)
-                        InvokeStorageEntity<Stamp>(entities[i], i, req, opt, func, now, reqSeq, optSeq);
+                        InvokeStorageEntity<Stamp, Par>(entities[i], i, req, opt, func, now, reqSeq, optSeq);
                 });
         }
 
