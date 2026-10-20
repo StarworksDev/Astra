@@ -399,6 +399,14 @@ namespace Astra::Test
     };
     static_assert(Component<PosS>);
 
+    // Enableable Table tag (spec 2026-10-01 s3.2, second bullet): an empty type that opts
+    // into AstraEnableable gets a BIT-ONLY archetype column. ONE TypeID (budget).
+    struct EnTag
+    {
+        static constexpr bool AstraEnableable = true;
+    };
+    static_assert(Component<EnTag> && std::is_empty_v<EnTag>);
+
     // Helper type traits for testing
     template<typename T>
     struct ComponentTraits

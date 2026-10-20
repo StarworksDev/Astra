@@ -27,7 +27,7 @@ namespace Astra::Debug
     // Physical placement of one storage column inside one chunk's arena.
     struct ChunkColumnLayout
     {
-        size_t offset = 0;                    // cache-line-aligned base offset
+        size_t offset = 0;                    // base offset (cache-line-aligned; a bit-only column's is the unaligned running offset)
         size_t bytes = 0;                     // stride * capacity
         size_t disabledOffset = SIZE_MAX;     // disabled-bit words region, or SIZE_MAX
         size_t disabledBytes = 0;
@@ -49,7 +49,7 @@ namespace Astra::Debug
         std::string signature;              // all mask components (tags included), " + "-joined; "(empty)" for the root
         size_t componentCount = 0;          // mask popcount
         size_t tagCount = 0;                // empty (tag) components in the mask
-        std::vector<ColumnInfo> columns;    // storage-bearing only (tags excluded)
+        std::vector<ColumnInfo> columns;    // storage-bearing columns + an enableable tag's bit-only column (stride 0)
         std::vector<ChunkInfo> chunks;
         size_t entityCount = 0;
         size_t chunkCount = 0;

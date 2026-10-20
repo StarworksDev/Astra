@@ -62,7 +62,7 @@ namespace Astra
         ~Archetype() = default;
 
     private:
-        // Builds m_columnMeta from m_componentDescriptors: excludes tags (desc.size == 0) from
+        // Builds m_columnMeta from m_componentDescriptors: excludes NON-enableable tags (desc.size == 0) from
         // columns, sorts columns ascending by id (required by the merge-join used for
         // cross-archetype moves), maps id -> column index, and flags the archetype complex if
         // any column is not trivially copyable. Called once, from Initialize(), immediately
@@ -72,7 +72,11 @@ namespace Astra
             m_columnMeta = ArchetypeColumnMeta{};   // resets idToColumn to -1, columnCount/isComplex to 0/false
             for (const ComponentDescriptor& desc : m_componentDescriptors)
             {
-                if (desc.size == 0) continue;       // tag: no storage column (idToColumn stays -1)
+                // A non-enableable tag has no column (idToColumn stays -1). An ENABLEABLE tag
+                // gets a BIT-ONLY column (spec 2026-10-01 s3.2): stride 0, no data region, a
+                // disabled-word region like any enableable column -- so SetEnabledByID, every
+                // view filter and every bit carry work unchanged through idToColumn.
+                if (desc.size == 0 && !desc.isEnableable) continue;
                 const uint16_t col = m_columnMeta.columnCount++;
                 m_columnMeta.columns[col] = { desc.id, static_cast<uint32_t>(desc.size), &desc };
                 if (!desc.is_trivially_copyable) m_columnMeta.isComplex = true;
@@ -171,6 +175,8 @@ namespace Astra
             size_t offset = 0;
             for (uint16_t c = 0; c < m_columnMeta.columnCount; ++c)
             {
+                if (m_columnMeta.columns[c].stride == 0)
+                    continue;   // bit-only column (enableable tag): no data, no alignment -- mirrors InitializeColumns
                 offset = (offset + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1);
                 offset += static_cast<size_t>(m_columnMeta.columns[c].stride) * cap;
             }
@@ -325,9 +331,11 @@ namespace Astra
                 : 0;
 
             // Change-detection version region (ArchetypeChunk::InitializeColumns):
-            // 8-byte align slack + one Tick per storage column. Folded into the
-            // overhead so ComputeCapacityForBytes' estimate stays a guaranteed fit.
-            alignmentOverhead += 8 + nonEmptyComponents * sizeof(Tick);
+            // 8-byte align slack + one Tick per COLUMN -- an enableable tag's bit-only
+            // column included (columnCount equals nonEmptyComponents unless one is
+            // present, so every other archetype's layout is byte-identical). Folded into
+            // the overhead so ComputeCapacityForBytes' estimate stays a guaranteed fit.
+            alignmentOverhead += 8 + static_cast<size_t>(m_columnMeta.columnCount) * sizeof(Tick);
 
             m_perEntitySize = perEntitySize;
             m_alignmentOverhead = alignmentOverhead;

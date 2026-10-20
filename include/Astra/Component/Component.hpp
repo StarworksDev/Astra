@@ -256,6 +256,11 @@ namespace Astra
         
         inline void ConstructWith(void* ptr, const void* value) const
         {
+            if (size == 0)
+            {
+                return;  // empty (tag) component: nothing to construct (mirrors DefaultConstruct;
+                         // an enableable tag's bit-only column base must never be written)
+            }
             if (constructWith)
             {
                 constructWith(ptr, value);
@@ -298,7 +303,7 @@ namespace Astra
             {
                 std::memcpy(dst, src, size);
             }
-            else
+            else if (size != 0)   // empty (tag) component: nothing to move (an enableable tag's bit-only column has no data)
             {
                 moveConstruct(dst, src);
             }

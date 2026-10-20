@@ -602,9 +602,10 @@ namespace Astra
             const EntityRecord* rec = GetEntityRecord(entity);
             if (!rec || !rec->chunk || id >= MAX_COMPONENTS) ASTRA_UNLIKELY
                 return false;
-            const int col = rec->archetype->GetColumnMeta().idToColumn[id];
-            if (col < 0) ASTRA_UNLIKELY
-                return false;
+            const ArchetypeColumnMeta& cm = rec->archetype->GetColumnMeta();
+            const int col = cm.idToColumn[id];
+            if (col < 0 || cm.columns[col].stride == 0) ASTRA_UNLIKELY
+                return false;   // absent, or a tag (an enableable tag's bit-only column holds no value)
             rec->chunk->StampColumn(col, m_tick);
             if (EntityTicks* t = rec->chunk->GetTicks(col))
                 t[rec->location.GetEntityIndex()].changed = m_tick;
@@ -1326,7 +1327,12 @@ namespace Astra
 
                 if (id == newComponentId) ASTRA_UNLIKELY
                 {
-                    new (dstPtr) T(std::forward<Args>(args)...);
+                    // An enableable tag's bit-only column (stride 0) has no data: never
+                    // placement-new into its base. Born enabled (fresh slot bits are zero).
+                    if constexpr (std::is_empty_v<T>)
+                        ((void)args, ...);
+                    else
+                        new (dstPtr) T(std::forward<Args>(args)...);
                 }
                 else
                 {
@@ -1544,31 +1550,36 @@ namespace Astra
 
                 if (id == newComponentId) ASTRA_UNLIKELY
                 {
-                    // Copy new component data - use memcpy for trivially copyable types
-                    if (newDesc.is_trivially_copyable)
+                    // Copy new component data - use memcpy for trivially copyable types. An
+                    // enableable tag's bit-only column (size 0) has no data; the by-id add
+                    // path may pass componentData == nullptr for a tag, so write nothing.
+                    if (newDesc.size != 0) ASTRA_LIKELY
                     {
-                        std::memcpy(dstPtr, componentData, newDesc.size);
-                    }
-                    else if (newDesc.constructWith)
-                    {
-                        newDesc.constructWith(dstPtr, componentData);
-                    }
-                    else if (newDesc.copyConstruct)
-                    {
-                        newDesc.copyConstruct(dstPtr, componentData);
-                    }
-                    else if (newDesc.moveConstruct)
-                    {
-                        // Move-only component: the CommandBuffer move-constructed the
-                        // value into its own storage, so move it out (the buffer's copy
-                        // is destructed after flush). Without this the slot was left
-                        // uninitialized.
-                        newDesc.moveConstruct(dstPtr, const_cast<void*>(componentData));
-                    }
-                    else
-                    {
-                        // Never-UB floor (mirrors ComponentDescriptor::ConstructWith).
-                        newDesc.DefaultConstruct(dstPtr);
+                        if (newDesc.is_trivially_copyable)
+                        {
+                            std::memcpy(dstPtr, componentData, newDesc.size);
+                        }
+                        else if (newDesc.constructWith)
+                        {
+                            newDesc.constructWith(dstPtr, componentData);
+                        }
+                        else if (newDesc.copyConstruct)
+                        {
+                            newDesc.copyConstruct(dstPtr, componentData);
+                        }
+                        else if (newDesc.moveConstruct)
+                        {
+                            // Move-only component: the CommandBuffer move-constructed the
+                            // value into its own storage, so move it out (the buffer's copy
+                            // is destructed after flush). Without this the slot was left
+                            // uninitialized.
+                            newDesc.moveConstruct(dstPtr, const_cast<void*>(componentData));
+                        }
+                        else
+                        {
+                            // Never-UB floor (mirrors ComponentDescriptor::ConstructWith).
+                            newDesc.DefaultConstruct(dstPtr);
+                        }
                     }
                 }
                 else

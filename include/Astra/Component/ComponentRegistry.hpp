@@ -358,14 +358,9 @@ namespace Astra
             // through here, so both pick it up.
             desc.storage = StorageOfV<T>;
 
-            // An enableable component must carry storage: the disabled bit lives
-            // per-entity in the chunk's column data, and an empty/tag type has no
-            // column (idToColumn == -1) to hang that bit off of. A runtime guard
-            // would make such a type silently unfilterable instead of catching the
-            // mistake at the call site, so refuse it at compile time.
-            static_assert(!(std::is_empty_v<T> && IsEnableableV<T>),
-                "An enableable component must have storage: an empty/tag type has no column to carry "
-                "a disabled bit. Use a non-empty component, or a separate enableable marker with a byte of state.");
+            // An enableable TAG is legal (spec 2026-10-01 s3.2, parity): its archetype gives
+            // it a BIT-ONLY column -- stride 0, a disabled-word region, no data region (see
+            // Archetype::BuildColumnMeta). A non-enableable tag still gets no column at all.
 
             desc.defaultConstruct = &DefaultConstruct<T>;
             desc.destruct = &Destruct<T>;

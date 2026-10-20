@@ -26,21 +26,22 @@ namespace Astra
 {
     // Per-archetype column metadata, built once and shared by every chunk of the archetype.
     // The heavy ComponentDescriptor lives here once (via pointer into the archetype's canonical
-    // list) instead of by-value in every chunk slot. Columns are storage-bearing components only
-    // (tags excluded), sorted ascending by id so cross-archetype moves can merge-join.
+    // list) instead of by-value in every chunk slot. Columns are storage-bearing components plus
+    // one BIT-ONLY column (stride 0: disabled words, no data) per ENABLEABLE tag; non-enableable
+    // tags have no column. Sorted ascending by id so cross-archetype moves can merge-join.
     struct ArchetypeColumnMeta
     {
         struct ColumnDesc
         {
             ComponentID id{0};
-            uint32_t stride{0};                          // == descriptor->size
+            uint32_t stride{0};                          // == descriptor->size (0 for an enableable tag's bit-only column)
             const ComponentDescriptor* descriptor{nullptr};
         };
 
-        uint16_t  columnCount{0};                        // N: storage-bearing components
+        uint16_t  columnCount{0};                        // N: storage-bearing components + enableable-tag bit-only columns
         bool      isComplex{false};                      // any column not trivially copyable
         ColumnDesc columns[MAX_COMPONENTS]{};            // [0, columnCount) valid, ascending id
-        int16_t   idToColumn[MAX_COMPONENTS];            // id -> column index, or -1 (absent OR tag)
+        int16_t   idToColumn[MAX_COMPONENTS];            // id -> column index, or -1 (absent OR non-enableable tag)
 
         // Enableable-components (spec §3/§4): the column ordinals (into `columns`)
         // whose component opted into ASTRA_ENABLEABLE. Only these carve per-chunk
@@ -313,6 +314,12 @@ namespace Astra
         template<Component T>
         void BatchConstructComponent(std::span<const size_t> indices, const T& value)
         {
+            // Empty (tag) component: nothing to construct. Must precede the column lookup: an
+            // enableable tag HAS a (bit-only, stride-0) column, and the trivially-copyable path
+            // below would memcpy sizeof(T) == 1 byte through its base.
+            if constexpr (std::is_empty_v<T>)
+                return;
+
             ComponentID id = TypeID<T>::Value();
             const int col = m_meta->idToColumn[id];
 
@@ -454,21 +461,19 @@ namespace Astra
         T* GetComponent(size_t index)
         {
             ASTRA_ASSERT(index < m_count, "Index out of count");
-            ComponentID id = TypeID<T>::Value();
-            void* ptr = GetComponentPointer(id, index);
-            
-            // For empty components, return a static instance
+            // Empty (tag) component: no data, so a shared static instance -- also for an
+            // enableable tag, whose bit-only column has a (never-dereferenced) base. Callers
+            // resolve presence from the archetype mask first (Archetype::GetComponent).
             if constexpr (std::is_empty_v<T>)
             {
-                if (ptr == nullptr)
-                {
-                    static T emptyInstance{};
-                    return &emptyInstance;
-                }
+                static T emptyInstance{};
+                return &emptyInstance;
             }
-            
-            return static_cast<T*>(ptr);
-        }
+            else
+            {
+                return static_cast<T*>(GetComponentPointer(TypeID<T>::Value(), index));
+            }
+}
         
         template<Component T>
         ASTRA_FORCEINLINE auto GetComponentArray()
@@ -733,17 +738,27 @@ namespace Astra
         }
 
         // Assign each storage column a cache-line-aligned base within the chunk arena.
-        // Column physical order follows m_meta->columns (ascending by id); tags carry
-        // no column, so every column here has real storage.
+        // Column physical order follows m_meta->columns (ascending by id). Non-enableable
+        // tags carry no column; an enableable tag's column is BIT-ONLY (stride 0).
         void InitializeColumns()
         {
             size_t offset = 0;
             for (uint16_t c = 0; c < m_meta->columnCount; ++c)
             {
+                m_columns[c].stride = m_meta->columns[c].stride;
+                if (m_columns[c].stride == 0)
+                {
+                    // Bit-only column (enableable tag, spec 2026-10-01 s3.2): no data region and
+                    // no alignment. The base is a NON-NULL in-arena address at the running offset,
+                    // so the type-erased move/copy paths (memcpy of 0 bytes) never see nullptr.
+                    // It is never dereferenced: desc.size == 0 makes every construct/move/destruct
+                    // a no-op, and the Inspector's layout walk reads it as a zero-byte column.
+                    m_columns[c].base = static_cast<std::byte*>(m_memory) + offset;
+                    continue;
+                }
                 // Align offset to a cache line to avoid false sharing between columns.
                 offset = (offset + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1);
-                m_columns[c].base   = static_cast<std::byte*>(m_memory) + offset;
-                m_columns[c].stride = m_meta->columns[c].stride;
+                m_columns[c].base = static_cast<std::byte*>(m_memory) + offset;
                 offset += static_cast<size_t>(m_meta->columns[c].stride) * m_capacity;
             }
 

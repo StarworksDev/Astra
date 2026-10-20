@@ -632,7 +632,7 @@ namespace Astra
             const ComponentID id = TypeID<T>::Value();
             if (id >= MAX_COMPONENTS) return false;
             const int col = rec->archetype->GetColumnMeta().idToColumn[id];
-            if (col < 0) return false;
+            if (col < 0 || rec->archetype->GetColumnMeta().columns[col].stride == 0) return false;   // absent, or a tag (no value)
             if (const EntityTicks* t = rec->chunk->GetTicks(col))
                 return IsNewer(t[rec->location.GetEntityIndex()].changed, since);
             return IsNewer(rec->chunk->GetColumnVersion(col), since);
@@ -650,7 +650,7 @@ namespace Astra
             const ComponentID id = TypeID<T>::Value();
             if (id >= MAX_COMPONENTS) return false;
             const int col = rec->archetype->GetColumnMeta().idToColumn[id];
-            if (col < 0) return false;
+            if (col < 0 || rec->archetype->GetColumnMeta().columns[col].stride == 0) return false;   // absent, or a tag (no value)
             if (const EntityTicks* t = rec->chunk->GetTicks(col))
                 return IsNewer(t[rec->location.GetEntityIndex()].added, since);
             return IsNewer(rec->chunk->GetColumnVersion(col), since);
@@ -733,7 +733,11 @@ namespace Astra
                 const Signal flag = enable ? Signal::ComponentEnabled : Signal::ComponentDisabled;
                 if (m_signalManager.IsSignalEnabled(flag)) ASTRA_UNLIKELY
                 {
-                    void* comp = chunk->GetComponentPointer(componentId, idx);
+                    // A present tag's payload is EmptyComponentSentinel() on every by-ID path
+                    // (Component.hpp); an enableable tag's bit-only column base is never handed out.
+                    void* comp = rec->archetype->GetColumnMeta().columns[col].stride == 0
+                        ? EmptyComponentSentinel()
+                        : chunk->GetComponentPointer(componentId, idx);
                     if (enable) m_signalManager.Emit<Events::ComponentEnabled>(entity, componentId, comp);
                     else        m_signalManager.Emit<Events::ComponentDisabled>(entity, componentId, comp);
                 }
