@@ -213,11 +213,7 @@ namespace Astra
 
             // Use unified batch AddEntities - handles archetype selection internally
             m_archetypeManager->AddEntities<Components...>(outEntities.subspan(0, created));
-            if (m_componentStorage->HasUniversals()) ASTRA_UNLIKELY
-            {
-                for (size_t i = 0; i < created; ++i)
-                    m_componentStorage->ConstructUniversals(outEntities[i], nullptr, 0);
-            }
+            ConstructUniversalsForBatch(outEntities.subspan(0, created));
 
             if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
             {
@@ -242,8 +238,7 @@ namespace Astra
                 }
             }
 
-            for (size_t i = 0; i < created; ++i)
-                EmitUniversalAdded(outEntities[i]);
+            EmitUniversalAddedBatch(outEntities.subspan(0, created));
 
             return created;
         }
@@ -263,11 +258,7 @@ namespace Astra
                 return 0;
 
             m_archetypeManager->AddEntitiesWith<Components...>(outEntities.subspan(0, created), std::forward<Generator>(generator));
-            if (m_componentStorage->HasUniversals()) ASTRA_UNLIKELY
-            {
-                for (size_t i = 0; i < created; ++i)
-                    m_componentStorage->ConstructUniversals(outEntities[i], nullptr, 0);
-            }
+            ConstructUniversalsForBatch(outEntities.subspan(0, created));
 
             if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
             {
@@ -289,8 +280,7 @@ namespace Astra
                 }
             }
 
-            for (size_t i = 0; i < created; ++i)
-                EmitUniversalAdded(outEntities[i]);
+            EmitUniversalAddedBatch(outEntities.subspan(0, created));
 
             return created;
         }
@@ -2032,6 +2022,26 @@ namespace Astra
                 if (void* component = column->Get(entity))
                     m_signalManager.Emit<Events::ComponentAdded>(entity, spec.id, component);
             }
+        }
+
+        // Batch twins of the two helpers above: the guard is tested once, then the loop runs.
+        void ConstructUniversalsForBatch(std::span<const Entity> made)
+        {
+            if (m_componentStorage->HasUniversals()) ASTRA_UNLIKELY
+            {
+                for (const Entity entity : made)
+                    m_componentStorage->ConstructUniversals(entity, nullptr, 0);
+            }
+        }
+
+        void EmitUniversalAddedBatch(std::span<const Entity> made)
+        {
+            if (!m_componentStorage->HasUniversals()) ASTRA_LIKELY
+                return;
+            if (!m_signalManager.IsSignalEnabled(Signal::ComponentAdded)) ASTRA_LIKELY
+                return;
+            for (const Entity entity : made)
+                EmitUniversalAdded(entity);
         }
 
         // THE single-entity creation funnel. Every create path without a component pack

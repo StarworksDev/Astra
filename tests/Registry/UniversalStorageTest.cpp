@@ -122,6 +122,31 @@ TEST(UniversalStorage, ComponentAddedFiresOncePerUniversalAfterEntityCreated)
     signals->On<Astra::Events::ComponentAdded>().Unregister(added);
 }
 
+TEST(UniversalStorage, BatchCreatorsFireUniversalComponentAddedOncePerEntity)
+{
+    Registry reg(UniversalPositionConfig(nullptr));
+    reg.EnableSignals(Astra::Signal::ComponentAdded);
+    size_t positionAdds = 0;
+    auto* signals = reg.GetSignalManager();
+    auto added = signals->On<Astra::Events::ComponentAdded>().Register(
+        [&](const Astra::Events::ComponentAdded& ev)
+        {
+            if (ev.componentId == Astra::TypeID<Position>::Value())
+                ++positionAdds;
+        });
+
+    std::vector<Entity> batch(5);
+    ASSERT_EQ(reg.CreateEntities<Velocity>(5, std::span{batch}), 5u);
+    EXPECT_EQ(positionAdds, 5u);
+
+    positionAdds = 0;
+    ASSERT_EQ((reg.CreateEntitiesWith<Velocity>(5, std::span{batch},
+        [](size_t i) { return std::tuple{Velocity{static_cast<float>(i), 0.0f, 0.0f}}; })), 5u);
+    EXPECT_EQ(positionAdds, 5u);
+
+    signals->On<Astra::Events::ComponentAdded>().Unregister(added);
+}
+
 TEST(UniversalStorage, DestroyClearAndRegistryDestructionDestroyUniversalValues)
 {
     using Astra::Test::Tracked;   // move-only, lifetime-counted
