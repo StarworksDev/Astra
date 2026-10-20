@@ -2366,8 +2366,20 @@ namespace Astra
                     UniversalColumn* column = m_componentStorage->FindUniversal(id);
                     return column && column->MarkWritten(entity, CurrentTick());
                 }
+                case StorageKind::Sparse:
+                {
+                    // A write to a present Sparse element (spec s3.3): the element's `changed`
+                    // tick when tracked (inside MarkWritten), plus the component's coarse
+                    // version. Tag, absent or stale: false.
+                    SparseSet* set = m_componentStorage->FindSparse(id);
+                    const Tick now = CurrentTick();
+                    if (!set || !set->MarkWritten(entity, now)) ASTRA_UNLIKELY
+                        return false;
+                    m_componentStorage->StampCoarse(id, now);
+                    return true;
+                }
                 default:
-                    return false;   // Sparse: Task 20 replaces this arm with `case StorageKind::Sparse`
+                    return false;
             }
         }
 
@@ -2386,8 +2398,20 @@ namespace Astra
                         return false;
                     return IsNewer(added ? column->AddedTick(entity) : column->ChangedTick(entity), since);
                 }
+                case StorageKind::Sparse:
+                {
+                    // Tracked: the element's exact ticks. Untracked: the component's coarse
+                    // version, so every member answers alike (IsAdded == IsChanged). Tag,
+                    // absent or stale: false.
+                    const SparseSet* set = m_componentStorage->FindSparse(id);
+                    if (!set || set->Descriptor().size == 0 || !set->Contains(entity)) ASTRA_UNLIKELY
+                        return false;
+                    if (const EntityTicks* t = set->Ticks(entity))
+                        return IsNewer(added ? t->added : t->changed, since);
+                    return IsNewer(m_componentStorage->CoarseVersion(id), since);
+                }
                 default:
-                    return false;   // Sparse: Task 20 replaces this arm with `case StorageKind::Sparse`
+                    return false;
             }
         }
 
@@ -2485,6 +2509,9 @@ namespace Astra
             void* element = src ? set->InsertMove(entity, src) : set->Insert(entity);
             rec.chunk->SetSparsePresent(static_cast<uint16_t>(slot), rec.location.GetEntityIndex(), true);
             m_archetypeManager->BumpSparseStructuralCounter();
+            // A tracked element's {added, changed} are stamped by the set on insert; an
+            // untracked one is born into the component's coarse version.
+            m_componentStorage->StampCoarse(id, CurrentTick());
             return set->Descriptor().size == 0 ? EmptyComponentSentinel() : element;
         }
 

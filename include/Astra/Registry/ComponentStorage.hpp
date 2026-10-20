@@ -288,6 +288,21 @@ namespace Astra
                 m_sparseSets[id]->Clear();   // the set and its slot survive (spec s7.3)
         }
 
+        // Coarse change version per UNTRACKED Sparse component (spec s3.3): the analogue
+        // of a Table chunk-column version, stamped on every add, mutable Get, Modified
+        // and storing SetIfNeq of the component; read by IsChanged / IsAdded for an
+        // untracked Sparse element. 0 == never. Survives Clear() (a version is a time,
+        // not a value). SparseSet keeps no coarse tick of its own.
+        ASTRA_NODISCARD Tick CoarseVersion(ComponentID id) const noexcept
+        {
+            return id < MAX_COMPONENTS ? m_coarseVersion[id] : Tick{0};
+        }
+        void StampCoarse(ComponentID id, Tick tick) noexcept
+        {
+            if (id < MAX_COMPONENTS) ASTRA_LIKELY
+                m_coarseVersion[id] = tick;
+        }
+
     private:
         // One lookup loop: the mutable form goes through the const one.
         UniversalSpec* FindUniversalSpecMutable(ComponentID id) noexcept
@@ -305,6 +320,7 @@ namespace Astra
         std::array<std::unique_ptr<SparseSet>, MAX_COMPONENTS> m_sparseSets{};
         std::vector<ComponentID> m_sparseIds;   // ids with a live set, in creation order
         const Tick* m_tickSource = nullptr;
+        Tick m_coarseVersion[MAX_COMPONENTS]{};   // untracked-Sparse coarse change version, by id
         std::uint32_t m_storeCount = 0;   // columns + sparse sets created so far (HasAnyStore)
     };
 }
