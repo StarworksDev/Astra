@@ -540,6 +540,12 @@ namespace Astra
                     m_columns[c].ticks[index] = m_columns[c].ticks[lastIndex];
                 }
 
+            // Sparse presence carry (storage policies, spec s5.3): the tail's bits
+            // fill the vacated slot, then the tail is cleared. With index == lastIndex
+            // this only clears the removed entity's own bits.
+            if (!m_sparseBlocks.empty()) ASTRA_UNLIKELY
+                SwapRemoveSparseBits(index, lastIndex);
+
             // Remove last entity
             m_entities.pop_back();
             --m_count;

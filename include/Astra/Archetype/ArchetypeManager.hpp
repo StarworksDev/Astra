@@ -1376,6 +1376,11 @@ namespace Astra
                     }
                 }
             }
+
+            // Sparse presence carry (storage policies, spec s5.3). The added
+            // component is a Table column (Sparse adds never move the entity).
+            if (srcChunk->HasSparseBlocks()) ASTRA_UNLIKELY
+                dstChunk->CarrySparseBits(*srcChunk, srcEntityIdx, dstEntityIdx);
         }
 
         template<typename Predicate>
@@ -1621,6 +1626,11 @@ namespace Astra
                     }
                 }
             }
+
+            // Sparse presence carry (storage policies, spec s5.3). The added
+            // component is a Table column (Sparse adds never move the entity).
+            if (srcChunk->HasSparseBlocks()) ASTRA_UNLIKELY
+                dstChunk->CarrySparseBits(*srcChunk, srcEntityIdx, dstEntityIdx);
         }
 
         // The ONLY sanctioned writers of a record's storage fields (archetype/chunk/

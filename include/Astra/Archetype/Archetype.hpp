@@ -777,6 +777,12 @@ namespace Astra
                 }
                 ++a;
             }
+
+            // Sparse presence carry (storage policies, spec s5.3). Presence follows the
+            // entity whatever the column sets are; the source bits are cleared by the
+            // caller's swap-remove of the source.
+            if (srcChunk->HasSparseBlocks()) ASTRA_UNLIKELY
+                dstChunk->CarrySparseBits(*srcChunk, srcEntityIndex, dstEntityIndex);
         }
 
         template<Component T>
@@ -1456,6 +1462,15 @@ namespace Astra
                     for (uint16_t c = 0; c < m_columnMeta.columnCount; ++c)
                         dst->FoldColumnVersion(c, src->GetColumnVersion(c));
 
+                    // Sparse presence carry (storage policies, spec s5.3): a block is
+                    // re-created in the fresh chunk only for a slot some moved entity
+                    // holds, so compaction also drops emptied blocks.
+                    if (src->HasSparseBlocks()) ASTRA_UNLIKELY
+                    {
+                        for (size_t k = 0; k < run; ++k)
+                            dst->CarrySparseBits(*src, srcIndex + k, dstIndex + k);
+                    }
+
                     dst->SetCount(dst->GetCount() + run);
                     srcIndex += run;
                     dstIndex += run;
@@ -1915,14 +1930,9 @@ namespace Astra
             // This is the intersection of source and destination masks
             ComponentMask componentsToMove = srcArchetype.GetMask() & GetMask();
 
-            // If there are no components to move (e.g., moving from root archetype),
-            // we're done - entities are already allocated
-            if (componentsToMove.None())
-            {
-                return dstLocations;
-            }
-
-            // Batch move components for each chunk pair
+            // Per chunk pair: carry sparse presence (spec s5.3) -- ALWAYS, because
+            // presence follows the entity even when no column is shared (a batch
+            // leaving the root archetype) -- then move the shared columns.
             for (auto& [key, batch] : batches)
             {
                 // Validate chunk indices
@@ -1934,6 +1944,15 @@ namespace Astra
 
                 auto& srcChunk = srcArchetype.m_chunks[batch.srcChunkIndex];
                 auto& dstChunk = m_chunks[batch.dstChunkIndex];
+
+                if (srcChunk->HasSparseBlocks()) ASTRA_UNLIKELY
+                {
+                    for (size_t i = 0; i < batch.srcIndices.size(); ++i)
+                        dstChunk->CarrySparseBits(*srcChunk, batch.srcIndices[i], batch.dstIndices[i]);
+                }
+
+                if (componentsToMove.None())
+                    continue;   // e.g. moving from the root archetype: no column to move
 
                 dstChunk->BatchMoveComponentsFrom(batch.dstIndices, *srcChunk, batch.srcIndices, componentsToMove);
             }
