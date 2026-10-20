@@ -1660,6 +1660,9 @@ namespace Astra
             };
             struct NoGroupScratch {};
             [[no_unique_address]] std::conditional_t<(NGroups > 0), GroupScratch, NoGroupScratch> groups;
+            // Per-entity change tier (Task 27): SET bit == the entity fails a Changed/Added term.
+            struct NoChangeScratch {};
+            [[no_unique_address]] std::conditional_t<HasChangeFilter, SmallVector<uint64_t, 64>, NoChangeScratch> changeExcluded;
         };
 
         // Required (or With<>) Sparse T: its block's present words. Returns false when no
@@ -1910,6 +1913,94 @@ namespace Astra
                 }(static_cast<OneOfGroupTypes*>(nullptr));
             }
             return pass;
+        }
+
+        // ---- Changed<T> / Added<T> on the storage path (spec s6.3) ----
+        // Chunk tier of one term: a Table term rejects on its column version, an
+        // untracked Sparse term on the per-component coarse version (the source
+        // Registry::IsChanged reads). Tracked Sparse and Universal terms are decided per
+        // entity.
+        template<typename T>
+        bool ChangeTermChunkPasses(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, Tick since) const
+        {
+            using Bare = std::remove_const_t<T>;
+            switch (m_kinds[PlanIndex<Bare>])
+            {
+            case StorageKind::Table:
+                return IsNewer(chunk->GetColumnVersion(cm.idToColumn[TypeID<Bare>::Value()]), since);
+            case StorageKind::Sparse:
+                if constexpr (IsChangeTrackedV<Bare>)
+                    return true;
+                else
+                {
+                    ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
+                    return storage && IsNewer(storage->CoarseVersion(TypeID<Bare>::Value()), since);
+                }
+            case StorageKind::Universal:
+                return true;
+            }
+            return true;
+        }
+        template<typename... Ts>
+        bool AllChangeTermsPass([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
+                                [[maybe_unused]] Tick since, std::tuple<Ts...>*) const
+        {
+            return (ChangeTermChunkPasses<Ts>(chunk, cm, since) && ...);
+        }
+        bool ChangeChunkPassesStorage(ArchetypeChunk* chunk, const ArchetypeColumnMeta& cm, Tick since) const
+        {
+            return AllChangeTermsPass(chunk, cm, since, static_cast<ChangedTypes*>(nullptr))
+                && AllChangeTermsPass(chunk, cm, since, static_cast<AddedTypes*>(nullptr));
+        }
+
+        // Per-entity tier of one term: set the bit of every entity whose tick is NOT newer
+        // than `since` (an absent element fails; the presence words exclude it anyway).
+        template<bool UseAdded, typename T>
+        void ExcludeNotNewerStorage([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
+                                    [[maybe_unused]] size_t count, [[maybe_unused]] Tick since,
+                                    [[maybe_unused]] uint64_t* excluded, [[maybe_unused]] bool& anyExcluded) const
+        {
+            using Bare = std::remove_const_t<T>;
+            const Entity* es = chunk->GetEntities().data();
+            switch (m_kinds[PlanIndex<Bare>])
+            {
+            case StorageKind::Table:
+                if constexpr (IsChangeTrackedV<Bare>)
+                    ExcludeNotNewer<UseAdded>(chunk->GetTicks(cm.idToColumn[TypeID<Bare>::Value()]), count, since, excluded, anyExcluded);
+                break;
+            case StorageKind::Sparse:
+                if constexpr (IsChangeTrackedV<Bare>)
+                {
+                    const SparseSet* set = m_stores[PlanIndex<Bare>].sparse;
+                    for (size_t i = 0; i < count; ++i)
+                    {
+                        const EntityTicks* t = set ? set->Ticks(es[i]) : nullptr;
+                        const bool fails = !t || !IsNewer(UseAdded ? t->added : t->changed, since);
+                        excluded[i >> 6] |= static_cast<uint64_t>(fails) << (i & 63);
+                        anyExcluded |= fails;
+                    }
+                }
+                break;
+            case StorageKind::Universal:
+            {
+                const UniversalColumn* col = m_stores[PlanIndex<Bare>].universal;
+                for (size_t i = 0; i < count; ++i)
+                {
+                    const Tick t = col ? (UseAdded ? col->AddedTick(es[i]) : col->ChangedTick(es[i])) : Tick{0};
+                    const bool fails = !IsNewer(t, since);
+                    excluded[i >> 6] |= static_cast<uint64_t>(fails) << (i & 63);
+                    anyExcluded |= fails;
+                }
+                break;
+            }
+            }
+        }
+        template<bool UseAdded, typename... Ts>
+        void BuildChangeExcludedStorage([[maybe_unused]] ArchetypeChunk* chunk, [[maybe_unused]] const ArchetypeColumnMeta& cm,
+                                        [[maybe_unused]] size_t count, [[maybe_unused]] Tick since,
+                                        [[maybe_unused]] uint64_t* excluded, [[maybe_unused]] bool& anyExcluded, std::tuple<Ts...>*) const
+        {
+            (ExcludeNotNewerStorage<UseAdded, Ts>(chunk, cm, count, since, excluded, anyExcluded), ...);
         }
 
         // ---- Fetching (spec s6.4) ----
@@ -2204,10 +2295,31 @@ namespace Astra
             if (count == 0) ASTRA_UNLIKELY
                 return;
             const ArchetypeColumnMeta& cm = archetype->GetColumnMeta();
+            if constexpr (HasChangeFilter)
+            {
+                // Chunk reject first: before the enabled reject and before the stamp -- a
+                // rejected chunk is not "visited".
+                if (!ChangeChunkPassesStorage(chunk, cm, since))
+                    return;
+            }
 
             ChunkFilter f;
             if (!BuildChunkFilter(archetype, chunk, count, f))
                 return;                                   // Tier 2: nothing in this chunk can match
+            if constexpr (HasChangeFilter)
+            {
+                // Per-entity change tier, unioned into the exclude sets (not a reject: the
+                // chunk is still visited, Ruling B).
+                f.changeExcluded.assign((count + 63) >> 6, 0ull);
+                bool anyExcluded = false;
+                BuildChangeExcludedStorage<false>(chunk, cm, count, since, f.changeExcluded.data(), anyExcluded, static_cast<ChangedTypes*>(nullptr));
+                BuildChangeExcludedStorage<true >(chunk, cm, count, since, f.changeExcluded.data(), anyExcluded, static_cast<AddedTypes*>(nullptr));
+                if (anyExcluded)
+                {
+                    ASTRA_ASSERT(f.nExclude < MaxWordSets, "View::ChunkFilter: exclude word-set capacity exceeded");
+                    f.exclude[f.nExclude++] = f.changeExcluded.data();
+                }
+            }
 
             // Coarse stamp after every whole-chunk reject (Ruling B: a skipped chunk is
             // not "visited" and must not be stamped).
