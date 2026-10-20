@@ -254,3 +254,36 @@ TEST(TypeIdentityFactory, RttiDiscriminatorIsStableSelfContainedValue)
     EXPECT_NE(a1.rttiName, b.rttiName);          // same layout {int x;}, distinct types -> distinct
 }
 #endif
+
+// ---- Linux inventory 2026-10-01, finding I1 ----------------------------------
+// GCC's __PRETTY_FUNCTION__ lists the function's OTHER bindings after T:
+//   "... [with T = X; std::string_view = std::basic_string_view<char>]".
+// The type name, and therefore every TypeHash, must stop at T. A named, non-template
+// namespace type keeps the expected spelling identical on MSVC, Clang and GCC.
+// Name()/Hash()/TypeNameInternal mint NO ComponentID (zero TypeID budget).
+namespace AstraTypeNameProbe
+{
+    struct Probe { int v; };
+    template<typename T> struct Box { T v; };
+}
+
+// Compile-time pin: this is what fails the GCC build before the fix.
+static_assert(Astra::Detail::TypeNameInternal<AstraTypeNameProbe::Probe>().find(';') == std::string_view::npos,
+              "I1: a type name must not carry the compiler's trailing binding list");
+
+TEST(TypeNameSpelling, NamespacedTypeIsTheBareQualifiedName)
+{
+    constexpr std::string_view name = Astra::TypeID<AstraTypeNameProbe::Probe>::Name();
+    EXPECT_EQ(name, std::string_view("AstraTypeNameProbe::Probe"));
+    EXPECT_EQ(Astra::TypeID<AstraTypeNameProbe::Probe>::Hash(),
+              Astra::Detail::XXHash::XXHash64(std::string_view("AstraTypeNameProbe::Probe")));
+}
+
+TEST(TypeNameSpelling, TemplateNameCarriesNoBindingList)
+{
+    // MSVC spells template arguments differently from GCC/Clang. That is spec s8.4 and out
+    // of scope, so this test pins only the GCC binding-list tail.
+    constexpr std::string_view name = Astra::TypeID<AstraTypeNameProbe::Box<int>>::Name();
+    EXPECT_EQ(name.find(';'), std::string_view::npos) << name;
+    EXPECT_NE(name.find("AstraTypeNameProbe::Box<"), std::string_view::npos) << name;
+}

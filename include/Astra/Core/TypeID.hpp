@@ -168,7 +168,9 @@ namespace Astra
                 constexpr std::string_view prefix = "TypeNameInternal() [T = ";
                 constexpr std::string_view suffix = "]";
             #elif defined(ASTRA_COMPILER_GCC)
-                // GCC: __PRETTY_FUNCTION__ gives "constexpr std::string_view TypeName() [with T = MyClass]"
+                // GCC: __PRETTY_FUNCTION__ gives
+                //   "constexpr std::string_view TypeName() [with T = MyClass; std::string_view = ...]"
+                // -- the tail after ';' is cut below.
                 constexpr std::string_view funcName = __PRETTY_FUNCTION__;
                 constexpr std::string_view prefix = "TypeNameInternal() [with T = ";
                 constexpr std::string_view suffix = "]";
@@ -186,6 +188,17 @@ namespace Astra
             size_t end = funcName.rfind(suffix);
             if (end == std::string_view::npos || end <= start)
                 return "Unknown";
+
+            #if defined(ASTRA_COMPILER_GCC)
+                // GCC lists the function's OTHER bindings after T, ';'-separated:
+                //   "[with T = Ns::X; std::string_view = std::basic_string_view<char>]".
+                // Without this cut every GCC type name, and so every TypeHash, carries that
+                // tail, and name-keyed lookups ("Ns::X") never match Clang's
+                // (Linux inventory 2026-10-01, finding I1). A type name itself never
+                // contains ';'.
+                if (const size_t semi = funcName.find(';', start); semi != std::string_view::npos && semi < end)
+                    end = semi;
+            #endif
 
             // Extract the type name
             std::string_view typeName = funcName.substr(start, end - start);
