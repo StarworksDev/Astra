@@ -34,6 +34,7 @@
 #include "Query.hpp"
 #include "Relations.hpp"
 #include "RelationshipGraph.hpp"
+#include "StorageAccess.hpp"
 #include "StorageSplit.hpp"
 #include "View.hpp"
 
@@ -1117,7 +1118,11 @@ namespace Astra
             // Presence is the archetype mask, not the chunk array (which is null for a
             // size==0 tag). This makes Get(...) != nullptr agree with Has(...).
             if (!record->archetype->GetMask().Test(componentId))
-                return nullptr;                     // entity does not have the component
+            {
+                // Not in the mask: a Sparse/Universal member lives in its store (s3.3).
+                bool present = false;
+                return StoredElementByID(entity, componentId, present);
+            }
 
             if (desc->size == 0)
                 return EmptyComponentSentinel();     // present tag: no data
@@ -1165,7 +1170,11 @@ namespace Astra
             if (!record)
                 return false;
 
-            return record->archetype->GetMask().Test(componentId);
+            if (record->archetype->GetMask().Test(componentId))
+                return true;
+            bool present = false;
+            (void)StoredElementByID(entity, componentId, present);
+            return present;
         }
 
         /**
@@ -1192,6 +1201,13 @@ namespace Astra
             m_componentRegistry->ForEachComponent([&](ComponentID id, const ComponentDescriptor& desc)
             {
                 if (mask.Test(id))
+                {
+                    result.push_back(&desc);
+                    return;
+                }
+                bool present = false;
+                (void)StoredElementByID(entity, id, present);
+                if (present)
                     result.push_back(&desc);
             });
 
@@ -1235,7 +1251,15 @@ namespace Astra
             m_componentRegistry->ForEachComponent([&](ComponentID id, const ComponentDescriptor& desc)
             {
                 if (!mask.Test(id))
+                {
+                    // A Sparse/Universal member lives in its store (s3.3).
+                    bool present = false;
+                    void* stored = StoredElementByID(entity, id, present);
+                    if (!present)
+                        return;
+                    result.push_back(ComponentInfo{ &desc, desc.meta, desc.size > 0 ? stored : nullptr });   // a tag has no data
                     return;
+                }
 
                 ComponentInfo info;
                 info.descriptor = &desc;
@@ -2384,11 +2408,7 @@ namespace Astra
                     // tick when tracked (inside MarkWritten), plus the component's coarse
                     // version. Tag, absent or stale: false.
                     SparseSet* set = m_componentStorage->FindSparse(id);
-                    const Tick now = CurrentTick();
-                    if (!set || !set->MarkWritten(entity, now)) ASTRA_UNLIKELY
-                        return false;
-                    m_componentStorage->StampCoarse(id, now);
-                    return true;
+                    return set && Detail::StampSparseWrite(*m_componentStorage, *set, id, entity, CurrentTick());
                 }
                 default:
                     return false;
@@ -2457,8 +2477,19 @@ namespace Astra
         template<Component T>
         ASTRA_NODISCARD static T* StoreTagInstance() noexcept
         {
-            static T s_tag{};
-            return &s_tag;
+            return Detail::StoreTagInstance<T>();   // shared with Relations' GetInStorage
+        }
+
+        // Storage-aware membership and element of one component id (spec s3.3, reflection
+        // row). Sparse/Universal members are in no archetype mask, so every reflection API
+        // asks the store when the mask misses. Sets `present`; returns the data pointer, or
+        // EmptyComponentSentinel() for a present tag. A Table id (or an absent/stale
+        // handle): nullptr, present == false. Delegates to StoreLookup (non-creating, G2).
+        ASTRA_NODISCARD void* StoredElementByID(Entity entity, ComponentID id, bool& present) const noexcept
+        {
+            void* p = StoreLookup(entity, id);
+            present = p != nullptr;
+            return p;
         }
 
         // Typed twin of StoreLookup. A present tag yields the shared per-type instance.

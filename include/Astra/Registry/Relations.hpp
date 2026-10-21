@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <memory>
 #include <queue>
@@ -14,6 +15,7 @@
 #include "../Entity/Entity.hpp"
 #include "Query.hpp"
 #include "RelationshipGraph.hpp"
+#include "StorageAccess.hpp"
 
 namespace Astra
 {
@@ -42,6 +44,29 @@ namespace Astra
             "With<T> is not yet supported in Relations queries (it would be silently ignored). "
             "Use a plain required component, or filter after the relation query.");
 
+        // Storage policies (spec 2026-10-01 s6.5): effective kind of every named type,
+        // resolved once per Relations object (Universal is a per-registry fact). The
+        // manager's typed HasComponent/GetComponent see Table columns only, so filters and
+        // yields dispatch on this. Store POINTERS are never cached (module unload, Task 36).
+        using PlanTypes = Detail::QueryPlanTypes<QueryArgs...>;
+        static constexpr size_t NPlanSlots = std::tuple_size_v<PlanTypes> == 0 ? 1 : std::tuple_size_v<PlanTypes>;
+
+        template<typename T>
+        ASTRA_NODISCARD StorageKind KindOfT() const noexcept
+        {
+            return m_kinds[Detail::TupleIndexOf<std::remove_const_t<T>, PlanTypes>::value];
+        }
+
+        void ResolveKinds() noexcept
+        {
+            m_kinds.fill(StorageKind::Table);
+            const ComponentStorage* storage = m_archetypeManager ? m_archetypeManager->GetComponentStorage() : nullptr;
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((m_kinds[Detail::TupleIndexOf<Ts, PlanTypes>::value] = Detail::EffectiveKindOf<Ts>(storage)), ...);
+            }(static_cast<PlanTypes*>(nullptr));
+        }
+
     public:
         Relations(std::shared_ptr<ArchetypeManager> manager, Entity entity,
                   std::shared_ptr<const RelationshipGraph> graph,
@@ -50,7 +75,9 @@ namespace Astra
             m_rootEntity(entity),
             m_relationsGraph(graph),
             m_scheduler(std::move(scheduler))
-        {}
+        {
+            ResolveKinds();
+        }
         
         /**
          * Check if the Relations object is still valid (Registry not destroyed)
@@ -391,10 +418,11 @@ namespace Astra
         template<typename C>
         ASTRA_FORCEINLINE C* FetchYield(Entity entity) const
         {
-            if constexpr (Detail::IsMutableYield<C>)
-                return m_archetypeManager->template GetComponentMut<C>(entity);
-            else
-                return m_archetypeManager->template GetComponent<C>(entity);
+            // Any kind (spec 2026-10-01 s6.5): Table via the manager, Sparse/Universal via
+            // their stores. A non-const request is still a write for every kind; the
+            // store stamps go through the Par=true (relaxed atomic_ref) forms, since the
+            // parallel traversals call this from workers (RULINGS Task 28).
+            return Detail::GetInStorage<C>(*m_archetypeManager, entity, KindOfT<C>());
         }
 
         ASTRA_FORCEINLINE bool PassesFilter(Entity entity) const
@@ -457,7 +485,7 @@ namespace Astra
             {
                 if (!m_archetypeManager) ASTRA_UNLIKELY
                     return false;  // Registry destroyed
-                return (m_archetypeManager->HasComponent<Ts>(entity) && ...);
+                return (Detail::HasInStorage<Ts>(*m_archetypeManager, entity, KindOfT<Ts>()) && ...);
             }
         }
         
@@ -472,7 +500,7 @@ namespace Astra
             {
                 if (!m_archetypeManager) ASTRA_UNLIKELY
                     return false;  // Registry destroyed
-                return (m_archetypeManager->HasComponent<Ts>(entity) || ...);
+                return (Detail::HasInStorage<Ts>(*m_archetypeManager, entity, KindOfT<Ts>()) || ...);
             }
         }
         
@@ -499,7 +527,7 @@ namespace Astra
         {
             if (!m_archetypeManager) ASTRA_UNLIKELY
                 return false;  // Registry destroyed
-            return (m_archetypeManager->HasComponent<Ts>(entity) || ...);
+            return (Detail::HasInStorage<Ts>(*m_archetypeManager, entity, KindOfT<Ts>()) || ...);
         }
         
         bool CheckOneOfGroups(Entity entity) const
@@ -525,12 +553,13 @@ namespace Astra
         {
             if (!m_archetypeManager) ASTRA_UNLIKELY
                 return 0;  // Registry destroyed
-            return ((m_archetypeManager->HasComponent<Ts>(entity) ? 1 : 0) + ...);
+            return ((Detail::HasInStorage<Ts>(*m_archetypeManager, entity, KindOfT<Ts>()) ? 1 : 0) + ...);
         }
-        
+
         std::shared_ptr<ArchetypeManager> m_archetypeManager;
         Entity m_rootEntity;
         std::shared_ptr<const RelationshipGraph> m_relationsGraph;
         std::shared_ptr<IWorkScheduler> m_scheduler;
+        std::array<StorageKind, NPlanSlots> m_kinds{};
     };
 }
