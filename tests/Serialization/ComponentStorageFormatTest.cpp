@@ -159,3 +159,48 @@ TEST(ComponentStorageFormat, SaveWritesTheBlockBetweenArchetypesAndRelationsAtVe
     r(firstHash);
     EXPECT_EQ(firstHash, std::min(Astra::TypeID<Hierarchy>::Hash(), Astra::TypeID<Health>::Hash()));
 }
+
+// Fix round 1: the reader branches on the ARCHIVE's flag, never on its own build's
+// descriptor. A values-flagged block for a component this build registers as a tag
+// (size 0) cannot be decoded; it must be refused, not left to desync the stream.
+TEST(ComponentStorageFormat, ValuesFlaggedBlockForATagTypeIsRefused)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponents<EnTag>();
+    Astra::Registry reg(creg);
+
+    std::vector<std::byte> bytes;
+    {
+        Astra::BinaryWriter w(bytes);
+        uint32_t stored = 1;
+        uint64_t hash = Astra::TypeID<EnTag>::Hash();
+        uint32_t version = 1, count = 1;
+        uint8_t kind = Astra::StorageFormat::KIND_UNIVERSAL;
+        uint8_t flags = Astra::StorageFormat::FLAG_HAS_VALUES;
+        Astra::Entity e = reg.CreateEntity<EnTag>();
+        w(stored)(hash)(version)(kind)(flags)(count)(e);
+        uint64_t valueHash = hash; uint32_t valueVersion = 1, payload = 0xABCDu;   // per-element versioned bytes the stub cannot size
+        w(valueHash)(valueVersion)(payload);
+        ASSERT_FALSE(w.HasError());
+    }
+    Astra::BinaryReader r{std::span<const std::byte>(bytes)};
+    EXPECT_FALSE(reg.GetComponentStorage()->Deserialize(r, reg));
+}
+
+// The stub must consume exactly what Serialize wrote (Sparse values + disabled
+// bitmap, uncompressed), so the sections after the block stay aligned.
+TEST(ComponentStorageFormat, StubConsumesSparseBlockWithDisabledBitmapExactly)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    FormatWorld world;
+    std::vector<std::byte> bytes;
+    {
+        Astra::BinaryWriter w(bytes);
+        world.reg->GetComponentStorage()->Serialize(w);
+        ASSERT_FALSE(w.HasError());
+    }
+    Astra::BinaryReader r{std::span<const std::byte>(bytes)};
+    EXPECT_TRUE(world.reg->GetComponentStorage()->Deserialize(r, *world.reg));
+    EXPECT_EQ(r.GetRemaining(), 0u);
+}

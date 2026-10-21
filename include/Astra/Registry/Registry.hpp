@@ -3167,8 +3167,11 @@ namespace Astra
             }
             if (in->HasError()) return false;
 
-            if ((flags & StorageFormat::FLAG_HAS_VALUES) && desc->size > 0)
+            // The archive's flag decides the stream layout, never this build's descriptor
+            // (IM-9): values the loading build cannot decode (it registers a tag) are refused.
+            if (flags & StorageFormat::FLAG_HAS_VALUES)
             {
+                if (desc->size == 0) return false;
                 AllocResult scratch = AllocateMemory(desc->size, desc->alignment);
                 if (!scratch.ptr) return false;
                 bool ok = true;
