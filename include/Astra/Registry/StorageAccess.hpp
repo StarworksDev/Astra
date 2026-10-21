@@ -117,7 +117,7 @@ namespace Astra::Detail
             }
         }
         if constexpr (Write)
-            return am.template GetComponentMut<Bare>(e);
+            return am.template GetComponentMut<Bare, true>(e);
         else
             return am.template GetComponent<Bare>(e);
     }

@@ -412,9 +412,11 @@ namespace Astra
         // `const C` request, or a tag (no column), is a plain read through the
         // non-stamping GetComponent and touches nothing. The return type is the same
         // C* the site received before (GetComponentMut<C> == GetComponent<C> plus the
-        // stamp), so callbacks are unaffected; the parallel variant issues the same
-        // stores from workers -- same-value column stamps and one owner per entity's
-        // tick, the same benign pattern as View::ParallelForEach.
+        // stamp), so callbacks are unaffected. The parallel variant calls this from
+        // workers over a dense descendant range (not chunk-partitioned), so a chunk's
+        // column version can be stamped by several workers: GetInStorage stamps it with
+        // the Par=true relaxed shared store (same value from every worker, RULINGS
+        // Task 28), while the per-entity `changed` tick has one owner and stays plain.
         template<typename C>
         ASTRA_FORCEINLINE C* FetchYield(Entity entity) const
         {

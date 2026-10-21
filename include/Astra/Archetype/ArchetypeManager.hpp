@@ -578,7 +578,10 @@ namespace Astra
         // Non-const component access IS a write for change detection (spec §3.3):
         // stamp T's column in the entity's chunk and, for a change-tracked T, mark
         // the entity's `changed` tick. Same validation and result as GetComponent<T>.
-        template<Component T>
+        // Par=true is for parallel workers that may share a chunk (Relations' dense
+        // descendant range): the column-version stamp goes through the relaxed shared
+        // store (RULINGS Task 28); the per-entity `changed` tick stays plain.
+        template<Component T, bool Par = false>
         ASTRA_NODISCARD T* GetComponentMut(Entity entity)
         {
             T* ptr = GetComponent<T>(entity);
@@ -588,7 +591,7 @@ namespace Astra
                 {
                     const EntityRecord* rec = m_records->GetRecord(entity.GetID());   // validated by GetComponent above
                     const int col = rec->archetype->GetColumnMeta().idToColumn[TypeID<T>::Value()];
-                    rec->chunk->StampColumn(col, m_tick);
+                    rec->chunk->template StampColumn<Par>(col, m_tick);
                     if constexpr (IsChangeTrackedV<T>)
                         rec->chunk->GetTicks(col)[rec->location.GetEntityIndex()].changed = m_tick;
                 }
