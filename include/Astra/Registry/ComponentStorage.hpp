@@ -19,6 +19,10 @@
 
 namespace Astra
 {
+    class BinaryWriter;
+    class BinaryReader;
+    class Registry;
+
     // ============ Storage policies: the per-registry owner (spec 2026-10-01 s4) ============
     //
     // ComponentStorage sits beside ArchetypeManager inside a Registry. It answers "where does
@@ -166,6 +170,11 @@ namespace Astra
         // skip the storage walk entirely while this is false (G4: Table-only registries pay
         // one predictable branch).
         ASTRA_NODISCARD bool HasAnyStore() const noexcept { return m_storeCount != 0; }
+
+        // Format v6 block (spec s8.2). Serialize is defined in ComponentStorageSerialization.hpp;
+        // Deserialize out of line after class Registry (its body needs the complete Registry).
+        void Serialize(BinaryWriter& w) const;
+        bool Deserialize(BinaryReader& r, class Registry& registry);
 
         // Lookup without creation. Read paths, which are const at the Registry, use this.
         ASTRA_NODISCARD UniversalColumn* FindUniversal(ComponentID id) const noexcept

@@ -93,8 +93,16 @@ namespace Astra
      *     frame), orthogonal to per-element versioning. v5 archives written with
      *     compressionMode == None are layout-identical to v4 (inline per-element
      *     columns, uncompressed).
+     * v6: ComponentStorage block between the archetype records and the
+     *     relationship graph (storage policies, spec 2026-10-01 s8): one entry
+     *     per non-empty Sparse set / Universal column, sorted by type hash --
+     *     {hash, version, kind, flags, count} then entities (ascending id),
+     *     values (per-element serializeVersioned), disabled bitmap; the payload
+     *     is one WriteCompressedBlock frame per component under LZ4. Archetype
+     *     records are unchanged. Loads are storage-agnostic: v5 and older
+     *     archives (no block, every component a Table column) load unchanged.
      */
-    inline constexpr uint16_t BINARY_FORMAT_VERSION = 5;
+    inline constexpr uint16_t BINARY_FORMAT_VERSION = 6;
     inline constexpr char BINARY_MAGIC[6] = "ASTRA";
     
     /**

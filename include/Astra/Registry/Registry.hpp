@@ -31,6 +31,8 @@
 #include "../Serialization/BinaryWriter.hpp"
 #include "../Serialization/SerializationError.hpp"
 #include "ComponentStorage.hpp"
+#include "ComponentStorageSerialization.hpp"
+#include <optional>
 #include "Query.hpp"
 #include "Relations.hpp"
 #include "RelationshipGraph.hpp"
@@ -2164,6 +2166,7 @@ namespace Astra
             // Serialize components
             m_entityManager.Serialize(writer);
             m_archetypeManager->Serialize(writer);
+            m_componentStorage->Serialize(writer);   // format v6 ComponentStorage block (s8.1)
             m_relationshipGraph->Serialize(writer);
             m_resourceStorage.Serialize(writer);   // format v2 resource block
 
@@ -2198,6 +2201,7 @@ namespace Astra
             // Serialize components
             m_entityManager.Serialize(writer);
             m_archetypeManager->Serialize(writer);
+            m_componentStorage->Serialize(writer);   // format v6 ComponentStorage block (s8.1)
             m_relationshipGraph->Serialize(writer);
             m_resourceStorage.Serialize(writer);   // format v2 resource block
 
@@ -3053,6 +3057,17 @@ namespace Astra
             {
                 return Result<std::unique_ptr<Registry>, SerializationError>::Err(SerializationError::CorruptedData);
             }
+
+            // Format v6 (s8.1): the ComponentStorage block sits between the
+            // archetype records and the relationship graph. v5 and older have none.
+            if (reader.GetVersion() >= 6)
+            {
+                if (!registry->m_componentStorage->Deserialize(reader, *registry))
+                {
+                    return Result<std::unique_ptr<Registry>, SerializationError>::Err(
+                        reader.HasError() ? reader.GetError() : SerializationError::UnknownComponent);
+                }
+            }
             
             // Deserialize RelationshipGraph
             auto graphResult = RelationshipGraph::Deserialize(reader);
@@ -3099,4 +3114,81 @@ namespace Astra
         inline static std::atomic<std::uint64_t> s_nextInstanceId{1};   // 0 is never assigned
         std::uint64_t m_instanceId;   // last member: initialized last in every ctor
     };
+
+    // Format v6 block reader (stub). Every block is DECODED into scratch values
+    // through the loading registry's descriptor and discarded (the
+    // ResourceStorage::Deserialize transient-resource pattern, RULINGS Task 31):
+    // that keeps the stream aligned and the full suite green until Task 32 replaces
+    // this with the real reader. Unknown hash -> false (the caller maps it to
+    // UnknownComponent); malformed data -> false with the reader error or not.
+    inline bool ComponentStorage::Deserialize(BinaryReader& r, Registry& registry)
+    {
+        const ComponentRegistry* creg = registry.GetComponentRegistry();
+        uint32_t stored = 0;
+        r(stored);
+        if (r.HasError() || !creg) return false;
+        if (r.CountExceedsRemaining(stored, StorageFormat::BLOCK_HEADER_BYTES)) return false;
+
+        for (uint32_t b = 0; b < stored; ++b)
+        {
+            uint64_t hash = 0;
+            uint32_t version = 0;
+            uint8_t kind = 0, flags = 0;
+            uint32_t count = 0;
+            r(hash)(version)(kind)(flags)(count);
+            if (r.HasError()) return false;
+
+            const ComponentDescriptor* desc = creg->GetComponentDescriptorByHash(hash);
+            if (!desc) return false;
+            if ((kind != StorageFormat::KIND_SPARSE && kind != StorageFormat::KIND_UNIVERSAL)
+                || (flags & ~StorageFormat::FLAG_MASK) != 0 || count == 0)
+                return false;
+
+            // Same gate as the writer: LZ4 archives frame each component's payload.
+            std::vector<uint8_t> inflated;
+            std::optional<BinaryReader> sub;
+            BinaryReader* in = &r;
+            if (r.GetCompressionMode() == CompressionMode::LZ4)
+            {
+                auto blk = r.ReadCompressedBlock();
+                if (blk.IsErr()) return false;
+                inflated = std::move(*blk.GetValue());
+                sub.emplace(std::span<const std::byte>(
+                    reinterpret_cast<const std::byte*>(inflated.data()), inflated.size()));
+                sub->SetChecksumEnabled(false);
+                in = &*sub;
+            }
+
+            if (in->CountExceedsRemaining(count, sizeof(Entity))) return false;
+            for (uint32_t i = 0; i < count; ++i)
+            {
+                Entity e;
+                (*in)(e);
+            }
+            if (in->HasError()) return false;
+
+            if ((flags & StorageFormat::FLAG_HAS_VALUES) && desc->size > 0)
+            {
+                AllocResult scratch = AllocateMemory(desc->size, desc->alignment);
+                if (!scratch.ptr) return false;
+                bool ok = true;
+                for (uint32_t i = 0; i < count && ok; ++i)
+                {
+                    desc->DefaultConstruct(scratch.ptr);
+                    ok = desc->deserializeVersioned(*in, scratch.ptr);
+                    desc->Destruct(scratch.ptr);
+                }
+                FreeMemory(scratch.ptr, desc->size);
+                if (!ok) return false;
+            }
+
+            if (flags & StorageFormat::FLAG_HAS_DISABLED)
+            {
+                std::vector<uint8_t> disabled;
+                if (!StorageFormat::ReadDisabledBitmap(*in, count, disabled)) return false;
+            }
+            if (in->HasError()) return false;
+        }
+        return !r.HasError();
+    }
 }
