@@ -558,3 +558,88 @@ TEST(ComponentStorageFormat, HeldSparseSetIsSavedEvenWhenItsDescriptorKindChange
     r(stored);
     EXPECT_EQ(stored, 1u);
 }
+
+// Task 32 review (a): an ENABLEABLE Universal with disabled entities survives Save/Load.
+// Exercises the Universal arms of SetLoadedDisabled and DeriveStoragePresence.
+TEST(ComponentStorageFormat, EnableableUniversalKeepsDisabledEntitiesAcrossSaveLoad)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    constexpr int kCount = 70;
+    Astra::Registry::Config cfg;
+    cfg.AddUniversal<Hierarchy>();
+
+    auto saveCreg = std::make_shared<Astra::ComponentRegistry>();
+    saveCreg->RegisterComponents<Position>();
+    Astra::Registry reg(saveCreg, cfg);
+    std::vector<Astra::Entity> es;
+    for (int i = 0; i < kCount; ++i)
+    {
+        const Astra::Entity e = reg.CreateEntity<Position>();
+        reg.GetComponent<Hierarchy>(e)->parent = static_cast<uint32_t>(i);
+        if (i % 3 == 0) ASSERT_TRUE(reg.SetEnabled<Hierarchy>(e, false));
+        es.push_back(e);
+    }
+    ASSERT_EQ(reg.ValidateStorageInvariants(), "");
+    auto saved = reg.Save();
+    ASSERT_TRUE(saved.IsOk());
+
+    auto loadCreg = std::make_shared<Astra::ComponentRegistry>();
+    loadCreg->RegisterComponents<Position>();
+    auto loaded = Astra::Registry::Load(*saved.GetValue(), loadCreg, cfg);
+    ASSERT_TRUE(loaded.IsOk()) << "error " << static_cast<int>(*loaded.GetError());
+    Astra::Registry& out = **loaded.GetValue();
+
+    EXPECT_EQ(out.ValidateStorageInvariants(), "");
+    const Astra::ComponentID hierId = Astra::TypeID<Hierarchy>::Value();
+    for (int i = 0; i < kCount; ++i)
+    {
+        const auto* h = static_cast<const Hierarchy*>(out.GetComponentByHash(es[i], Astra::TypeID<Hierarchy>::Hash()));
+        ASSERT_NE(h, nullptr) << "entity " << i;
+        EXPECT_EQ(h->parent, static_cast<uint32_t>(i));
+        EXPECT_EQ(out.IsEnabledByID(es[i], hierId), i % 3 != 0) << "entity " << i;
+    }
+}
+
+// Task 32 review (b): an archived ENABLEABLE Universal loads as Sparse-now (cross-kind).
+TEST(ComponentStorageFormat, ArchivedUniversalLoadsAsSparseWithValuesPresenceAndDisabledState)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    constexpr int kCount = 9;
+    Astra::Registry::Config saveCfg;
+    saveCfg.AddUniversal<Hierarchy>();
+    auto saveCreg = std::make_shared<Astra::ComponentRegistry>();
+    saveCreg->RegisterComponents<Position>();
+    Astra::Registry reg(saveCreg, saveCfg);
+    std::vector<Astra::Entity> es;
+    for (int i = 0; i < kCount; ++i)
+    {
+        const Astra::Entity e = reg.CreateEntity<Position>();
+        reg.GetComponent<Hierarchy>(e)->parent = 40u + static_cast<uint32_t>(i);
+        if (i == 2 || i == 5) ASSERT_TRUE(reg.SetEnabled<Hierarchy>(e, false));
+        es.push_back(e);
+    }
+    auto saved = reg.Save();
+    ASSERT_TRUE(saved.IsOk());
+
+    auto loadCreg = std::make_shared<Astra::ComponentRegistry>();
+    loadCreg->RegisterComponents<Position>();
+    const Astra::ComponentID hierId = Astra::TestSupport::InstallWithStorage<Hierarchy>(*loadCreg, Astra::Storage::Sparse);
+    auto loaded = Astra::Registry::Load(*saved.GetValue(), loadCreg);
+    ASSERT_TRUE(loaded.IsOk()) << "error " << static_cast<int>(*loaded.GetError());
+    Astra::Registry& out = **loaded.GetValue();
+
+    EXPECT_EQ(out.ValidateStorageInvariants(), "");
+    EXPECT_EQ(out.GetComponentStorage()->KindOf(hierId), Astra::StorageKind::Sparse);
+    for (int i = 0; i < kCount; ++i)
+    {
+        ASSERT_TRUE(out.HasComponentByHash(es[i], Astra::TypeID<Hierarchy>::Hash())) << "entity " << i;
+        const auto* h = static_cast<const Hierarchy*>(out.GetComponentByHash(es[i], Astra::TypeID<Hierarchy>::Hash()));
+        ASSERT_NE(h, nullptr);
+        EXPECT_EQ(h->parent, 40u + static_cast<uint32_t>(i));
+        EXPECT_EQ(out.IsEnabledByID(es[i], hierId), i != 2 && i != 5) << "entity " << i;
+    }
+    // The migrated set is an ordinary sparse set afterwards.
+    ASSERT_TRUE(out.RemoveComponentByID(es[0], hierId));
+    EXPECT_FALSE(out.HasComponentByHash(es[0], Astra::TypeID<Hierarchy>::Hash()));
+    EXPECT_EQ(out.ValidateStorageInvariants(), "");
+}
