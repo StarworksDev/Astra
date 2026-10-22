@@ -1,9 +1,8 @@
 #pragma once
 
 #include <algorithm>
+#include <cstdint>
 #include <numeric>
-#include <optional>
-#include <span>
 #include <vector>
 
 #include "../Serialization/BinaryReader.hpp"
@@ -29,9 +28,60 @@ namespace Astra
         {
             for (const Entity e : c.entities) w(e);
             if (flags & StorageFormat::FLAG_HAS_VALUES)
+            {
+                // Mirror of Archetype::SerializeColumn's precondition: a hookless descriptor
+                // would write nothing per element and desync the reader.
+                ASTRA_ASSERT(c.desc->serializeVersioned, "WriteStoredPayload: component descriptor has no serialize hook");
                 for (void* value : c.values) c.desc->serializeVersioned(w, value);
+            }
             if (flags & StorageFormat::FLAG_HAS_DISABLED)
                 StorageFormat::WriteDisabledBitmap(w, c.disabled);
+        }
+
+        // Where a loaded element of `desc` for `e` lives in the LOADING registry's
+        // storage (spec s8.3): the existing element, or a freshly default-constructed
+        // one that the caller deserializes over. EmptyComponentSentinel() for a tag;
+        // nullptr refuses the load (slot cap exhausted, or the kind is Table).
+        inline void* AcquireLoadTarget(ComponentStorage& storage, const ComponentDescriptor& desc, Entity e)
+        {
+            switch (storage.KindOf(desc.id))
+            {
+            case StorageKind::Sparse:
+            {
+                if (storage.AcquireSparseSlot(desc.id) < 0)
+                    return nullptr;   // s3.2: the sparse-slot cap refuses
+                SparseSet* set = storage.Sparse(desc.id);
+                if (!set)
+                    return nullptr;
+                void* element = set->Contains(e) ? set->Get(e) : set->Insert(e);
+                return desc.size == 0 ? EmptyComponentSentinel() : element;
+            }
+            case StorageKind::Universal:
+            {
+                UniversalColumn* column = storage.Universal(desc.id);
+                if (!column)
+                    return nullptr;
+                void* element = column->IsLive(e) ? column->Get(e) : column->Construct(e);
+                return desc.size == 0 ? EmptyComponentSentinel() : element;
+            }
+            default:
+                return nullptr;
+            }
+        }
+
+        inline void SetLoadedDisabled(ComponentStorage& storage, ComponentID id, Entity e)
+        {
+            switch (storage.KindOf(id))
+            {
+            case StorageKind::Sparse:
+                if (SparseSet* set = storage.FindSparse(id)) set->SetDisabled(e, true);
+                break;
+            case StorageKind::Universal:
+                if (UniversalColumn* column = storage.FindUniversal(id)) column->SetDisabled(e, true);
+                break;
+            default:
+                break;
+            }
         }
     }
 
@@ -43,14 +93,17 @@ namespace Astra
     {
         std::vector<Detail::StoredComponent> stored;
 
+        // Selects by the stores that EXIST, never by a live KindOf(id) descriptor read: a held
+        // set whose descriptor now says Table (a module swap) must still be saved, not
+        // silently dropped (RULINGS Task 32). Each store carries its own descriptor copy.
         for (size_t raw = 0; raw < MAX_COMPONENTS; ++raw)
         {
             const auto id = static_cast<ComponentID>(raw);
-            const StorageKind kind = KindOf(id);
-            if (kind == StorageKind::Sparse)
+            SparseSet* set = FindSparse(id);
+            UniversalColumn* column = set ? nullptr : FindUniversal(id);
+            if (set)
             {
-                SparseSet* set = FindSparse(id);
-                if (!set || set->Size() == 0) continue;
+                if (set->Size() == 0) continue;
 
                 Detail::StoredComponent c;
                 c.desc = &set->Descriptor();
@@ -68,10 +121,9 @@ namespace Astra
                 }
                 stored.push_back(std::move(c));
             }
-            else if (kind == StorageKind::Universal)
+            else if (column)
             {
-                UniversalColumn* column = FindUniversal(id);
-                if (!column || column->LiveCount() == 0) continue;
+                if (column->LiveCount() == 0) continue;
 
                 Detail::StoredComponent c;
                 c.desc = &column->Descriptor();

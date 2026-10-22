@@ -7,6 +7,7 @@
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 #include <tuple>
@@ -32,7 +33,6 @@
 #include "../Serialization/SerializationError.hpp"
 #include "ComponentStorage.hpp"
 #include "ComponentStorageSerialization.hpp"
-#include <optional>
 #include "Query.hpp"
 #include "Relations.hpp"
 #include "RelationshipGraph.hpp"
@@ -3062,10 +3062,10 @@ namespace Astra
             // archetype records and the relationship graph. v5 and older have none.
             if (reader.GetVersion() >= 6)
             {
-                if (!registry->m_componentStorage->Deserialize(reader, *registry))
+                SerializationError blockError = SerializationError::CorruptedData;
+                if (!registry->m_componentStorage->Deserialize(reader, *registry, &blockError))
                 {
-                    return Result<std::unique_ptr<Registry>, SerializationError>::Err(
-                        reader.HasError() ? reader.GetError() : SerializationError::UnknownComponent);
+                    return Result<std::unique_ptr<Registry>, SerializationError>::Err(blockError);
                 }
             }
             
@@ -3092,10 +3092,111 @@ namespace Astra
             {
                 return Result<std::unique_ptr<Registry>, SerializationError>::Err(*checksumResult.GetError());
             }
-            
+
+            // s8.3 fix-ups: universal defaults + init, then the chunk presence
+            // mirror derived from the stores.
+            if (!registry->FinishStorageLoad())
+            {
+                return Result<std::unique_ptr<Registry>, SerializationError>::Err(SerializationError::CorruptedData);
+            }
+
             return Result<std::unique_ptr<Registry>, SerializationError>::Ok(std::move(registry));
         }
         
+        // Post-load storage fix-ups (spec s8.2/s8.3), run once the checksum verifies.
+        // Task 34 prepends ApplyMigratedTableComponents.
+        bool FinishStorageLoad()
+        {
+            FillMissingUniversals();
+            return DeriveStoragePresence();
+        }
+
+        // s8.3 bullet 3 + s4.2 order: an entity the archive restored without a declared
+        // Universal component gets default construction, then the registry's init
+        // (Arcane: a fresh GUID). Explicitly archived values are never re-initialised:
+        // they are passed as `supplied`, exactly like a caller-supplied value at creation,
+        // so this is ConstructUniversals' two passes (construct every missing universal,
+        // then run the inits) over the declared, deduplicated specs.
+        void FillMissingUniversals()
+        {
+            const std::vector<UniversalSpec>& specs = m_componentStorage->UniversalSpecs();
+            if (specs.empty())
+                return;
+            std::vector<ComponentID> live;
+            live.reserve(specs.size());
+            for (Archetype* archetype : m_archetypeManager->GetArchetypes())
+            {
+                for (const auto& chunk : archetype->GetChunks())
+                {
+                    if (!chunk) continue;
+                    const auto& entities = chunk->GetEntities();
+                    for (size_t i = 0; i < chunk->GetCount(); ++i)
+                    {
+                        const Entity e = entities[i];
+                        live.clear();
+                        for (const UniversalSpec& spec : specs)
+                        {
+                            const UniversalColumn* column = m_componentStorage->FindUniversal(spec.id);
+                            if (column && column->IsLive(e))
+                                live.push_back(spec.id);
+                        }
+                        if (live.size() != specs.size())
+                            m_componentStorage->ConstructUniversals(e, live.data(), live.size());
+                    }
+                }
+            }
+        }
+
+        // Chunk presence blocks are never serialized (s8.2): rebuild P1 (present
+        // bits) and P3 (disabled mirror) from the stores, now that every entity is
+        // located. A stored entity without a location is a corrupt archive. A loaded
+        // Sparse component's coarse version is stamped at the current tick (Table's
+        // loaded columns stamp their column version on load; RULINGS Task 32).
+        bool DeriveStoragePresence()
+        {
+            ComponentStorage& storage = *m_componentStorage;
+            for (size_t raw = 0; raw < MAX_COMPONENTS; ++raw)
+            {
+                const auto id = static_cast<ComponentID>(raw);
+                const StorageKind kind = storage.KindOf(id);
+                if (kind == StorageKind::Sparse)
+                {
+                    const int slot = storage.SparseSlotOf(id);
+                    SparseSet* set = storage.FindSparse(id);
+                    if (slot < 0 || !set || set->Size() == 0) continue;
+                    const Entity* dense = set->Entities();
+                    for (size_t d = 0; d < set->Size(); ++d)
+                    {
+                        const EntityRecord* rec = m_archetypeManager->GetEntityRecord(dense[d]);
+                        if (!rec || !rec->chunk)
+                            return false;
+                        const size_t index = rec->location.GetEntityIndex();
+                        rec->chunk->SetSparsePresent(static_cast<uint16_t>(slot), index, true);
+                        if (set->IsDisabled(dense[d]))
+                            rec->chunk->SetSparseDisabled(static_cast<uint16_t>(slot), index, true);
+                    }
+                    storage.StampCoarse(id, CurrentTick());
+                }
+                else if (kind == StorageKind::Universal)
+                {
+                    UniversalColumn* column = storage.FindUniversal(id);
+                    if (!column || !column->Descriptor().isEnableable) continue;
+                    bool ok = true;
+                    column->ForEachLive([&](Entity e, const void*)
+                    {
+                        if (!ok || !column->IsDisabled(e)) return;
+                        const int slot = storage.AcquireSparseSlot(id);   // s5.1: an enableable universal mirrors through a slot
+                        const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+                        if (slot < 0 || !rec || !rec->chunk) { ok = false; return; }
+                        rec->chunk->SetSparseDisabled(static_cast<uint16_t>(slot), rec->location.GetEntityIndex(), true);
+                    });
+                    if (!ok)
+                        return false;
+                }
+            }
+            return true;
+        }
+
         EntityManager m_entityManager;
         std::shared_ptr<ComponentRegistry> m_componentRegistry;
         std::shared_ptr<ArchetypeManager> m_archetypeManager;
@@ -3115,34 +3216,140 @@ namespace Astra
         std::uint64_t m_instanceId;   // last member: initialized last in every ctor
     };
 
-    // Format v6 block reader (stub). Every block is DECODED into scratch values
-    // through the loading registry's descriptor and discarded (the
-    // ResourceStorage::Deserialize transient-resource pattern, RULINGS Task 31):
-    // that keeps the stream aligned and the full suite green until Task 32 replaces
-    // this with the real reader. Unknown hash -> false (the caller maps it to
-    // UnknownComponent); malformed data -> false with the reader error or not.
-    inline bool ComponentStorage::Deserialize(BinaryReader& r, Registry& registry)
+    namespace Detail
     {
-        const ComponentRegistry* creg = registry.GetComponentRegistry();
+        // Decodes `count` values into scratch and drops them: the Table-now arm
+        // (archived Sparse/Universal, Table in the loading build) until Task 34 stages
+        // the values (RULINGS Task 31/32). Keeps the stream aligned, like
+        // ResourceStorage::Deserialize's transient-resource pattern.
+        inline bool DiscardStoredValues(BinaryReader& r, const ComponentDescriptor& desc, uint32_t count)
+        {
+            ASTRA_ASSERT(desc.deserializeVersioned, "DiscardStoredValues: component descriptor has no deserialize hook");
+            if (!desc.deserializeVersioned || desc.size == 0)
+                return false;
+            AllocResult scratch = AllocateMemory(desc.size, desc.alignment);
+            if (!scratch.ptr)
+                return false;
+            bool ok = true;
+            for (uint32_t i = 0; i < count && ok; ++i)
+            {
+                desc.DefaultConstruct(scratch.ptr);
+                ok = desc.deserializeVersioned(r, scratch.ptr);
+                desc.Destruct(scratch.ptr);
+            }
+            FreeMemory(scratch.ptr, desc.size);
+            return ok;
+        }
+
+        // One stored component's payload (spec s8.2), read into whatever storage the
+        // LOADING registry assigns (s8.3). Entities are untrusted: each must be live
+        // in the registry being loaded, ascending and unique. The archive's flags decide
+        // the stream layout, never this build's descriptor (IM-9): values the loading
+        // build cannot decode (it registers a tag) are refused.
+        inline bool ReadStoredPayload(BinaryReader& r, ComponentStorage& storage, const Registry& registry,
+                                      const ComponentDescriptor& desc, uint8_t flags, uint32_t count)
+        {
+            const bool hasValues = (flags & StorageFormat::FLAG_HAS_VALUES) != 0;
+            if (hasValues && (desc.size == 0 || !desc.deserializeVersioned))
+                return false;
+            if (r.CountExceedsRemaining(count, sizeof(Entity)))
+                return false;
+            std::vector<Entity> entities(count);
+            for (Entity& e : entities) r(e);
+            if (r.HasError())
+                return false;
+            for (size_t i = 0; i < entities.size(); ++i)
+            {
+                if (!registry.IsValid(entities[i]))
+                    return false;
+                if (i > 0 && entities[i].GetID() <= entities[i - 1].GetID())
+                    return false;
+            }
+
+            const bool tableNow = storage.KindOf(desc.id) == StorageKind::Table;
+            if (hasValues)
+            {
+                if (tableNow)
+                {
+                    if (!DiscardStoredValues(r, desc, count))
+                        return false;
+                }
+                else
+                {
+                    for (const Entity e : entities)
+                    {
+                        void* target = AcquireLoadTarget(storage, desc, e);
+                        if (!target || !desc.deserializeVersioned(r, target))
+                            return false;
+                    }
+                }
+            }
+            else if (!tableNow)
+            {
+                for (const Entity e : entities)
+                    if (!AcquireLoadTarget(storage, desc, e))
+                        return false;
+            }
+
+            if (flags & StorageFormat::FLAG_HAS_DISABLED)
+            {
+                std::vector<uint8_t> disabled;
+                if (!StorageFormat::ReadDisabledBitmap(r, entities.size(), disabled))
+                    return false;
+                if (desc.isEnableable && !tableNow)   // else: consumed, validated, dropped (IM-9)
+                    for (size_t i = 0; i < entities.size(); ++i)
+                        if (disabled[i]) SetLoadedDisabled(storage, desc.id, entities[i]);
+            }
+            return !r.HasError();
+        }
+    }
+
+    // Format v6 block reader (spec s8.2, s8.3). Defined after Registry is complete:
+    // it validates every entity against the registry being loaded. A refused block may
+    // leave partially inserted elements behind; Load discards the whole registry then.
+    inline bool ComponentStorage::Deserialize(BinaryReader& r, Registry& registry, SerializationError* error)
+    {
+        const auto refuse = [&](SerializationError why)
+        {
+            if (error)
+                *error = why;
+            return false;
+        };
+        const auto corrupt = [&]
+        {
+            return refuse(r.HasError() ? r.GetError() : SerializationError::CorruptedData);
+        };
+
         uint32_t stored = 0;
         r(stored);
-        if (r.HasError() || !creg) return false;
-        if (r.CountExceedsRemaining(stored, StorageFormat::BLOCK_HEADER_BYTES)) return false;
+        if (r.HasError() || r.CountExceedsRemaining(stored, StorageFormat::BLOCK_HEADER_BYTES))
+            return corrupt();
+        const ComponentRegistry* components = registry.GetComponentRegistry();
+        if (!components)
+            return corrupt();
 
+        uint64_t previousHash = 0;
         for (uint32_t b = 0; b < stored; ++b)
         {
             uint64_t hash = 0;
-            uint32_t version = 0;
-            uint8_t kind = 0, flags = 0;
+            uint32_t version = 0;   // informational: per-element versions drive migration
+            uint8_t kind = 0;
+            uint8_t flags = 0;
             uint32_t count = 0;
             r(hash)(version)(kind)(flags)(count);
-            if (r.HasError()) return false;
+            if (r.HasError())
+                return corrupt();
+            if (b > 0 && hash <= previousHash)
+                return corrupt();   // sorted, unique (s8.2)
+            previousHash = hash;
+            if (kind != StorageFormat::KIND_SPARSE && kind != StorageFormat::KIND_UNIVERSAL)
+                return corrupt();
+            if ((flags & ~StorageFormat::FLAG_MASK) != 0 || count == 0)
+                return corrupt();   // the writer never emits unknown flags or empty blocks
 
-            const ComponentDescriptor* desc = creg->GetComponentDescriptorByHash(hash);
-            if (!desc) return false;
-            if ((kind != StorageFormat::KIND_SPARSE && kind != StorageFormat::KIND_UNIVERSAL)
-                || (flags & ~StorageFormat::FLAG_MASK) != 0 || count == 0)
-                return false;
+            const ComponentDescriptor* desc = components->GetComponentDescriptorByHash(hash);
+            if (!desc)
+                return refuse(SerializationError::UnknownComponent);   // unregistered in the loading build
 
             // Same gate as the writer: LZ4 archives frame each component's payload.
             std::vector<uint8_t> inflated;
@@ -3150,48 +3357,20 @@ namespace Astra
             BinaryReader* in = &r;
             if (r.GetCompressionMode() == CompressionMode::LZ4)
             {
-                auto blk = r.ReadCompressedBlock();
-                if (blk.IsErr()) return false;
-                inflated = std::move(*blk.GetValue());
-                sub.emplace(std::span<const std::byte>(
-                    reinterpret_cast<const std::byte*>(inflated.data()), inflated.size()));
+                auto block = r.ReadCompressedBlock();
+                if (block.IsErr())
+                    return refuse(*block.GetError());
+                inflated = std::move(*block.GetValue());
+                sub.emplace(std::span<const std::byte>(reinterpret_cast<const std::byte*>(inflated.data()), inflated.size()));
                 sub->SetChecksumEnabled(false);
                 in = &*sub;
             }
 
-            if (in->CountExceedsRemaining(count, sizeof(Entity))) return false;
-            for (uint32_t i = 0; i < count; ++i)
-            {
-                Entity e;
-                (*in)(e);
-            }
-            if (in->HasError()) return false;
-
-            // The archive's flag decides the stream layout, never this build's descriptor
-            // (IM-9): values the loading build cannot decode (it registers a tag) are refused.
-            if (flags & StorageFormat::FLAG_HAS_VALUES)
-            {
-                if (desc->size == 0) return false;
-                AllocResult scratch = AllocateMemory(desc->size, desc->alignment);
-                if (!scratch.ptr) return false;
-                bool ok = true;
-                for (uint32_t i = 0; i < count && ok; ++i)
-                {
-                    desc->DefaultConstruct(scratch.ptr);
-                    ok = desc->deserializeVersioned(*in, scratch.ptr);
-                    desc->Destruct(scratch.ptr);
-                }
-                FreeMemory(scratch.ptr, desc->size);
-                if (!ok) return false;
-            }
-
-            if (flags & StorageFormat::FLAG_HAS_DISABLED)
-            {
-                std::vector<uint8_t> disabled;
-                if (!StorageFormat::ReadDisabledBitmap(*in, count, disabled)) return false;
-            }
-            if (in->HasError()) return false;
+            if (!Detail::ReadStoredPayload(*in, *this, registry, *desc, flags, count))
+                return corrupt();
+            if (in != &r && in->GetRemaining() != 0)
+                return corrupt();   // a framed block must be consumed exactly
         }
-        return !r.HasError();
+        return r.HasError() ? corrupt() : true;
     }
 }

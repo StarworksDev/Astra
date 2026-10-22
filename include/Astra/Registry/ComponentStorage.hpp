@@ -14,6 +14,7 @@
 #include "../Core/Base.hpp"
 #include "../Core/Tick.hpp"
 #include "../Entity/Entity.hpp"
+#include "../Serialization/SerializationError.hpp"
 #include "SparseSet.hpp"
 #include "UniversalColumn.hpp"
 
@@ -173,8 +174,10 @@ namespace Astra
 
         // Format v6 block (spec s8.2). Serialize is defined in ComponentStorageSerialization.hpp;
         // Deserialize out of line after class Registry (its body needs the complete Registry).
+        // On refusal it returns false and, when `error` is given, says why: UnknownComponent
+        // for an unregistered hash, CorruptedData (or the reader's own error) for malformed data.
         void Serialize(BinaryWriter& w) const;
-        bool Deserialize(BinaryReader& r, class Registry& registry);
+        bool Deserialize(BinaryReader& r, class Registry& registry, SerializationError* error = nullptr);
 
         // Lookup without creation. Read paths, which are const at the Registry, use this.
         ASTRA_NODISCARD UniversalColumn* FindUniversal(ComponentID id) const noexcept
