@@ -232,3 +232,266 @@ TEST(ComponentRegistryStoreRelease, AHookRemovedByAnEarlierHookIsNotCalled)
     EXPECT_EQ(victimCalls, 0) << "the second hook was removed during the first: never called with a dangling ctx";
     creg->RemoveStoreReleaseHook(ha);
 }
+
+// ---- Task 36: Registry tears its stores down at module unload (Review Focus 5) ----
+
+namespace
+{
+    bool g_pluginUnloaded = false;
+    int g_pluginDestructs = 0;
+    int g_postUnloadDestructs = 0;
+
+    // The plugin image's destructor for RelocationCanary. Once the plugin is
+    // "unloaded", a call here stands for a jump into unmapped code: it is counted
+    // and does nothing else.
+    void PluginCanaryDestruct(void* p)
+    {
+        if (g_pluginUnloaded)
+        {
+            ++g_postUnloadDestructs;
+            return;
+        }
+        ++g_pluginDestructs;
+        static_cast<RelocationCanary*>(p)->~RelocationCanary();
+    }
+
+    struct PluginInstall { uint32_t owner; Astra::ComponentID id; };
+
+    // Installs RelocationCanary as a plugin-owned type whose destructor is
+    // PluginCanaryDestruct: the in-process stand-in for a DLL's descriptors.
+    PluginInstall InstallPluginCanary(Astra::ComponentRegistry& creg, Astra::Storage storage)
+    {
+        static int s_pluginImage = 0;
+        g_pluginUnloaded = false;
+        g_pluginDestructs = 0;
+        g_postUnloadDestructs = 0;
+        const Astra::ComponentID id = Astra::TypeID<RelocationCanary>::Value();
+        Astra::ComponentDescriptor desc = Astra::ComponentRegistry::MakeDescriptor<RelocationCanary>(id, nullptr);
+        desc.storage = storage;
+        desc.destruct = &PluginCanaryDestruct;
+        desc.name = "PluginCanary";
+        const uint32_t owner = creg.OpenModuleId("CanaryPlugin");
+        EXPECT_EQ(creg.InstallOwned(id, owner, desc, &s_pluginImage), Astra::InstallResult::Installed);
+        return {owner, id};
+    }
+
+    bool AnyChunkHasBlock(Astra::Registry& reg, int slot)
+    {
+        for (Astra::Archetype* archetype : reg.GetArchetypeManager()->GetArchetypes())
+            for (const auto& chunk : archetype->GetChunks())
+                if (chunk && chunk->FindSparseBlock(static_cast<uint16_t>(slot)))
+                    return true;
+        return false;
+    }
+
+    enum class UnloadPath { ReleaseModule, RangePurge };
+
+    void RunSparsePluginUnload(UnloadPath path)
+    {
+        auto creg = std::make_shared<Astra::ComponentRegistry>();
+        creg->RegisterComponents<Position>();
+        const PluginInstall plugin = InstallPluginCanary(*creg, Astra::Storage::Sparse);
+        const int liveAtStart = RelocationCanary::s_live;
+
+        Astra::Registry reg(creg);
+        std::vector<Astra::Entity> holders;
+        for (int i = 0; i < 100; ++i)   // > 64: blocks span several words
+        {
+            const Astra::Entity e = reg.CreateEntity<Position>();
+            RelocationCanary v(i);
+            ASSERT_TRUE(reg.AddComponentByID(e, plugin.id, &v, sizeof(v)));
+            holders.push_back(e);
+        }
+        const Astra::Entity bystander = reg.CreateEntity<Position>();
+        const int slot = reg.GetComponentStorage()->SparseSlotOf(plugin.id);
+        ASSERT_GE(slot, 0);
+        ASSERT_TRUE(AnyChunkHasBlock(reg, slot));
+        ASSERT_EQ(reg.ValidateStorageInvariants(), "");
+
+        const int destructsBefore = g_pluginDestructs;   // set growth may already have relocated elements
+        if (path == UnloadPath::ReleaseModule)
+            (void)creg->ReleaseModule(plugin.owner);    // what the plugin's ComponentModule::Reset() runs
+        else
+            EXPECT_EQ(creg->UnregisterModuleRange(reinterpret_cast<const void*>(reinterpret_cast<uintptr_t>(&PluginCanaryDestruct)), 1), 1u);
+        g_pluginUnloaded = true;                        // the image is gone from here on
+
+        EXPECT_EQ(g_pluginDestructs - destructsBefore, 100) << "every element destroyed at unload, through the still-mapped destructor";
+        EXPECT_EQ(RelocationCanary::s_live, liveAtStart);
+        EXPECT_EQ(creg->GetComponentDescriptor(plugin.id), nullptr);
+        EXPECT_EQ(reg.GetComponentStorage()->SparseSlotOf(plugin.id), -1);
+        EXPECT_FALSE(AnyChunkHasBlock(reg, slot)) << "no presence block may survive for the released slot";
+        EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+
+        reg.DestroyEntities(holders);
+        reg.DestroyEntity(bystander);
+        EXPECT_EQ(g_postUnloadDestructs, 0) << "destroying the former holders must not reach the unloaded destructor";
+        EXPECT_EQ(reg.Size(), 0u);
+        EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+    }
+}
+
+// Review Focus 5 (PINNED): unload a plugin module whose Sparse component is still
+// held by live entities, then destroy those entities. No destructor may be
+// reached through the unloaded descriptor, and no presence block may be left
+// for the released slot. Both unload paths: the RAII ComponentModule::Reset()
+// route (ReleaseModule) and the UnregisterModuleRange safety valve.
+TEST(StorageModuleUnload, UnloadingAPluginSparseComponentHeldByLiveEntitiesLeavesNoDanglingDestructorOrBlock)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    RunSparsePluginUnload(UnloadPath::ReleaseModule);
+}
+
+TEST(StorageModuleUnload, RangePurgeOfAPluginSparseComponentLeavesNoDanglingDestructorOrBlock)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    RunSparsePluginUnload(UnloadPath::RangePurge);
+}
+
+// Order pin (Task 35 review): the chunk presence blocks are released before any
+// AcquireSparseSlot can run again. A new Sparse type that reuses the freed slot
+// must not inherit the former holders' presence bits.
+TEST(StorageModuleUnload, AReusedSparseSlotNeverAliasesTheUnloadedTypesPresenceBits)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponents<Position>();
+    const PluginInstall plugin = InstallPluginCanary(*creg, Astra::Storage::Sparse);
+
+    Astra::Registry reg(creg);
+    std::vector<Astra::Entity> holders;
+    for (int i = 0; i < 70; ++i)
+    {
+        const Astra::Entity e = reg.CreateEntity<Position>();
+        RelocationCanary v(i);
+        ASSERT_TRUE(reg.AddComponentByID(e, plugin.id, &v, sizeof(v)));
+        holders.push_back(e);
+    }
+    const int slot = reg.GetComponentStorage()->SparseSlotOf(plugin.id);
+    ASSERT_GE(slot, 0);
+
+    (void)creg->ReleaseModule(plugin.owner);
+    g_pluginUnloaded = true;
+
+    const Astra::ComponentID nameId = Astra::TestSupport::InstallWithStorage<Name>(*creg, Astra::Storage::Sparse);
+    const Astra::Entity fresh = reg.CreateEntity<Position>();    // same archetype, same chunk as the holders
+    Name n;
+    ASSERT_TRUE(reg.AddComponentByID(fresh, nameId, &n, sizeof(n)));
+    EXPECT_EQ(reg.GetComponentStorage()->SparseSlotOf(nameId), slot) << "the freed slot is the lowest free one: reused";
+
+    const Astra::SparseSet* nameSet = reg.GetComponentStorage()->FindSparse(nameId);
+    ASSERT_NE(nameSet, nullptr);
+    for (const Astra::Entity e : holders)
+        EXPECT_FALSE(nameSet->Contains(e)) << "stale presence bits would alias the new type";
+    EXPECT_TRUE(nameSet->Contains(fresh));
+    EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+    reg.DestroyEntities(holders);
+    EXPECT_EQ(g_postUnloadDestructs, 0);
+    EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+}
+
+TEST(StorageModuleUnload, UnloadingAPluginUniversalComponentDestroysItsColumn)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponents<Position>();
+    const PluginInstall plugin = InstallPluginCanary(*creg, Astra::Storage::Table);   // universal by Config
+    Astra::Registry::Config cfg;
+    cfg.AddUniversal<RelocationCanary>();
+    {
+        Astra::Registry reg(creg, cfg);
+        std::vector<Astra::Entity> es;
+        for (int i = 0; i < 10; ++i) es.push_back(reg.CreateEntity<Position>());
+
+        const int destructsBefore = g_pluginDestructs;
+        (void)creg->ReleaseModule(plugin.owner);
+        g_pluginUnloaded = true;
+        EXPECT_EQ(g_pluginDestructs - destructsBefore, 10);
+
+        reg.DestroyEntities(es);
+        EXPECT_EQ(g_postUnloadDestructs, 0);
+    }   // registry teardown: no store is left holding the plugin's descriptor
+    EXPECT_EQ(g_postUnloadDestructs, 0);
+}
+
+// RULINGS Task 36 (PINNED): the suspended-Universal state (spec s4.4). After the
+// column is dropped "always present" is suspended for that type: typed
+// Has/Get answer absent, typed Add/Emplace answer false (an add never revives a
+// slot, never creates a column and emits nothing), views never visit the
+// entity, and nothing reads an unconstructed slot. Entities created after the
+// type is registered again get a rebuilt column; entities that predate the
+// unload stay without a value.
+TEST(StorageModuleUnload, ASuspendedUniversalAnswersAbsentThroughTheTypedApiAndViews)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponents<Position>();
+    const PluginInstall plugin = InstallPluginCanary(*creg, Astra::Storage::Table);
+    Astra::Registry::Config cfg;
+    cfg.AddUniversal<RelocationCanary>();
+    Astra::Registry reg(creg, cfg);
+    std::vector<Astra::Entity> old;
+    for (int i = 0; i < 5; ++i) old.push_back(reg.CreateEntity<Position>());
+    ASSERT_TRUE(reg.HasComponent<RelocationCanary>(old[0])) << "live before unload";
+    EXPECT_EQ(reg.CreateView<RelocationCanary>().Size(), 5u);
+
+    (void)creg->ReleaseModule(plugin.owner);
+    g_pluginUnloaded = true;
+
+    const Astra::ComponentID id = plugin.id;
+    ASSERT_EQ(reg.GetComponentStorage()->FindUniversal(id), nullptr);
+    for (const Astra::Entity e : old)
+    {
+        EXPECT_FALSE(reg.HasComponent<RelocationCanary>(e));
+        EXPECT_EQ(reg.GetComponent<RelocationCanary>(e), nullptr);
+        EXPECT_EQ(std::as_const(reg).GetComponent<RelocationCanary>(e), nullptr);
+        EXPECT_FALSE(reg.AddComponent(e, RelocationCanary(1))) << "an add never revives a suspended slot";
+        EXPECT_FALSE(reg.EmplaceComponent<RelocationCanary>(e, 2));
+    }
+    EXPECT_EQ(reg.GetComponentStorage()->FindUniversal(id), nullptr) << "no read or add path creates a column";
+    int visited = 0;
+    reg.CreateView<RelocationCanary>().ForEach([&](Astra::Entity, RelocationCanary&) { ++visited; });
+    reg.CreateView<Position, RelocationCanary>().ForEach([&](Astra::Entity, Position&, RelocationCanary&) { ++visited; });
+    EXPECT_EQ(visited, 0);
+    EXPECT_EQ(reg.CreateView<RelocationCanary>().Size(), 0u);
+    EXPECT_FALSE(reg.CreateView<RelocationCanary>().Contains(old[0]));
+    const Astra::Entity whileSuspended = reg.CreateEntity<Position>();   // descriptor gone: nothing to construct
+    EXPECT_FALSE(reg.HasComponent<RelocationCanary>(whileSuspended));
+    EXPECT_EQ(g_postUnloadDestructs, 0);
+    EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+
+    // The type is registered again (a reloaded module): a later create rebuilds the column.
+    (void)InstallPluginCanary(*creg, Astra::Storage::Table);
+    const Astra::Entity reborn = reg.CreateEntity<Position>();
+    EXPECT_TRUE(reg.HasComponent<RelocationCanary>(reborn));
+    EXPECT_NE(reg.GetComponentStorage()->FindUniversal(id), nullptr);
+    EXPECT_FALSE(reg.HasComponent<RelocationCanary>(old[0])) << "predating entities are not retro-filled";
+    EXPECT_FALSE(reg.HasComponent<RelocationCanary>(whileSuspended));
+    // Per-entity answers stay exact while the column is partially live. (Size() on a
+    // partially-live Universal is chunk-granular and not part of this pin.)
+    int rebuiltVisits = 0;
+    reg.CreateView<RelocationCanary>().ForEach([&](Astra::Entity e, RelocationCanary&) { EXPECT_EQ(e, reborn); ++rebuiltVisits; });
+    EXPECT_EQ(rebuiltVisits, 1);
+    EXPECT_TRUE(reg.CreateView<RelocationCanary>().Contains(reborn));
+    EXPECT_FALSE(reg.CreateView<RelocationCanary>().Contains(old[0]));
+    reg.DestroyEntities(old);
+    EXPECT_EQ(g_postUnloadDestructs, 0);
+    EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+}
+
+TEST(StorageModuleUnload, EveryRegistrySubscribesForItsLifetimeIncludingLoadedOnes)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponents<Position>();
+    EXPECT_EQ(creg->StoreReleaseHookCount(), 0u);
+    {
+        Astra::Registry reg(creg);
+        EXPECT_EQ(creg->StoreReleaseHookCount(), 1u);
+        auto saved = reg.Save();
+        ASSERT_TRUE(saved.IsOk());
+        auto loaded = Astra::Registry::Load(*saved.GetValue(), creg);
+        ASSERT_TRUE(loaded.IsOk());
+        EXPECT_EQ(creg->StoreReleaseHookCount(), 2u);
+    }
+    EXPECT_EQ(creg->StoreReleaseHookCount(), 0u) << "a destroyed Registry must never be called back";
+}

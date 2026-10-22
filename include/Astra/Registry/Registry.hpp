@@ -105,6 +105,7 @@ namespace Astra
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
             m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            InstallStoreReleaseHook();
         }
 
         Registry(const EntityManager::Config& entityConfig, const ArchetypeChunkPool::Config& chunkConfig) :
@@ -120,6 +121,7 @@ namespace Astra
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
             m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            InstallStoreReleaseHook();
         }
 
         Registry(std::shared_ptr<ComponentRegistry> componentRegistry, const Config& config = {}) :
@@ -135,6 +137,7 @@ namespace Astra
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
             m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            InstallStoreReleaseHook();
         }
 
         // A Registry is a heavy, stateful container: copying is not supported (the old
@@ -144,7 +147,12 @@ namespace Astra
         Registry(const Registry&) = delete;
         Registry& operator=(const Registry&) = delete;
 
-        ~Registry() = default;
+        ~Registry()
+        {
+            // Unsubscribe before any member (the stores included) is destroyed.
+            if (m_componentRegistry && m_storeReleaseHook != 0)
+                m_componentRegistry->RemoveStoreReleaseHook(m_storeReleaseHook);
+        }
         
         template<Component... Components>
         Entity CreateEntity()
@@ -395,7 +403,7 @@ namespace Astra
             if (!m_entityManager.IsValid(entity))
                 return false;
             if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
-                return true;   // always present: today's present-component rule, no signal (s3.3, s12.2)
+                return UniversalAddAnswer(entity, TypeID<T>::Value());   // always present: today's present-component rule, no signal (s3.3, s12.2)
 
             if constexpr (StorageOfV<T> == Storage::Sparse)
             {
@@ -441,7 +449,7 @@ namespace Astra
             if (!m_entityManager.IsValid(entity))
                 return false;
             if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
-                return true;   // always present: see AddComponent
+                return UniversalAddAnswer(entity, TypeID<T>::Value());   // always present: see AddComponent
 
             if constexpr (StorageOfV<T> == Storage::Sparse)
             {
@@ -3124,6 +3132,68 @@ namespace Astra
             Detail::SetLoadedDisabled(*static_cast<Registry*>(ctx)->m_componentStorage, id, e);
         }
 
+        // A typed add of a Universal id is a present-component no-op: true, no signal, no
+        // store write. It stays truthful after a module unload (spec s4.4): once the column
+        // is dropped "always present" is SUSPENDED for the type, an entity whose slot is not
+        // live does not hold it, and an add must neither lie (true) nor revive the slot, so
+        // it answers false. Columns are rebuilt only by creating an entity once the type is
+        // registered again; entities that predate the unload are not retro-filled.
+        ASTRA_NODISCARD bool UniversalAddAnswer(Entity entity, ComponentID id) const noexcept
+        {
+            return StoreLookup(entity, id) != nullptr;
+        }
+
+        // s4.4: every Registry, including one built by Load, which goes through
+        // these constructors, subscribes once to its ComponentRegistry's
+        // store-release hooks. Registry is non-copyable and non-movable, so `this`
+        // stays valid for the subscription's whole life.
+        void InstallStoreReleaseHook()
+        {
+            if (m_componentRegistry)
+                m_storeReleaseHook = m_componentRegistry->AddStoreReleaseHook(this, &Registry::OnStoreRelease);
+        }
+
+        static void OnStoreRelease(void* ctx, ComponentID id, const ComponentDescriptor& departing)
+        {
+            static_cast<Registry*>(ctx)->ReleaseStoredComponent(id, departing);
+        }
+
+        // A module entry is departing (spec s4.4, R4). If this registry's store for
+        // `id` was built from that entry's descriptor, matched by its destructor
+        // (the code that is about to be unmapped), then:
+        //   1. destroy every element and drop the store, freeing the slot;
+        //   2. release the slot's presence block in every chunk, BEFORE anything can
+        //      acquire the slot again, so no block outlives its slot (P1 holds for the
+        //      former holders and a reused slot starts clean).
+        // A store built from a different module's entry (a shadowed or overriding
+        // registration) is left alone. Runs host-serialized, like registration, on the
+        // registry's own context.
+        // Edge: the stores are probed by id, NOT through KindOf. KindOf reads the LIVE
+        // descriptor, so a purged shadowed Sparse entry whose live override says Table
+        // would otherwise be skipped and keep a dangling destructor.
+        // Universal: its spec stays declared, so the type is SUSPENDED afterwards (see
+        // UniversalAddAnswer; Has/Get answer absent, views skip it via the live bit).
+        void ReleaseStoredComponent(ComponentID id, const ComponentDescriptor& departing)
+        {
+            ComponentStorage& storage = *m_componentStorage;
+            bool holdsDeparting = false;
+            if (const SparseSet* set = storage.FindSparse(id))          // never create a store here
+                holdsDeparting = set->Descriptor().destruct == departing.destruct;
+            else if (const UniversalColumn* column = storage.FindUniversal(id))
+                holdsDeparting = column->Descriptor().destruct == departing.destruct;
+            if (!holdsDeparting)
+                return;
+
+            const int slot = storage.SparseSlotOf(id);   // Sparse, or an enableable Universal's mirror slot
+            storage.ReleaseComponent(id);
+            if (slot < 0)
+                return;
+            m_archetypeManager->BumpSparseStructuralCounter();   // membership changed for every former holder
+            for (Archetype* archetype : m_archetypeManager->GetArchetypes())
+                for (const auto& chunk : archetype->GetChunks())
+                    if (chunk) chunk->ReleaseSparseBlock(static_cast<uint16_t>(slot));
+        }
+
         // Post-load storage fix-ups (spec s8.2/s8.3), run once the checksum verifies.
         // The staged Table-now columns land first (one batched move per (source,
         // destination) pair), so universals and presence see the final archetypes.
@@ -3237,6 +3307,7 @@ namespace Astra
         std::shared_ptr<IWorkScheduler> m_workScheduler;  // null = sequential inline fallback
         Config m_config;   // retained so Clear()/Load() preserve pool + storage policy
         inline static std::atomic<std::uint64_t> s_nextInstanceId{1};   // 0 is never assigned
+        uint64_t m_storeReleaseHook = 0;   // ComponentRegistry store-release subscription (s4.4)
         std::uint64_t m_instanceId;   // last member: initialized last in every ctor
     };
 

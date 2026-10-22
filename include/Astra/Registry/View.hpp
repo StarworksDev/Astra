@@ -115,6 +115,12 @@ namespace Astra
             std::declval<RequiredTypes>(), std::declval<WithTypes>()))>;
         using SparseExcludedTypes = Detail::FilterSparseTrait_t<ExcludedTypes>;
 
+        // Every required (+ IncludeDisabled) and With<> type, whatever its trait: a type of
+        // ANY trait can be declared Universal by the registry's Config, which is known only
+        // at run time. A suspended Universal (spec s4.4) must fail these terms.
+        using NamedRequiredTypes = decltype(std::tuple_cat(
+            std::declval<RequiredTypes>(), std::declval<WithTypes>()));
+
         // Parallel execution thresholds - based on empirical testing
         static constexpr size_t AVG_ENTITIES_PER_CHUNK = 256;                           // Typical for 16KB chunks with ~50 byte entities
         static constexpr size_t MIN_CHUNKS_PER_THREAD = 4;                              // Each thread should process at least 4 chunks (64KB)
@@ -481,11 +487,13 @@ namespace Astra
             EnsureArchetypes();
 
             size_t total = 0;
-            if constexpr (!HasRequiredFilter && !HasSparseArg)
+            if (!HasRequiredFilter && !UsesStoragePath())
             {
                 // No required enableable filter: entity count is unaffected by
                 // disabled bits (optional filtering never removes entities), so
-                // this is the pre-existing sum (invariant 1).
+                // this is the pre-existing sum (invariant 1). A view naming a Universal
+                // type is on the storage path: a suspended Universal (spec s4.4) holds
+                // for no entity, so the plain entity count would overcount.
                 for (Archetype* archetype : m_archetypes)
                 {
                     total += archetype->GetEntityCount();
@@ -1731,7 +1739,7 @@ namespace Astra
         bool RequirePresent(ArchetypeChunk* chunk, size_t count, ChunkFilter& f) const
         {
             if (m_kinds[PlanIndex<T>] == StorageKind::Universal)
-                return true;                                   // declared Universal here: always present
+                return m_stores[PlanIndex<T>].universal != nullptr;   // no column == suspended (spec s4.4): no entity holds it
             const StoreRef& s = m_stores[PlanIndex<T>];
             if (s.slot < 0)
                 return false;
@@ -1859,14 +1867,14 @@ namespace Astra
         }
 
         // Per-entity membership of one named type, any kind: the archetype mask (Table),
-        // always (Universal: a live entity holds every universal), the set (Sparse).
+        // the live column slot (Universal: always present until its module unloads), the set (Sparse).
         template<typename T>
         ASTRA_NODISCARD bool EntityHolds(const EntityRecord* rec, Entity e, const StoreArray& st) const
         {
             switch (m_kinds[PlanIndex<T>])
             {
             case StorageKind::Table:     return rec->archetype->GetMask().Test(TypeID<std::remove_const_t<T>>::Value());
-            case StorageKind::Universal: return true;
+            case StorageKind::Universal: return st[PlanIndex<T>].universal && st[PlanIndex<T>].universal->Get(e);   // live slot (suspended after a module unload, spec s4.4)
             case StorageKind::Sparse:
             {
                 const StoreRef& s = st[PlanIndex<T>];
@@ -1967,6 +1975,16 @@ namespace Astra
         ASTRA_NODISCARD bool EntityPasses(const EntityRecord* rec, Entity e, const StoreArray& st, [[maybe_unused]] Tick since) const
         {
             bool ok = true;
+            if (m_anyUniversal) ASTRA_UNLIKELY
+            {
+                // A Universal term holds only for an entity whose column slot is live
+                // (a suspended Universal after a module unload holds for none, spec s4.4).
+                [&]<typename... Ts>(std::tuple<Ts...>*)
+                {
+                    ((ok = ok && (m_kinds[PlanIndex<std::remove_const_t<Ts>>] != StorageKind::Universal
+                                  || EntityHolds<std::remove_const_t<Ts>>(rec, e, st))), ...);
+                }(static_cast<NamedRequiredTypes*>(nullptr));
+            }
             [&]<typename... Ts>(std::tuple<Ts...>*)
             {
                 ((ok = ok && EntityHolds<std::remove_const_t<Ts>>(rec, e, st)), ...);
@@ -2173,6 +2191,16 @@ namespace Astra
         {
             [[maybe_unused]] const ArchetypeColumnMeta& cm = archetype->GetColumnMeta();
             bool pass = true;
+            if (m_anyUniversal) ASTRA_UNLIKELY
+            {
+                // A declared Universal with no column (suspended after a module unload):
+                // no entity of any chunk holds it.
+                [&]<typename... Ts>(std::tuple<Ts...>*)
+                {
+                    ((pass = pass && (m_kinds[PlanIndex<std::remove_const_t<Ts>>] != StorageKind::Universal
+                                      || m_stores[PlanIndex<std::remove_const_t<Ts>>].universal != nullptr)), ...);
+                }(static_cast<NamedRequiredTypes*>(nullptr));
+            }
             [&]<typename... Ts>(std::tuple<Ts...>*)
             {
                 ((pass = pass && RequirePresent<std::remove_const_t<Ts>>(chunk, count, f)), ...);
