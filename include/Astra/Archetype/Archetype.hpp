@@ -1355,13 +1355,13 @@ namespace Astra
                         sub.SetChecksumEnabled(false);
                         colResult = DeserializeColumn(sub, chunk, archetype.get(), desc,
                                                       static_cast<size_t>(chunkEntityCount),
-                                                      column.hasDisabledSection);
+                                                      column.diskSize > 0, column.hasDisabledSection);
                     }
                     else
                     {
                         colResult = DeserializeColumn(reader, chunk, archetype.get(), desc,
                                                       static_cast<size_t>(chunkEntityCount),
-                                                      column.hasDisabledSection);
+                                                      column.diskSize > 0, column.hasDisabledSection);
                     }
                     if (colResult.IsErr())
                         return colResult;
@@ -1705,14 +1705,15 @@ namespace Astra
         // verbatim from Deserialize()'s per-column loop body (Task 2 of the LZ4
         // per-column compression plan, NO behavior change) so Task 3's
         // compressed-column path can reuse it. Called iff the ARCHIVE holds a block
-        // for desc (desc.size != 0 || hasDisabledSection). For a tag that block is zero
-        // data bytes plus the section; when THIS build has no column for the tag (not
+        // for desc (diskHasData || hasDisabledSection, the archive's own flags). For a tag that
+        // block is zero data bytes plus the section; diskHasData (ArchivedColumn::diskSize > 0)
+        // gates the value loop; when THIS build has no column for the tag (not
         // enableable here) the section is consumed, validated and dropped below.
         // hasDisabledSection is the per-descriptor
         // disk flag (ArchivedColumn::hasDisabledSection, IM-9), not this build's
         // desc.isEnableable. Static (like Deserialize itself): archetype is
         // passed explicitly rather than accessed via `this`.
-        static Result<std::unique_ptr<Archetype>, SerializationError> DeserializeColumn(BinaryReader& r, ArchetypeChunk* chunk, Archetype* archetype, const ComponentDescriptor& desc, size_t chunkEntityCount, bool hasDisabledSection)
+        static Result<std::unique_ptr<Archetype>, SerializationError> DeserializeColumn(BinaryReader& r, ArchetypeChunk* chunk, Archetype* archetype, const ComponentDescriptor& desc, size_t chunkEntityCount, bool diskHasData, bool hasDisabledSection)
         {
             using ResultType = Result<std::unique_ptr<Archetype>, SerializationError>;
 
@@ -1726,8 +1727,10 @@ namespace Astra
             // silently read zero bytes for chunkEntityCount elements -> stream desync.
             ASTRA_ASSERT(desc.deserializeVersioned || desc.deserialize,
                 "DeserializeColumn: component descriptor has no deserialize hook");
-            // desc.size == 0: a tag's block carries no data (bit-only column) -- read nothing.
-            if (desc.size != 0 && (desc.deserializeVersioned || desc.deserialize))
+            // !diskHasData: the ARCHIVE's block carries no values (a tag's bit-only column) --
+            // read none, whatever this build's descriptor says. A tag archived as enableable
+            // and loaded as a data type keeps AddEntity's default-constructed values.
+            if (diskHasData && desc.size != 0 && (desc.deserializeVersioned || desc.deserialize))
             {
                 // For custom deserialization, components are not compressed
                 // as they were serialized individually

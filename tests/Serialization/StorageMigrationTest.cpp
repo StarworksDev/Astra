@@ -257,7 +257,10 @@ TEST(StorageMigration, FormatV5ArchivesLoadIntoUniversalSparseAndTableRegistries
             Astra::Registry& out = **loaded.GetValue();
             EXPECT_EQ(inits, kEntities / 2);
             for (int i = 0; i < kEntities; i += 2)
+            {
+                ASSERT_NE(out.GetComponent<Name>(world.entities[i]), nullptr);
                 EXPECT_EQ(out.GetComponent<Name>(world.entities[i])->value, LongName(i));
+            }
             EXPECT_EQ(out.ValidateStorageInvariants(), "");
         }
         {   // Name Sparse
@@ -314,12 +317,13 @@ namespace
     // descriptor (size 0, no decode hooks): a tag stand-in carrying Name's hash.
     // `nm` must outlive `creg` (the descriptor keeps a pointer to it).
     Astra::ComponentID InstallNameStandIn(Astra::ComponentRegistry& creg, const std::string& nm,
-                                          Astra::Storage storage, bool asTag)
+                                          Astra::Storage storage, bool asTag, bool enableable = false)
     {
         static int s_image = 0;
         const Astra::ComponentID nameId = Astra::TypeID<Name>::Value();
         Astra::ComponentDescriptor desc = Astra::ComponentRegistry::MakeDescriptor<Name>(nameId, nullptr);
         desc.storage = storage;
+        desc.isEnableable = enableable;
         if (asTag)
         {
             desc.size = 0;
@@ -375,6 +379,51 @@ TEST(StorageMigration, ArchivedTableColumnForAnEmptyTableTypeIsRefused)
         auto loaded = Astra::Registry::Load(bytes, creg);
         ASSERT_TRUE(loaded.IsErr());
         EXPECT_EQ(*loaded.GetError(), Astra::SerializationError::CorruptedData);
+    }
+}
+
+// IM-9, the other direction: the archive holds Name as an ENABLEABLE TAG (no values, a
+// disabled-bit section); this build's Name is a data Table type. The column must be
+// consumed as bits only (no value decode over the section's bytes), the values stay
+// default-constructed and the disabled bits survive.
+TEST(StorageMigration, ArchivedEnableableTagLoadsAsADataTableTypeWithDefaultValues)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    const std::string nm(Astra::TypeID<Name>::Name());
+    std::vector<Astra::Entity> entities;
+    for (const auto mode : {Astra::CompressionMode::None, Astra::CompressionMode::LZ4})
+    {
+        entities.clear();
+        std::vector<std::byte> bytes;
+        {
+            auto creg = std::make_shared<Astra::ComponentRegistry>();
+            creg->RegisterComponents<Position>();
+            const Astra::ComponentID nameId = InstallNameStandIn(*creg, nm, Astra::Storage::Table, true, true);
+            Astra::Registry reg(creg);
+            for (int i = 0; i < kEntities; ++i)
+            {
+                const Astra::Entity e = reg.CreateEntity<Position>();
+                ASSERT_TRUE(reg.AddComponentByID(e, nameId, nullptr, 0));
+                if (i % 3 == 0) ASSERT_TRUE(reg.SetEnabledByID(e, nameId, false));
+                entities.push_back(e);
+            }
+            bytes = SaveWith(reg, mode);
+        }
+        auto creg = std::make_shared<Astra::ComponentRegistry>();
+        creg->RegisterComponents<Position>();
+        // A data type that is enableable here, so the surviving bits are observable.
+        const Astra::ComponentID nameId = InstallNameStandIn(*creg, nm, Astra::Storage::Table, false, true);
+        auto loaded = Astra::Registry::Load(bytes, creg);
+        ASSERT_TRUE(loaded.IsOk()) << "error " << static_cast<int>(*loaded.GetError());
+        Astra::Registry& out = **loaded.GetValue();
+        for (int i = 0; i < kEntities; ++i)
+        {
+            const Name* n = NameByHash(out, entities[i]);
+            ASSERT_NE(n, nullptr);
+            EXPECT_EQ(n->value, "");
+            EXPECT_EQ(out.IsEnabledByID(entities[i], nameId), i % 3 != 0);
+        }
+        EXPECT_EQ(out.ValidateStorageInvariants(), "");
     }
 }
 
