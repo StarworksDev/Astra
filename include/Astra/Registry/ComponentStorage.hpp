@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
 #include <cstdint>
@@ -305,6 +306,41 @@ namespace Astra
                     column->Clear();
             for (ComponentID id : m_sparseIds)
                 m_sparseSets[id]->Clear();   // the set and its slot survive (spec s7.3)
+        }
+
+        // Module unload (spec s4.4): destroy every element of `id` while the
+        // departing module's code is still mapped, drop the SparseSet /
+        // UniversalColumn (their by-value descriptors point into that module) and
+        // free its sparse slot for reuse. The chunk presence blocks for the slot
+        // belong to the archetypes: Registry::ReleaseStoredComponent frees them.
+        // A later Sparse()/Universal() for `id` builds a fresh store from whatever
+        // descriptor is registered then (a reloaded module's).
+        void ReleaseComponent(ComponentID id)
+        {
+            if (id >= MAX_COMPONENTS)
+                return;
+            if (auto& set = m_sparseSets[id])
+            {
+                set->Clear();
+                set.reset();
+                std::erase(m_sparseIds, id);   // all-sets loops skip it now
+                --m_storeCount;
+            }
+            if (auto& column = m_universalColumns[id])
+            {
+                column->Clear();
+                column.reset();
+                --m_storeCount;
+            }
+            m_coarseVersion[id] = Tick{0};     // a reloaded type starts with no history
+            const int slot = SparseSlotOf(id);
+            if (slot >= 0)
+            {
+                // Slot-free rule: reset BOTH table entries, then the count.
+                m_componentOfSlot[static_cast<size_t>(slot)] = INVALID_COMPONENT;
+                m_slotOf[id] = -1;
+                --m_usedSlots;
+            }
         }
 
         // Coarse change version per UNTRACKED Sparse component (spec s3.3): the analogue
