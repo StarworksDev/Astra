@@ -3053,7 +3053,8 @@ namespace Astra
             // rebuilt, so re-point them; a stale pointer would be a use-after-free.
             registry->m_componentStorage->SetTickSource(registry->m_archetypeManager->TickSource());
             registry->m_archetypeManager->SetComponentStorage(registry->m_componentStorage.get());
-            if (!registry->m_archetypeManager->Deserialize(reader))
+            const StorageLoadHooks hooks{registry.get(), &LoadHookIsDiverted, &LoadHookAcquire, &LoadHookSetDisabled};
+            if (!registry->m_archetypeManager->Deserialize(reader, &hooks))
             {
                 return Result<std::unique_ptr<Registry>, SerializationError>::Err(SerializationError::CorruptedData);
             }
@@ -3103,6 +3104,26 @@ namespace Astra
             return Result<std::unique_ptr<Registry>, SerializationError>::Ok(std::move(registry));
         }
         
+        // StorageLoadHooks for LoadInternal (s8.3). ctx is the registry being
+        // loaded; its EntityManager is already restored, so entity ids from the
+        // archive are validated before any store is touched. The hooks read
+        // m_componentStorage at call time, so they always reach the current store.
+        static bool LoadHookIsDiverted(void* ctx, ComponentID id)
+        {
+            return static_cast<Registry*>(ctx)->m_componentStorage->KindOf(id) != StorageKind::Table;
+        }
+        static void* LoadHookAcquire(void* ctx, const ComponentDescriptor& desc, Entity e)
+        {
+            auto* self = static_cast<Registry*>(ctx);
+            if (!self->IsValid(e))
+                return nullptr;
+            return Detail::AcquireLoadTarget(*self->m_componentStorage, desc, e);
+        }
+        static void LoadHookSetDisabled(void* ctx, ComponentID id, Entity e)
+        {
+            Detail::SetLoadedDisabled(*static_cast<Registry*>(ctx)->m_componentStorage, id, e);
+        }
+
         // Post-load storage fix-ups (spec s8.2/s8.3), run once the checksum verifies.
         // Task 34 prepends ApplyMigratedTableComponents.
         bool FinishStorageLoad()
@@ -3266,41 +3287,21 @@ namespace Astra
                     return false;
             }
 
-            const bool tableNow = storage.KindOf(desc.id) == StorageKind::Table;
-            if (hasValues)
+            const bool hasDisabled = (flags & StorageFormat::FLAG_HAS_DISABLED) != 0;
+            if (storage.KindOf(desc.id) == StorageKind::Table)
             {
-                if (tableNow)
-                {
-                    if (!DiscardStoredValues(r, desc, count))
-                        return false;
-                }
-                else
-                {
-                    for (const Entity e : entities)
-                    {
-                        void* target = AcquireLoadTarget(storage, desc, e);
-                        if (!target || !desc.deserializeVersioned(r, target))
-                            return false;
-                    }
-                }
-            }
-            else if (!tableNow)
-            {
-                for (const Entity e : entities)
-                    if (!AcquireLoadTarget(storage, desc, e))
-                        return false;
-            }
-
-            if (flags & StorageFormat::FLAG_HAS_DISABLED)
-            {
-                std::vector<uint8_t> disabled;
-                if (!StorageFormat::ReadDisabledBitmap(r, entities.size(), disabled))
+                // Sparse/Universal in the archive, Table here: decode-and-discard until
+                // Task 34 stages the values (the bitmap is validated and dropped, IM-9).
+                if (hasValues && !DiscardStoredValues(r, desc, count))
                     return false;
-                if (desc.isEnableable && !tableNow)   // else: consumed, validated, dropped (IM-9)
-                    for (size_t i = 0; i < entities.size(); ++i)
-                        if (disabled[i]) SetLoadedDisabled(storage, desc.id, entities[i]);
+                std::vector<uint8_t> disabled;
+                if (hasDisabled && !StorageFormat::ReadDisabledBitmap(r, entities.size(), disabled))
+                    return false;
+                return !r.HasError();
             }
-            return !r.HasError();
+            return StorageFormat::ReadElementRun(r, entities.size(), desc, hasValues, hasDisabled,
+                [&](size_t i) { return AcquireLoadTarget(storage, desc, entities[i]); },
+                [&](size_t i) { SetLoadedDisabled(storage, desc.id, entities[i]); });
         }
     }
 

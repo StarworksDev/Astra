@@ -6,6 +6,8 @@
 #include <cstdint>
 #include <vector>
 
+#include "../Component/Component.hpp"
+#include "../Entity/Entity.hpp"
 #include "BinaryReader.hpp"
 #include "BinaryWriter.hpp"
 
@@ -74,4 +76,59 @@ namespace Astra::StorageFormat
         }
         return popcount == diskCount;
     }
+
+    // The shared "values, then the disabled bitmap" body of every reader that loads an
+    // element run into a store (spec s8.2/s8.3): the v6 block reader and the diverted
+    // Table-in-archive column. `acquire(i)` returns the constructed element to
+    // deserialize over for the i-th entity (a sentinel for a tag; nullptr refuses) and
+    // is called for every element, values or not; `setDisabled(i)` runs for each set bit
+    // iff the loading type is enableable (otherwise the bitmap is validated and dropped,
+    // IM-9). `hasValues`/`hasDisabled` are what the ARCHIVE carries, never this build's
+    // descriptor: values this build's type cannot decode (a tag here) are refused.
+    template<typename Acquire, typename SetDisabled>
+    ASTRA_NODISCARD bool ReadElementRun(BinaryReader& r, size_t count, const ComponentDescriptor& desc,
+                                        bool hasValues, bool hasDisabled,
+                                        Acquire&& acquire, SetDisabled&& setDisabled)
+    {
+        if (hasValues && (desc.size == 0 || !desc.deserializeVersioned))
+            return false;
+        for (size_t i = 0; i < count; ++i)
+        {
+            void* target = acquire(i);
+            if (!target)
+                return false;
+            if (hasValues && !desc.deserializeVersioned(r, target))
+                return false;
+        }
+        if (hasDisabled)
+        {
+            std::vector<uint8_t> disabled;
+            if (!ReadDisabledBitmap(r, count, disabled))
+                return false;
+            if (desc.isEnableable)
+                for (size_t i = 0; i < count; ++i)
+                    if (disabled[i]) setDisabled(i);
+        }
+        return !r.HasError();
+    }
+}
+
+namespace Astra
+{
+    // Load-time diversion seam (spec s8.3). Archetype::Deserialize meets columns of
+    // components the LOADING registry does not keep in tables and hands their
+    // values to ComponentStorage through these callbacks (Archetype cannot see
+    // Registry or ComponentStorage). Null hooks mean no diversion: every caller
+    // that deserializes archetypes outside Registry::Load is unchanged.
+    struct StorageLoadHooks
+    {
+        void* ctx = nullptr;
+        bool  (*isDiverted)(void* ctx, ComponentID id) = nullptr;
+        // Constructed element to deserialize over (EmptyComponentSentinel() for a
+        // tag); nullptr refuses the load.
+        void* (*acquire)(void* ctx, const ComponentDescriptor& desc, Entity e) = nullptr;
+        void  (*setDisabled)(void* ctx, ComponentID id, Entity e) = nullptr;
+
+        ASTRA_NODISCARD bool IsDiverted(ComponentID id) const { return isDiverted && isDiverted(ctx, id); }
+    };
 }

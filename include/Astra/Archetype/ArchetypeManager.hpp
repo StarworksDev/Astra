@@ -960,7 +960,7 @@ namespace Astra
             }
         }
 
-        bool Deserialize(BinaryReader& reader)
+        bool Deserialize(BinaryReader& reader, const StorageLoadHooks* hooks = nullptr)
         {
             // Clear existing archetypes (except root)
             while (m_archetypes.size() > 1)
@@ -1040,6 +1040,12 @@ namespace Astra
             // exactly (root stays empty, same as when it was written), instead of
             // misreading the first non-root record's bytes as a root record.
             const uint32_t firstArchetypeIndex = (reader.GetVersion() >= 3) ? 0u : 1u;
+            // v2 archives carry no root record, so index 0 is never re-read and the
+            // m_archetypeMap.Clear() above left the surviving root unmapped. Re-map it
+            // so the duplicate check below (and later empty-mask lookups) see it.
+            if (firstArchetypeIndex == 1 && m_rootArchetype)
+                m_archetypeMap[m_rootArchetype->GetMask()] = m_rootArchetype;
+            std::vector<Archetype*> duplicates;   // s8.3 collapsed masks, merged below
             for (uint32_t i = firstArchetypeIndex; i < archetypeCount; ++i)
             {
                 // The on-disk archetype index isn't otherwise used by this loop
@@ -1050,7 +1056,7 @@ namespace Astra
                 reader(index);
 
                 // Deserialize the archetype
-                auto archetypeResult = Archetype::Deserialize(reader, registryDescriptors, &m_chunkPool, &m_tick);
+                auto archetypeResult = Archetype::Deserialize(reader, registryDescriptors, &m_chunkPool, &m_tick, hooks);
                 if (archetypeResult.IsErr() || reader.HasError())
                 {
                     return false;
@@ -1082,8 +1088,14 @@ namespace Astra
                     // Add to storage
                     ArchetypeEntry entry;
                     entry.archetype = std::move(archetype);
-
-                    m_archetypeMap[entry.archetype->GetMask()] = entry.archetype.get();
+                    // s8.3: diverting a column out of an archived archetype can make
+                    // its mask equal an earlier one's (or the root's). The map keeps
+                    // the first; the duplicate is merged into it once every record
+                    // is located (below).
+                    if (m_archetypeMap.Find(entry.archetype->GetMask()) != m_archetypeMap.end())
+                        duplicates.push_back(entry.archetype.get());
+                    else
+                        m_archetypeMap[entry.archetype->GetMask()] = entry.archetype.get();
                     m_archetypes.push_back(std::move(entry));
                 }
             }
@@ -1129,10 +1141,12 @@ namespace Astra
                     return false;
                 SetRecordLocation(rec, arch, EntityLocation::Create(chunkIndex, entityIndex));
             }
-            
-            return !reader.HasError();
+
+            if (reader.HasError())
+                return false;
+            return duplicates.empty() || MergeDuplicateArchetypes(duplicates);
         }
-        
+
     private:
         struct ArchetypeEntry
         {
@@ -1518,6 +1532,44 @@ namespace Astra
         size_t BatchMoveEntitiesWithoutComponent(Archetype* srcArchetype, Archetype* dstArchetype, SmallVector<std::pair<Entity, EntityLocation>, 8>& entityBatch)
         {
             return BatchMoveEntitiesInternal(srcArchetype, dstArchetype, entityBatch, [](Archetype*, const std::vector<EntityLocation>&) { /* No component operation needed for removal */ });
+        }
+
+        // Load-only (s8.3): every entity of a duplicate archetype moves, in ONE
+        // batched move, into the mapped archetype with the same mask (all columns
+        // shared: values, disabled bits and ticks carry), then the drained
+        // duplicate is dropped. Records are already located, and
+        // BatchMoveEntitiesInternal rewrites them. Nothing caches these archetypes
+        // yet: no views exist, and freshly loaded edges are null.
+        bool MergeDuplicateArchetypes(const std::vector<Archetype*>& duplicates)
+        {
+            for (Archetype* dup : duplicates)
+            {
+                auto it = m_archetypeMap.Find(dup->GetMask());
+                if (it == m_archetypeMap.end() || it->second == dup)
+                    return false;
+                Archetype* canonical = it->second;
+
+                SmallVector<std::pair<Entity, EntityLocation>, 8> batch;
+                const auto& chunks = dup->GetChunks();
+                for (size_t c = 0; c < chunks.size(); ++c)
+                {
+                    if (!chunks[c]) continue;
+                    const auto& entities = chunks[c]->GetEntities();
+                    for (size_t i = 0; i < chunks[c]->GetCount(); ++i)
+                        batch.emplace_back(entities[i], EntityLocation::Create(c, i));
+                }
+                if (!batch.empty() && BatchMoveEntitiesWithoutComponent(dup, canonical, batch) != batch.size())
+                    return false;
+
+                auto pos = std::find_if(m_archetypes.begin(), m_archetypes.end(),
+                                        [dup](const ArchetypeEntry& e) { return e.archetype.get() == dup; });
+                if (pos == m_archetypes.end())
+                    return false;
+                m_archetypes.erase(pos);
+            }
+            m_structuralChangeCounter.fetch_add(1, std::memory_order_release);
+            m_archetypeRemovalCounter.fetch_add(1, std::memory_order_release);
+            return true;
         }
 
         /**

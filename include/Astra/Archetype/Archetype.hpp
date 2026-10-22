@@ -33,6 +33,7 @@
 #include "../Entity/Entity.hpp"
 #include "../Serialization/BinaryReader.hpp"
 #include "../Serialization/BinaryWriter.hpp"
+#include "../Serialization/StorageMigration.hpp"
 #include "ArchetypeChunkPool.hpp"
 #include "EntityLocation.hpp"
 
@@ -1007,7 +1008,7 @@ namespace Astra
             }
         }
         
-        static Result<std::unique_ptr<Archetype>, SerializationError> Deserialize(BinaryReader& reader, const std::vector<ComponentDescriptor>& registryDescriptors, ArchetypeChunkPool* componentPool = nullptr, const Tick* tickSource = nullptr)
+        static Result<std::unique_ptr<Archetype>, SerializationError> Deserialize(BinaryReader& reader, const std::vector<ComponentDescriptor>& registryDescriptors, ArchetypeChunkPool* componentPool = nullptr, const Tick* tickSource = nullptr, const StorageLoadHooks* hooks = nullptr)
         {
             using ResultType = Result<std::unique_ptr<Archetype>, SerializationError>;
 
@@ -1068,12 +1069,22 @@ namespace Astra
             std::vector<ComponentDescriptor> descriptors;
             descriptors.reserve(descriptorCount);
 
-            // IM-9: per-descriptor "archive carries a disabled-bit section for this
-            // column" flags, kept in lockstep with `descriptors` (both are pushed
-            // together only when the hash resolves). Drives section CONSUMPTION on the
-            // chunk-read path below so it depends on the archive, not the local build.
-            std::vector<uint8_t> diskHasDisabledSection;
-            diskHasDisabledSection.reserve(descriptorCount);
+            // Every ARCHIVED descriptor, in disk order (the column order chunks were
+            // written in). `descriptors` above keeps only the ones this registry stores
+            // in tables; a diverted one (s8.3: Table in the archive, Sparse/Universal
+            // here) is read straight into ComponentStorage. hasDisabledSection is the
+            // IM-9 disk flag; diskSize > 0 || hasDisabledSection says whether the
+            // archive wrote a column for it at all (tags without bits never did). Both
+            // drive stream CONSUMPTION, so it depends on the archive, not the local build.
+            struct ArchivedColumn
+            {
+                ComponentDescriptor desc;
+                uint64_t diskSize;
+                bool hasDisabledSection;
+                bool diverted;
+            };
+            std::vector<ArchivedColumn> archived;
+            archived.reserve(descriptorCount);
 
             for (uint32_t i = 0; i < descriptorCount; ++i)
             {
@@ -1101,8 +1112,10 @@ namespace Astra
 
                 if (it != registryDescriptors.end())
                 {
-                    descriptors.push_back(*it);
-                    diskHasDisabledSection.push_back(hasDisabledSection);
+                    const bool diverted = hooks && hooks->IsDiverted(it->id);
+                    archived.push_back(ArchivedColumn{*it, size, hasDisabledSection != 0, diverted});
+                    if (!diverted)
+                        descriptors.push_back(*it);
                 }
                 else
                 {
@@ -1133,7 +1146,9 @@ namespace Astra
             // ids), so it must equal the descriptor count regardless of process. A
             // mismatch means the mask half and the descriptor half of the record
             // disagree -> corrupt/crafted input.
-            if (mask.Count() != descriptors.size())
+            // s8.3: the disk mask counts every ARCHIVED component (run-independent,
+            // archive-internal); the rebuilt localMask counts only the Table ones.
+            if (mask.Count() != archived.size())
             {
                 return ResultType::Err(SerializationError::CorruptedData);
             }
@@ -1270,18 +1285,48 @@ namespace Astra
                     return ResultType::Err(reader.GetError());
                 }
 
-                // Read component arrays (SOA layout). Indexed (not range-for) so each
-                // descriptor's disk has-disabled-section flag can be looked up by the
-                // same ordinal (IM-9).
-                for (size_t di = 0; di < descriptors.size(); ++di)
+                // Read component arrays (SOA layout), one archived column at a time, in
+                // disk order. Each carries its own disk has-disabled-section flag (IM-9).
+                for (const ArchivedColumn& column : archived)
                 {
-                    const ComponentDescriptor& desc = descriptors[di];
+                    const ComponentDescriptor& desc = column.desc;
+
+                    if (column.diverted)
+                    {
+                        // s8.3: Table in the archive, Sparse/Universal here. Consume the
+                        // column exactly as DeserializeColumn would, but into the store.
+                        // A column block exists iff the archive wrote one; a tag the
+                        // archive wrote nothing for reads zero bytes in DivertColumn.
+                        const bool diskHasColumn = column.diskSize > 0 || column.hasDisabledSection;
+                        bool ok = false;
+                        if (diskHasColumn && reader.GetVersion() >= 5 && reader.GetCompressionMode() == CompressionMode::LZ4)
+                        {
+                            auto blk = reader.ReadCompressedBlock();
+                            if (blk.IsErr())
+                                return ResultType::Err(SerializationError::CorruptedData);
+                            const auto& bytes = *blk.GetValue();   // std::vector<uint8_t>
+                            BinaryReader sub(std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()));
+                            sub.SetChecksumEnabled(false);
+                            ok = DivertColumn(sub, chunk, desc, chunkEntityCount,
+                                              column.diskSize > 0, column.hasDisabledSection, *hooks);
+                        }
+                        else
+                        {
+                            ok = DivertColumn(reader, chunk, desc, chunkEntityCount,
+                                              column.diskSize > 0, column.hasDisabledSection, *hooks);
+                        }
+                        if (!ok)
+                            return ResultType::Err(reader.HasError() ? reader.GetError() : SerializationError::CorruptedData);
+                        continue;
+                    }
+
                     // A block follows iff the WRITER had a column: every data component, and a
                     // tag only when the writer stored it as an enableable bit-only column --
                     // which the archive records as the has-disabled-section flag (IM-9). Keyed
                     // on the ARCHIVE, never on this build's column, so a tag whose
                     // enableability differs between builds keeps the stream in sync.
-                    const bool archiveHasColumn = desc.size != 0 || diskHasDisabledSection[di] != 0;
+                    const bool archiveHasColumn = desc.size != 0 || column.hasDisabledSection;
                     if (!archiveHasColumn) continue;
 
                     // Mirror of the write path (Serialize above): LZ4 archives wrap
@@ -1307,13 +1352,13 @@ namespace Astra
                         sub.SetChecksumEnabled(false);
                         colResult = DeserializeColumn(sub, chunk, archetype.get(), desc,
                                                       static_cast<size_t>(chunkEntityCount),
-                                                      diskHasDisabledSection[di]);
+                                                      column.hasDisabledSection);
                     }
                     else
                     {
                         colResult = DeserializeColumn(reader, chunk, archetype.get(), desc,
                                                       static_cast<size_t>(chunkEntityCount),
-                                                      diskHasDisabledSection[di]);
+                                                      column.hasDisabledSection);
                     }
                     if (colResult.IsErr())
                         return colResult;
@@ -1633,6 +1678,23 @@ namespace Astra
             }
         }
 
+        // s8.3: one chunk-column archived as Table whose component the loading
+        // registry keeps in ComponentStorage. Values are deserialized over the
+        // store's element for each of the chunk's entities; the column's disabled
+        // section (IM-9 disk flag) becomes the store's per-element flag. Consumes
+        // the stream exactly as DeserializeColumn does (the shared element-run reader
+        // is also the v6 block reader's body). diskHasData is the ARCHIVE's value
+        // size: data archived for a type that is a tag here is refused, never skipped.
+        static bool DivertColumn(BinaryReader& r, ArchetypeChunk* chunk, const ComponentDescriptor& desc,
+                                 size_t chunkEntityCount, bool diskHasData, bool hasDisabledSection,
+                                 const StorageLoadHooks& hooks)
+        {
+            const auto& entities = chunk->GetEntities();
+            return StorageFormat::ReadElementRun(r, chunkEntityCount, desc, diskHasData, hasDisabledSection,
+                [&](size_t i) { return hooks.acquire(hooks.ctx, desc, entities[i]); },
+                [&](size_t i) { hooks.setDisabled(hooks.ctx, desc.id, entities[i]); });
+        }
+
         // Reads one component column's per-chunk data (custom deserialize,
         // versioned or plain, or a compressed trivially-copyable block) into
         // the chunk's component array, then (iff hasDisabledSection) reads,
@@ -1644,7 +1706,7 @@ namespace Astra
         // data bytes plus the section; when THIS build has no column for the tag (not
         // enableable here) the section is consumed, validated and dropped below.
         // hasDisabledSection is the per-descriptor
-        // disk flag (diskHasDisabledSection[di], IM-9), not this build's
+        // disk flag (ArchivedColumn::hasDisabledSection, IM-9), not this build's
         // desc.isEnableable. Static (like Deserialize itself): archetype is
         // passed explicitly rather than accessed via `this`.
         static Result<std::unique_ptr<Archetype>, SerializationError> DeserializeColumn(BinaryReader& r, ArchetypeChunk* chunk, Archetype* archetype, const ComponentDescriptor& desc, size_t chunkEntityCount, bool hasDisabledSection)
