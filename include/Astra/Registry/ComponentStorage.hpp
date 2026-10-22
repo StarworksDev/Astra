@@ -15,6 +15,7 @@
 #include "../Core/Tick.hpp"
 #include "../Entity/Entity.hpp"
 #include "../Serialization/SerializationError.hpp"
+#include "../Serialization/StorageMigration.hpp"
 #include "SparseSet.hpp"
 #include "UniversalColumn.hpp"
 
@@ -335,6 +336,9 @@ namespace Astra
             }
         }
 
+        // s8.3: Table-now values read from a v6 block, applied after archetype load.
+        ASTRA_NODISCARD std::vector<StagedTableColumn>& PendingTableMigrations() noexcept { return m_pendingTable; }
+
     private:
         // One lookup loop: the mutable form goes through the const one.
         UniversalSpec* FindUniversalSpecMutable(ComponentID id) noexcept
@@ -354,5 +358,6 @@ namespace Astra
         const Tick* m_tickSource = nullptr;
         Tick m_coarseVersion[MAX_COMPONENTS]{};   // untracked-Sparse coarse change version, by id
         std::uint32_t m_storeCount = 0;   // columns + sparse sets created so far (HasAnyStore)
+        std::vector<StagedTableColumn> m_pendingTable;   // s8.3 staged Table-now values (load only)
     };
 }

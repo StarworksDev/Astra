@@ -26,6 +26,7 @@
 #include "../Entity/EntityTable.hpp"
 #include "../Serialization/BinaryReader.hpp"
 #include "../Serialization/BinaryWriter.hpp"
+#include "../Serialization/StorageMigration.hpp"
 #include "Archetype.hpp"
 #include "ArchetypeChunkPool.hpp"
 
@@ -1147,6 +1148,109 @@ namespace Astra
             return duplicates.empty() || MergeDuplicateArchetypes(duplicates);
         }
 
+        // Load-only (spec s8.3 bullet 2): moves values archived Sparse/Universal into
+        // the Table columns this registry uses for them. Entities are grouped by
+        // (source archetype, set of staged components); each group makes ONE batched
+        // move per (source, destination) pair into source-mask | staged-mask, so no
+        // intermediate archetype is ever created, and the staged values are
+        // move-constructed into the new columns in the move's post-op. A staged
+        // component the entity already holds as a Table column, or a stale entity,
+        // refuses the load. Clears `staged` on success.
+        bool ApplyMigratedTableComponents(std::vector<StagedTableColumn>& staged)
+        {
+            if (staged.empty())
+                return true;
+
+            struct Item { Entity entity; uint32_t column; uint32_t element; };
+            std::vector<Item> items;
+            for (size_t c = 0; c < staged.size(); ++c)
+                for (size_t i = 0; i < staged[c].Size(); ++i)
+                    items.push_back(Item{staged[c].EntityAt(i), static_cast<uint32_t>(c), static_cast<uint32_t>(i)});
+            std::sort(items.begin(), items.end(), [](const Item& a, const Item& b)
+            {
+                return a.entity.GetID() != b.entity.GetID() ? a.entity.GetID() < b.entity.GetID() : a.column < b.column;
+            });
+
+            struct Group
+            {
+                Archetype* src = nullptr;
+                ComponentMask added;
+                SmallVector<std::pair<Entity, EntityLocation>, 8> batch;
+            };
+            std::vector<Group> groups;
+            std::unordered_map<uint64_t, std::pair<size_t, size_t>> runOf;   // entity id -> [begin, end) in items
+
+            for (size_t b = 0; b < items.size();)
+            {
+                size_t e = b;
+                while (e < items.size() && items[e].entity == items[b].entity) ++e;
+                const Entity entity = items[b].entity;
+                EntityRecord* rec = m_records->GetRecord(entity.GetID());
+                if (!rec || rec->version != entity.GetVersion() || !rec->archetype)
+                    return false;
+
+                ComponentMask added;
+                for (size_t k = b; k < e; ++k)
+                {
+                    const ComponentID id = staged[items[k].column].Descriptor().id;
+                    if (rec->archetype->GetMask().Test(id) || added.Test(id))
+                        return false;
+                    added.Set(id);
+                }
+                auto g = std::find_if(groups.begin(), groups.end(),
+                                      [&](const Group& x) { return x.src == rec->archetype && x.added == added; });
+                if (g == groups.end())
+                {
+                    groups.push_back(Group{rec->archetype, added, {}});
+                    g = groups.end() - 1;
+                }
+                g->batch.emplace_back(entity, rec->location);
+                runOf[static_cast<uint64_t>(entity.GetID())] = {b, e};
+                b = e;
+            }
+
+            for (Group& group : groups)
+            {
+                // An earlier group's swap-removes may have moved these entities
+                // inside the shared source archetype: refresh from the records.
+                for (auto& [entity, location] : group.batch)
+                    location = m_records->GetRecord(entity.GetID())->location;
+
+                Archetype* dst = GetOrCreateArchetypeByMask(group.src->GetMask() | group.added);
+                if (!dst)
+                    return false;
+
+                const size_t moved = BatchMoveEntitiesInternal(group.src, dst, group.batch,
+                    [&](Archetype* d, const std::vector<EntityLocation>& locations)
+                    {
+                        // BatchMoveEntitiesInternal sorted group.batch in place before
+                        // the move, so locations[i] belongs to group.batch[i].
+                        const ArchetypeColumnMeta& meta = d->GetColumnMeta();
+                        for (size_t i = 0; i < locations.size(); ++i)
+                        {
+                            auto [chunk, index] = d->ResolveLocation(locations[i]);
+                            const auto [begin, end] = runOf[static_cast<uint64_t>(group.batch[i].first.GetID())];
+                            for (size_t k = begin; k < end; ++k)
+                            {
+                                StagedTableColumn& column = staged[items[k].column];
+                                const ComponentDescriptor& desc = column.Descriptor();
+                                if (desc.size > 0)
+                                    column.MoveOut(items[k].element, chunk->GetComponentPointer(desc.id, index));
+                                const int c = meta.idToColumn[desc.id];
+                                if (c >= 0 && column.IsDisabled(items[k].element))
+                                    chunk->SetDisabled(c, index, true);
+                            }
+                        }
+                    });
+                if (moved != group.batch.size())
+                    return false;
+            }
+
+            staged.clear();
+            m_structuralChangeCounter.fetch_add(1, std::memory_order_release);
+            return true;
+        }
+
     private:
         struct ArchetypeEntry
         {
@@ -1169,6 +1273,14 @@ namespace Astra
                 return it->second;
             }
 
+            return CreateArchetype(mask, *registry);
+        }
+
+        // The one archetype-creation body (cold path): builds, registers in the mask
+        // map and the archetype list, and bumps the structural counter. Shared by
+        // GetOrCreateArchetype, GetArchetypeWithModified and GetOrCreateArchetypeByMask.
+        Archetype* CreateArchetype(const ComponentMask& mask, ComponentRegistry& registry)
+        {
             auto archetype = std::make_unique<Archetype>(mask);
             Archetype* ptr = archetype.get();
             ptr->m_chunkPool = &m_chunkPool;
@@ -1180,13 +1292,14 @@ namespace Astra
             {
                 if (mask.Test(id)) ASTRA_UNLIKELY
                 {
-                    if (const auto* desc = registry->GetComponentDescriptor(id)) ASTRA_LIKELY
+                    if (const auto* desc = registry.GetComponentDescriptor(id)) ASTRA_LIKELY
                     {
                         componentDescriptors.push_back(*desc);
                     }
                 }
             }
 
+            // Always initialize archetype, even with empty component list
             ptr->Initialize(componentDescriptors);
             m_archetypeMap[mask] = ptr;
 
@@ -1198,6 +1311,19 @@ namespace Astra
             m_structuralChangeCounter.fetch_add(1, std::memory_order_release);
 
             return ptr;
+        }
+
+        // Find-or-create for an arbitrary mask (load-time staging, s8.3). Creates no
+        // edges; the single-component edge paths stay untouched (S4).
+        Archetype* GetOrCreateArchetypeByMask(const ComponentMask& mask)
+        {
+            auto it = m_archetypeMap.Find(mask);
+            if (it != m_archetypeMap.end())
+                return it->second;
+            auto registry = m_componentRegistry.lock();
+            if (!registry) ASTRA_UNLIKELY
+                return nullptr;
+            return CreateArchetype(mask, *registry);
         }
 
         template<typename GetEdgeFunc, typename SetEdgeFunc, typename MaskOp>
@@ -1225,40 +1351,7 @@ namespace Astra
                 return nullptr;
             }
             
-            auto archetype = std::make_unique<Archetype>(newMask);
-            Archetype* ptr = archetype.get();
-            ptr->m_chunkPool = &m_chunkPool;
-            ptr->SetTickSource(&m_tick);
-
-            std::vector<ComponentDescriptor> componentDescriptors;
-
-            for (ComponentID id = 0; id < MAX_COMPONENTS; ++id)
-            {
-                if (newMask.Test(id)) ASTRA_UNLIKELY
-                {
-                    if (const auto* desc = registry->GetComponentDescriptor(id)) ASTRA_LIKELY
-                    {
-                        componentDescriptors.push_back(*desc);
-                    }
-                }
-            }
-
-            // Always initialize archetype, even with empty component list
-            ptr->Initialize(componentDescriptors);
-
-            // Store archetype
-            m_archetypeMap[newMask] = ptr;
-
-            ArchetypeEntry entry;
-            entry.archetype = std::move(archetype);
-            entry.creationGeneration = ++m_generation;  // Assign generation
-
-            m_archetypes.push_back(std::move(entry));
-
-            // Increment structural change counter for fast path checking
-            m_structuralChangeCounter.fetch_add(1, std::memory_order_release);
-            
-            Archetype* to = ptr;
+            Archetype* to = CreateArchetype(newMask, *registry);
 
             // Cache edge on the source archetype (per-archetype array-indexed edge).
             setEdge(from, componentId, to);

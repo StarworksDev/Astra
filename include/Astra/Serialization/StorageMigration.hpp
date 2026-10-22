@@ -4,6 +4,8 @@
 #include <bit>
 #include <cstddef>
 #include <cstdint>
+#include <new>
+#include <utility>
 #include <vector>
 
 #include "../Component/Component.hpp"
@@ -130,5 +132,83 @@ namespace Astra
         void  (*setDisabled)(void* ctx, ComponentID id, Entity e) = nullptr;
 
         ASTRA_NODISCARD bool IsDiverted(ComponentID id) const { return isDiverted && isDiverted(ctx, id); }
+    };
+
+    // s8.3 bullet 2: values archived Sparse/Universal for a component the loading
+    // registry keeps in tables. Elements are default-constructed in an aligned
+    // buffer, deserialized over, and later moved into their destination columns by
+    // ArchetypeManager::ApplyMigratedTableComponents. Whatever is not moved out is
+    // destroyed with the column, so a failed load leaks nothing.
+    class StagedTableColumn
+    {
+    public:
+        StagedTableColumn(const ComponentDescriptor& desc, size_t count)
+            : m_desc(desc), m_entities(count), m_disabled(count, 0), m_constructed(count, 0)
+        {
+            if (desc.size == 0 || count == 0)
+                return;
+            m_data = static_cast<std::byte*>(::operator new(desc.size * count, std::align_val_t{desc.alignment}));
+            for (size_t i = 0; i < count; ++i)
+            {
+                desc.DefaultConstruct(m_data + i * desc.size);
+                m_constructed[i] = 1;
+            }
+        }
+        ~StagedTableColumn() { Release(); }
+
+        StagedTableColumn(StagedTableColumn&& other) noexcept
+            : m_desc(other.m_desc), m_data(std::exchange(other.m_data, nullptr)),
+              m_entities(std::move(other.m_entities)), m_disabled(std::move(other.m_disabled)),
+              m_constructed(std::move(other.m_constructed)) {}
+        StagedTableColumn& operator=(StagedTableColumn&& other) noexcept
+        {
+            if (this != &other)
+            {
+                Release();
+                m_desc = other.m_desc;
+                m_data = std::exchange(other.m_data, nullptr);
+                m_entities = std::move(other.m_entities);
+                m_disabled = std::move(other.m_disabled);
+                m_constructed = std::move(other.m_constructed);
+            }
+            return *this;
+        }
+        StagedTableColumn(const StagedTableColumn&) = delete;
+        StagedTableColumn& operator=(const StagedTableColumn&) = delete;
+
+        ASTRA_NODISCARD const ComponentDescriptor& Descriptor() const noexcept { return m_desc; }
+        ASTRA_NODISCARD size_t Size() const noexcept { return m_entities.size(); }
+        ASTRA_NODISCARD Entity& EntityAt(size_t i) noexcept { return m_entities[i]; }
+        ASTRA_NODISCARD Entity EntityAt(size_t i) const noexcept { return m_entities[i]; }
+        ASTRA_NODISCARD void* At(size_t i) noexcept { return m_data ? m_data + i * m_desc.size : EmptyComponentSentinel(); }
+        ASTRA_NODISCARD bool IsDisabled(size_t i) const noexcept { return m_disabled[i] != 0; }
+        void SetDisabled(size_t i, bool disabled) noexcept { m_disabled[i] = disabled ? 1 : 0; }
+
+        // Move-construct element i into raw column memory, then destroy the staged one.
+        void MoveOut(size_t i, void* dst)
+        {
+            if (!m_data || !m_constructed[i])
+                return;
+            m_desc.MoveConstruct(dst, At(i));
+            m_desc.Destruct(At(i));
+            m_constructed[i] = 0;
+        }
+
+    private:
+        void Release() noexcept
+        {
+            if (!m_data)
+                return;
+            for (size_t i = 0; i < m_constructed.size(); ++i)
+                if (m_constructed[i]) m_desc.Destruct(m_data + i * m_desc.size);
+            ::operator delete(m_data, std::align_val_t{m_desc.alignment});
+            m_data = nullptr;
+        }
+
+        ComponentDescriptor m_desc;          // by value: the ResourceStorage lifetime rule
+        std::byte* m_data = nullptr;
+        std::vector<Entity> m_entities;
+        std::vector<uint8_t> m_disabled;
+        std::vector<uint8_t> m_constructed;
     };
 }

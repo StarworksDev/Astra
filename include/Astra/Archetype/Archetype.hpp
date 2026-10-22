@@ -1326,8 +1326,11 @@ namespace Astra
                     // which the archive records as the has-disabled-section flag (IM-9). Keyed
                     // on the ARCHIVE, never on this build's column, so a tag whose
                     // enableability differs between builds keeps the stream in sync.
-                    const bool archiveHasColumn = desc.size != 0 || column.hasDisabledSection;
+                    const bool archiveHasColumn = column.diskSize > 0 || column.hasDisabledSection;
                     if (!archiveHasColumn) continue;
+                    // IM-9: the archive holds values this build's (empty) type cannot hold.
+                    if (column.diskSize > 0 && desc.size == 0)
+                        return ResultType::Err(SerializationError::CorruptedData);
 
                     // Mirror of the write path (Serialize above): LZ4 archives wrap
                     // each column in a compressed block, so read+decompress it into a

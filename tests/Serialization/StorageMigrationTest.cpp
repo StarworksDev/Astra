@@ -243,7 +243,7 @@ TEST(StorageMigration, FormatV5ArchivesLoadIntoUniversalSparseAndTableRegistries
     {
         const auto v5 = SaveAsV5(*world.reg, mode);
         uint16_t version = 0;
-        std::memcpy(&version, v5.data() + 5, sizeof(version));
+        std::memcpy(&version, v5.data() + offsetof(Astra::BinaryHeader, version), sizeof(version));
         ASSERT_EQ(version, 5u);
 
         {   // Name declared Universal
@@ -278,7 +278,15 @@ TEST(StorageMigration, FormatV5ArchivesLoadIntoUniversalSparseAndTableRegistries
             ASSERT_TRUE(loaded.IsOk()) << "error " << static_cast<int>(*loaded.GetError());
             Astra::Registry& out = **loaded.GetValue();
             for (int i = 0; i < kEntities; ++i)
-                EXPECT_EQ(out.HasComponent<Name>(world.entities[i]), i % 2 == 0);
+            {
+                ASSERT_EQ(out.HasComponent<Name>(world.entities[i]), i % 2 == 0);
+                if (i % 2 == 0)
+                {
+                    ASSERT_NE(out.GetComponent<Name>(world.entities[i]), nullptr);
+                    EXPECT_EQ(out.GetComponent<Name>(world.entities[i])->value, LongName(i));
+                }
+            }
+            EXPECT_EQ(out.ValidateStorageInvariants(), "");
         }
     }
 }
@@ -300,6 +308,31 @@ TEST(StorageMigration, DivertedSparseValuesStampTheCoarseVersionAtLoad)
     EXPECT_EQ(out.GetComponentStorage()->CoarseVersion(nameId), out.CurrentTick());
 }
 
+namespace
+{
+    // Installs Name's hash into `creg` with the given storage. `asTag` empties the
+    // descriptor (size 0, no decode hooks): a tag stand-in carrying Name's hash.
+    // `nm` must outlive `creg` (the descriptor keeps a pointer to it).
+    Astra::ComponentID InstallNameStandIn(Astra::ComponentRegistry& creg, const std::string& nm,
+                                          Astra::Storage storage, bool asTag)
+    {
+        static int s_image = 0;
+        const Astra::ComponentID nameId = Astra::TypeID<Name>::Value();
+        Astra::ComponentDescriptor desc = Astra::ComponentRegistry::MakeDescriptor<Name>(nameId, nullptr);
+        desc.storage = storage;
+        if (asTag)
+        {
+            desc.size = 0;
+            desc.deserializeVersioned = nullptr;
+            desc.deserialize = nullptr;
+        }
+        desc.name = nm.c_str();
+        const uint32_t owner = creg.OpenModuleId("NameStandIn");
+        EXPECT_NE(creg.InstallOwned(nameId, owner, desc, &s_image), Astra::InstallResult::Refused);
+        return nameId;
+    }
+}
+
 // IM-9: the archive says the column carries values; a type that is a tag in the
 // loading build cannot decode them, so the load is refused, not desynced.
 TEST(StorageMigration, ArchivedValuesForATypeThatIsATagHereAreRefused)
@@ -307,21 +340,161 @@ TEST(StorageMigration, ArchivedValuesForATypeThatIsATagHereAreRefused)
     Astra::TestSupport::ScopedDefaultTypeContext ctx;
     NamedWorld world;
     const auto bytes = SaveWith(*world.reg, Astra::CompressionMode::None);
-    const Astra::ComponentID nameId = Astra::TypeID<Name>::Value();
+    const std::string nm(Astra::TypeID<Name>::Name());   // declared before creg: the descriptor name must outlive it
+
+    {   // positive control: the same archive with a real (non-empty) descriptor loads
+        auto creg = std::make_shared<Astra::ComponentRegistry>();
+        creg->RegisterComponents<Position>();
+        InstallNameStandIn(*creg, nm, Astra::Storage::Sparse, false);
+        auto loaded = Astra::Registry::Load(bytes, creg);
+        ASSERT_TRUE(loaded.IsOk()) << "error " << static_cast<int>(*loaded.GetError());
+    }
+    {   // the tag stand-in as Sparse
+        auto creg = std::make_shared<Astra::ComponentRegistry>();
+        creg->RegisterComponents<Position>();
+        InstallNameStandIn(*creg, nm, Astra::Storage::Sparse, true);
+        auto loaded = Astra::Registry::Load(bytes, creg);
+        EXPECT_TRUE(loaded.IsErr());
+    }
+}
+
+// IM-9, the Table branch of Archetype::Deserialize: the archive holds a Name column
+// (disk size > 0); a build whose Name is an empty Table type is refused CorruptedData
+// instead of skipping the column and desyncing the stream.
+TEST(StorageMigration, ArchivedTableColumnForAnEmptyTableTypeIsRefused)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    NamedWorld world;
+    const std::string nm(Astra::TypeID<Name>::Name());
+    for (const auto mode : {Astra::CompressionMode::None, Astra::CompressionMode::LZ4})
+    {
+        const auto bytes = SaveWith(*world.reg, mode);
+        auto creg = std::make_shared<Astra::ComponentRegistry>();
+        creg->RegisterComponents<Position>();
+        InstallNameStandIn(*creg, nm, Astra::Storage::Table, true);
+        auto loaded = Astra::Registry::Load(bytes, creg);
+        ASSERT_TRUE(loaded.IsErr());
+        EXPECT_EQ(*loaded.GetError(), Astra::SerializationError::CorruptedData);
+    }
+}
+
+namespace
+{
+    // Save side with Name and Hierarchy Sparse via override.
+    struct SparseNamedWorld
+    {
+        std::shared_ptr<Astra::ComponentRegistry> creg = std::make_shared<Astra::ComponentRegistry>();
+        Astra::ComponentID nameId = 0;
+        Astra::ComponentID hierId = 0;
+        std::unique_ptr<Astra::Registry> reg;
+        std::vector<Astra::Entity> entities;
+        SparseNamedWorld()
+        {
+            creg->RegisterComponents<Position>();
+            nameId = Astra::TestSupport::InstallWithStorage<Name>(*creg, Astra::Storage::Sparse);
+            hierId = Astra::TestSupport::InstallWithStorage<Hierarchy>(*creg, Astra::Storage::Sparse);
+            reg = std::make_unique<Astra::Registry>(creg);
+            for (int i = 0; i < kEntities; ++i)
+            {
+                const Astra::Entity e = reg->CreateEntity<Position>();
+                if (i % 2 == 0)
+                {
+                    Name n(LongName(i));
+                    EXPECT_TRUE(reg->AddComponentByID(e, nameId, &n, sizeof(n)));
+                }
+                if (i % 4 == 0)
+                {
+                    Hierarchy h{};
+                    h.parent = static_cast<uint32_t>(i);
+                    EXPECT_TRUE(reg->AddComponentByID(e, hierId, &h, sizeof(h)));
+                    if (i % 8 == 0) EXPECT_TRUE(reg->SetEnabledByID(e, hierId, false));
+                }
+                entities.push_back(e);
+            }
+        }
+    };
+}
+
+// s8.3 bullet 2: Sparse in the archive, Table here. Staged values land through one
+// batched move per (source, destination) archetype pair: {P,N} for Name-only
+// entities and {P,N,H} for entities with both. No intermediate {P,H} archetype is
+// created, and the disabled state survives.
+TEST(StorageMigration, SparseInTheArchiveBecomesTableByOneBatchedMovePerDestination)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    SparseNamedWorld world;
+    for (const auto mode : {Astra::CompressionMode::None, Astra::CompressionMode::LZ4})
+    {
+        const auto bytes = SaveWith(*world.reg, mode);
+        auto creg = std::make_shared<Astra::ComponentRegistry>();
+        creg->RegisterComponents<Position, Name, Hierarchy>();   // all Table here
+        auto loaded = Astra::Registry::Load(bytes, creg);
+        ASSERT_TRUE(loaded.IsOk()) << "error " << static_cast<int>(*loaded.GetError());
+        Astra::Registry& out = **loaded.GetValue();
+
+        const auto pos = Astra::TypeID<Position>::Value();
+        const auto name = Astra::TypeID<Name>::Value();
+        const auto hier = Astra::TypeID<Hierarchy>::Value();
+        EXPECT_EQ(ArchetypesWithMask(out, MaskOf({pos, name})), 1u);
+        EXPECT_EQ(ArchetypesWithMask(out, MaskOf({pos, name, hier})), 1u);
+        EXPECT_EQ(out.GetArchetypeManager()->FindArchetype(MaskOf({pos, hier})), nullptr)
+            << "staged components must land in one move, never through an intermediate archetype";
+        ASSERT_NE(out.GetArchetypeManager()->FindArchetype(MaskOf({pos, name, hier})), nullptr);
+        EXPECT_EQ(out.GetArchetypeManager()->FindArchetype(MaskOf({pos, name, hier}))->GetEntityCount(),
+                  static_cast<size_t>(kEntities / 4));
+
+        for (int i = 0; i < kEntities; ++i)
+        {
+            const Astra::Entity e = world.entities[i];
+            ASSERT_EQ(out.HasComponent<Name>(e), i % 2 == 0) << "entity " << i;
+            if (i % 2 == 0)
+            {
+                ASSERT_NE(out.GetComponent<Name>(e), nullptr);
+                EXPECT_EQ(out.GetComponent<Name>(e)->value, LongName(i));
+            }
+            ASSERT_EQ(out.HasComponent<Hierarchy>(e), i % 4 == 0) << "entity " << i;
+            if (i % 4 == 0)
+            {
+                ASSERT_NE(out.GetComponent<Hierarchy>(e), nullptr);
+                EXPECT_EQ(out.GetComponent<Hierarchy>(e)->parent, static_cast<uint32_t>(i));
+                EXPECT_EQ(out.IsEnabled<Hierarchy>(e), i % 8 != 0) << "entity " << i;
+            }
+        }
+        EXPECT_EQ(out.ValidateStorageInvariants(), "");
+    }
+}
+
+TEST(StorageMigration, UniversalInTheArchiveBecomesTableWhenTheLoaderDoesNotDeclareIt)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    auto saveCreg = std::make_shared<Astra::ComponentRegistry>();
+    saveCreg->RegisterComponents<Position, Name>();
+    Astra::Registry::Config cfg;
+    cfg.AddUniversal<Name>();
+    Astra::Registry reg(saveCreg, cfg);
+    std::vector<Astra::Entity> es;
+    for (int i = 0; i < 20; ++i)
+    {
+        es.push_back(reg.CreateEntity<Position>());
+        reg.GetComponent<Name>(es.back())->value = LongName(i);
+    }
+    const auto bytes = SaveWith(reg, Astra::CompressionMode::LZ4);
 
     auto creg = std::make_shared<Astra::ComponentRegistry>();
-    creg->RegisterComponents<Position>();
-    // A tag stand-in carrying Name's hash: install Name's descriptor, emptied, as Sparse.
-    Astra::ComponentDescriptor desc = Astra::ComponentRegistry::MakeDescriptor<Name>(nameId, nullptr);
-    desc.storage = Astra::Storage::Sparse;
-    desc.size = 0;
-    desc.deserializeVersioned = nullptr;
-    desc.deserialize = nullptr;
-    static int s_image = 0;
-    const std::string nm(Astra::TypeID<Name>::Name());
-    desc.name = nm.c_str();
-    const uint32_t owner = creg->OpenModuleId("TagStandIn");
-    ASSERT_NE(creg->InstallOwned(nameId, owner, desc, &s_image), Astra::InstallResult::Refused);
-    auto loaded = Astra::Registry::Load(bytes, creg);
-    EXPECT_TRUE(loaded.IsErr());
+    creg->RegisterComponents<Position, Name>();
+    auto loaded = Astra::Registry::Load(bytes, creg);   // default Config: Name is Table here
+    ASSERT_TRUE(loaded.IsOk()) << "error " << static_cast<int>(*loaded.GetError());
+    Astra::Registry& out = **loaded.GetValue();
+
+    const auto pos = Astra::TypeID<Position>::Value();
+    const auto name = Astra::TypeID<Name>::Value();
+    ASSERT_NE(out.GetArchetypeManager()->FindArchetype(MaskOf({pos, name})), nullptr);
+    EXPECT_EQ(out.GetArchetypeManager()->FindArchetype(MaskOf({pos, name}))->GetEntityCount(), 20u);
+    for (int i = 0; i < 20; ++i)
+    {
+        ASSERT_TRUE(out.HasComponent<Name>(es[i]));
+        ASSERT_NE(out.GetComponent<Name>(es[i]), nullptr);
+        EXPECT_EQ(out.GetComponent<Name>(es[i])->value, LongName(i));
+    }
+    EXPECT_EQ(out.ValidateStorageInvariants(), "");
 }

@@ -3125,9 +3125,12 @@ namespace Astra
         }
 
         // Post-load storage fix-ups (spec s8.2/s8.3), run once the checksum verifies.
-        // Task 34 prepends ApplyMigratedTableComponents.
+        // The staged Table-now columns land first (one batched move per (source,
+        // destination) pair), so universals and presence see the final archetypes.
         bool FinishStorageLoad()
         {
+            if (!m_archetypeManager->ApplyMigratedTableComponents(m_componentStorage->PendingTableMigrations()))
+                return false;
             FillMissingUniversals();
             return DeriveStoragePresence();
         }
@@ -3239,29 +3242,6 @@ namespace Astra
 
     namespace Detail
     {
-        // Decodes `count` values into scratch and drops them: the Table-now arm
-        // (archived Sparse/Universal, Table in the loading build) until Task 34 stages
-        // the values (RULINGS Task 31/32). Keeps the stream aligned, like
-        // ResourceStorage::Deserialize's transient-resource pattern.
-        inline bool DiscardStoredValues(BinaryReader& r, const ComponentDescriptor& desc, uint32_t count)
-        {
-            ASTRA_ASSERT(desc.deserializeVersioned, "DiscardStoredValues: component descriptor has no deserialize hook");
-            if (!desc.deserializeVersioned || desc.size == 0)
-                return false;
-            AllocResult scratch = AllocateMemory(desc.size, desc.alignment);
-            if (!scratch.ptr)
-                return false;
-            bool ok = true;
-            for (uint32_t i = 0; i < count && ok; ++i)
-            {
-                desc.DefaultConstruct(scratch.ptr);
-                ok = desc.deserializeVersioned(r, scratch.ptr);
-                desc.Destruct(scratch.ptr);
-            }
-            FreeMemory(scratch.ptr, desc.size);
-            return ok;
-        }
-
         // One stored component's payload (spec s8.2), read into whatever storage the
         // LOADING registry assigns (s8.3). Entities are untrusted: each must be live
         // in the registry being loaded, ascending and unique. The archive's flags decide
@@ -3290,14 +3270,16 @@ namespace Astra
             const bool hasDisabled = (flags & StorageFormat::FLAG_HAS_DISABLED) != 0;
             if (storage.KindOf(desc.id) == StorageKind::Table)
             {
-                // Sparse/Universal in the archive, Table here: decode-and-discard until
-                // Task 34 stages the values (the bitmap is validated and dropped, IM-9).
-                if (hasValues && !DiscardStoredValues(r, desc, count))
+                // s8.3 bullet 2: archived Sparse/Universal, Table here. Stage the values
+                // (and disabled bits); FinishStorageLoad moves them into their archetypes.
+                StagedTableColumn staged(desc, entities.size());
+                const bool ok = StorageFormat::ReadElementRun(r, entities.size(), desc, hasValues, hasDisabled,
+                    [&](size_t i) { staged.EntityAt(i) = entities[i]; return staged.At(i); },
+                    [&](size_t i) { staged.SetDisabled(i, true); });
+                if (!ok)
                     return false;
-                std::vector<uint8_t> disabled;
-                if (hasDisabled && !StorageFormat::ReadDisabledBitmap(r, entities.size(), disabled))
-                    return false;
-                return !r.HasError();
+                storage.PendingTableMigrations().push_back(std::move(staged));
+                return true;
             }
             return StorageFormat::ReadElementRun(r, entities.size(), desc, hasValues, hasDisabled,
                 [&](size_t i) { return AcquireLoadTarget(storage, desc, entities[i]); },
