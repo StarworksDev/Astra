@@ -229,3 +229,47 @@ TEST(StorageViewAccess, RangeForSurvivesDestroyingBystandersOnUniversalYield)
     EXPECT_GE(visited, 1u);
     EXPECT_TRUE(reg->ValidateStorageInvariants().empty());
 }
+
+// S4 fix round (Task 42): the hook-path iterator keeps its walk state per iterator, so two
+// live iterators over the SAME view (nested loops, an iterator copy) never share a mask.
+TEST(StorageViewAccess, NestedAndCopiedRangeForIteratorsKeepIndependentWalks)
+{
+    Astra::Registry reg;
+    constexpr size_t N = 7;
+    for (size_t i = 0; i < N; ++i)
+    {
+        Astra::Entity e = reg.CreateEntity<Position>();
+        if (i % 3 != 0)
+            reg.AddComponent(e, PosS{float(i), 0.0f, 0.0f});
+    }
+    reg.CreateEntity<Position>();   // a non-member bystander
+
+    auto expectNested = [](auto view)
+    {
+        const size_t n = view.Size();
+        ASSERT_GT(n, 0u);
+        size_t pairs = 0, innerSum = 0;
+        for (auto a : view)
+        {
+            (void)a;
+            size_t seen = 0;
+            for (auto b : view) { (void)b; ++seen; }
+            innerSum += seen;
+            ++pairs;
+        }
+        EXPECT_EQ(pairs, n);
+        EXPECT_EQ(innerSum, n * n);
+
+        // A copied iterator continues from its own position, independently.
+        auto it = view.begin();
+        auto copy = it;
+        ++it;
+        if (n > 1)
+            EXPECT_NE(std::get<0>(*it), std::get<0>(*copy));
+        size_t viaCopy = 0;
+        for (; copy != view.end(); ++copy) ++viaCopy;
+        EXPECT_EQ(viaCopy, n);
+    };
+    expectNested(reg.CreateView<Position, PosS>());                 // per-entity stepping
+    expectNested(reg.CreateView<Position, Astra::With<PosS>>());    // run stepping
+}

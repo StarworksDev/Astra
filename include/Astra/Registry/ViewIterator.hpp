@@ -59,7 +59,7 @@ namespace Astra
             using pointer = value_type*;
             using reference = value_type&;
 
-            Iterator() noexcept = default;
+            ASTRA_FORCEINLINE Iterator() noexcept {}   // user-provided + inline: an out-of-line (defaulted) constructor call pins the loop state in memory
 
             // `now` is the registry's current tick, applied as the coarse
             // change-detection stamp to every non-const component column of every
@@ -70,7 +70,9 @@ namespace Astra
             // (no archetypes, enters no chunk) is the default constructor.
             // Not noexcept: the hook path allocates the match words. With hooks, the iterator
             // holds a pointer into the View, so the View must outlive and not move during iteration.
-            Iterator(Archetype* const* archetypes, size_t archetypeCount, Tick now, const ViewIterHooks* hooks = nullptr)
+            // Force-inlined with the walk machinery below: an out-of-line constructor would
+            // take the iterator's address and pin the plain loop's indices in memory.
+            ASTRA_FORCEINLINE Iterator(Archetype* const* archetypes, size_t archetypeCount, Tick now, const ViewIterHooks* hooks = nullptr)
                 : m_archetypes(archetypes)
                 , m_archetypeCount(archetypeCount)
                 , m_now(now)
@@ -100,15 +102,16 @@ namespace Astra
              * Pre-increment operator - advances to next entity.
              * Single index increment on hot path, matching ForEach's pattern.
              */
-            // Hot path: one more index increment than before (m_compIndex) and the
-            // same single compare; m_runEnd == the chunk's count when no hooks are set.
+            // Hot path: exactly the pre-storage walk -- one index increment and one compare
+            // against m_chunkEntityCount. With hooks, m_chunkEntityCount is the END OF THE
+            // CURRENT RUN (the chunk's real count is m_hookChunkCount), so a run boundary
+            // takes the same cold branch a chunk boundary does.
             ASTRA_FORCEINLINE Iterator& operator++()
             {
                 ++m_entityIndex;
-                ++m_compIndex;
-                if (m_entityIndex >= m_runEnd) [[unlikely]]
+                if (m_entityIndex >= m_chunkEntityCount) [[unlikely]]
                 {
-                    NextRun();
+                    AdvanceChunk();
                 }
                 return *this;
             }
@@ -130,7 +133,11 @@ namespace Astra
             }
 
         private:
-            void FindFirstValidPosition()
+            // The walk machinery below is force-inlined: the plain (Table-only) loop must keep the
+            // iterator's indices and column bases in registers, which a non-inlined member call
+            // taking `this` forbids (the pre-storage walk was fully inlined). Everything the hook
+            // path needs beyond the plain state lives in the heap HookWalk, never in the iterator.
+            ASTRA_FORCEINLINE void FindFirstValidPosition()
             {
                 while (m_archetypeIndex < m_archetypeCount)
                 {
@@ -153,22 +160,17 @@ namespace Astra
                 m_chunkEntityCount = 0;
             }
 
-            void AdvanceChunk()
+            // Past the current run (hooks: the next run of this chunk), else the next chunk.
+            ASTRA_FORCEINLINE void AdvanceChunk()
             {
+                if (m_hooks && SeekRun(m_entityIndex))
+                    return;
                 ++m_chunkIndex;
                 FindFirstValidPosition();
             }
 
-            // Past the current run: the next run of this chunk (hooks), else the next chunk.
-            void NextRun()
-            {
-                if (m_hooks && SeekRun(m_entityIndex))
-                    return;
-                AdvanceChunk();
-            }
-
             // Enter a non-empty chunk. False when no entity of it is visible (hooks only).
-            bool EnterChunk(Archetype* archetype, size_t chunkIndex)
+            ASTRA_FORCEINLINE bool EnterChunk(Archetype* archetype, size_t chunkIndex)
             {
                 ArchetypeChunk* chunk = archetype->GetChunks()[chunkIndex].get();
                 m_chunkEntityCount = chunk->GetCount();
@@ -176,9 +178,13 @@ namespace Astra
                 m_componentArrays = std::tuple{chunk->GetComponentArray<std::remove_const_t<Components>>()...};
                 if (m_hooks)
                 {
-                    m_archetype = archetype;
-                    m_chunk = chunk;
-                    if (!m_hooks->chunkMask(m_hooks->view, archetype, chunk, m_words) || !SeekRun(0))
+                    if (!m_walk.p) ASTRA_UNLIKELY
+                        m_walk.p = new HookWalk{};
+                    HookWalk& walk = *m_walk.p;
+                    walk.archetype = archetype;
+                    walk.chunk = chunk;
+                    walk.chunkCount = m_chunkEntityCount;
+                    if (!m_hooks->chunkMask(m_hooks->view, archetype, chunk, walk.words) || !SeekRun(0))
                     {
                         m_chunkEntityCount = 0;
                         return false;
@@ -188,8 +194,6 @@ namespace Astra
                 }
                 StampChunk(archetype, chunk);
                 m_entityIndex = 0;
-                m_compIndex = 0;
-                m_runEnd = m_chunkEntityCount;
                 return true;
             }
 
@@ -215,13 +219,14 @@ namespace Astra
 
             // First index >= from (within this chunk) whose match bit equals `set`; the
             // count when there is none. The words are tail-cleared (WriteMatchWords).
-            size_t NextBit(size_t from, bool set) const noexcept
+            ASTRA_FORCEINLINE size_t NextBit(size_t from, bool set) const noexcept
             {
-                const size_t n = m_chunkEntityCount;
+                const HookWalk& walk = *m_walk.p;
+                const size_t n = walk.chunkCount;
                 while (from < n)
                 {
                     const size_t w = from >> 6;
-                    uint64_t word = set ? m_words[w] : ~m_words[w];
+                    uint64_t word = set ? walk.words[w] : ~walk.words[w];
                     word &= ~uint64_t(0) << (from & 63);
                     if (word)
                     {
@@ -236,34 +241,41 @@ namespace Astra
             // Position on the first visible entity at or after `from` (hooks mode). Run
             // mode: the whole run [i, end) with the chunk arrays. Per-entity mode: one
             // entity, with its element pointers; an entity whose element vanished mid-walk
-            // (reported by the Debug guard) is skipped.
-            bool SeekRun(size_t from)
+            // (reported by the Debug guard) is skipped. m_chunkEntityCount becomes the run end.
+            ASTRA_FORCEINLINE bool SeekRun(size_t from)
             {
-                const size_t n = m_chunkEntityCount;
+                const size_t n = m_walk.p->chunkCount;
                 for (size_t i = NextBit(from, true); i < n; i = NextBit(i + 1, true))
                 {
                     m_entityIndex = i;
                     if (!m_hooks->perEntity)
                     {
-                        m_runEnd = NextBit(i, false);
-                        m_compIndex = i;
+                        m_chunkEntityCount = NextBit(i, false);
                         return true;
                     }
                     void* ptrs[sizeof...(Components) == 0 ? 1 : sizeof...(Components)] = {};
-                    if (!m_hooks->resolve(m_hooks->view, m_archetype, m_chunk, i, ptrs))
+                    if (!m_hooks->resolve(m_hooks->view, m_walk.p->archetype, m_walk.p->chunk, i, ptrs))
                         continue;
-                    SetEntityPointers(ptrs, std::index_sequence_for<Components...>{});
-                    m_runEnd = i + 1;
-                    m_compIndex = 0;
+                    SetEntityPointers(ptrs, i, std::index_sequence_for<Components...>{});
+                    m_chunkEntityCount = i + 1;
                     return true;
                 }
                 return false;
             }
 
+            // Per-entity mode: an element pointer is not a column base, but a dereference is
+            // array[m_entityIndex], so each array is re-based by the index (the element is
+            // read at exactly ptr, and the shifted pointer is never touched otherwise).
             template<size_t... Is>
-            void SetEntityPointers([[maybe_unused]] void** ptrs, std::index_sequence<Is...>) noexcept
+            void SetEntityPointers([[maybe_unused]] void** ptrs, [[maybe_unused]] size_t index, std::index_sequence<Is...>) noexcept
             {
-                ((std::get<Is>(m_componentArrays) = static_cast<std::remove_const_t<Components>*>(ptrs[Is])), ...);
+                ((std::get<Is>(m_componentArrays) = RebasedArray<std::remove_const_t<Components>>(ptrs[Is], index)), ...);
+            }
+
+            template<typename T>
+            static T* RebasedArray(void* element, size_t index) noexcept
+            {
+                return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(element) - index * sizeof(T));
             }
 
             // Empty components have no storage (array pointer is nullptr);
@@ -279,7 +291,7 @@ namespace Astra
                 }
                 else
                 {
-                    return array[m_compIndex];
+                    return array[m_entityIndex];
                 }
             }
 
@@ -312,13 +324,44 @@ namespace Astra
             const Entity* m_entities = nullptr;
             std::tuple<std::remove_const_t<Components>*...> m_componentArrays{};
 
-            // Storage-policy run-stepping (hooks mode); m_runEnd/m_compIndex are also the
-            // plain walk's bound and component index (== m_chunkEntityCount / m_entityIndex).
-            Archetype* m_archetype = nullptr;
-            ArchetypeChunk* m_chunk = nullptr;
-            std::vector<uint64_t> m_words;
-            size_t m_runEnd = 0;
-            size_t m_compIndex = 0;
+            // Storage-policy run-stepping (hooks mode only; the plain walk never reads it).
+            // A heap object so the iterator itself holds one pointer and nothing a callee could
+            // reach: the plain walk stays register-resident. Deep-copied with the iterator.
+            struct HookWalk
+            {
+                Archetype* archetype = nullptr;
+                ArchetypeChunk* chunk = nullptr;
+                std::vector<uint64_t> words;   // the current chunk's match mask
+                size_t chunkCount = 0;         // the chunk's real entity count (m_chunkEntityCount is the run end)
+            };
+            struct WalkPtr
+            {
+                HookWalk* p = nullptr;
+                WalkPtr() noexcept = default;
+                WalkPtr(const WalkPtr& o) : p(o.p ? new HookWalk(*o.p) : nullptr) {}
+                WalkPtr(WalkPtr&& o) noexcept : p(std::exchange(o.p, nullptr)) {}
+                WalkPtr& operator=(const WalkPtr& o)
+                {
+                    if (this != &o)
+                    {
+                        HookWalk* copy = o.p ? new HookWalk(*o.p) : nullptr;
+                        delete p;
+                        p = copy;
+                    }
+                    return *this;
+                }
+                WalkPtr& operator=(WalkPtr&& o) noexcept
+                {
+                    if (this != &o)
+                    {
+                        delete p;
+                        p = std::exchange(o.p, nullptr);
+                    }
+                    return *this;
+                }
+                ~WalkPtr() { delete p; }
+            };
+            WalkPtr m_walk;
         };
 
         // `now`: the registry's current tick for the iterator's chunk-entry stamp
