@@ -25,6 +25,9 @@ namespace
         template<typename Archive>
         void Serialize(Archive& ar) { ar(guidHi)(guidLo)(name); }
     };
+#ifdef NDEBUG
+    static_assert(sizeof(BenchIdentity) == 48, "BenchIdentity must be the 48 B Arcane::Identity shape (MSVC x64 release STL)");
+#endif
     struct ChurnT { uint64_t a, b; };
     struct ChurnS { static constexpr auto AstraStorage = Astra::Storage::Sparse; uint64_t a, b; };
 

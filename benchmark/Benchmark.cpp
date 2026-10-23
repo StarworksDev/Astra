@@ -1466,7 +1466,9 @@ namespace StorageBench
     }
 
     // Scattered membership at `pct` percent (multiplicative hash, deterministic): the
-    // realistic case -- holders are interleaved with non-holders inside every chunk.
+    // realistic case for Sparse -- holders are interleaved with non-holders inside every chunk.
+    // (A Table member does not interleave: its non-holders sit in a separate archetype and are
+    // skipped by chunk, so Table iterates only matched entities, its best case.)
     inline bool Holds(size_t i, int pct) { return ((i * 2654435761ull) >> 7) % 100 < static_cast<size_t>(pct); }
 
     // 1. Structural churn with the 48 B Identity present on every entity: one timed op =
@@ -1556,10 +1558,11 @@ namespace StorageBench
     }
 
     // 3c. Sparse-driven View<C> with a NON-const, untracked yield: every visited entity writes,
-    //     so the walk stamps the shared per-component coarse version. Serial vs ParallelForEach
-    //     on a worker pool measures that shared-stamp cache-line contention (RULINGS Task 41,
-    //     Task 28 review). Compare the two rows: a Parallel row slower than Serial at the same
-    //     size is the contention signature.
+    //     so the walk stamps the shared per-component coarse version (once per visited CHUNK,
+    //     not per entity). Serial vs ParallelForEach on a worker pool measures parallel scaling
+    //     of the sparse-driven walk (RULINGS Task 41, Task 28 review): a Parallel row that is
+    //     not faster than Serial at the same size would be a scaling collapse. It does not
+    //     isolate per-entity stamp contention (there is none). Both rows use UseRealTime().
     template<class C, bool Parallel>
     void SparseDrivenWrite(benchmark::State& state)
     {
@@ -1631,8 +1634,8 @@ BENCHMARK(BM_Storage_FilteredIter_Table)->Args({100'000, 1})->Args({100'000, 50}
 BENCHMARK(BM_Storage_FilteredIter_Sparse)->Args({100'000, 1})->Args({100'000, 50})->Args({100'000, 99});
 BENCHMARK(BM_Storage_SoleIter_Table)->Args({100'000, 1})->Args({100'000, 50})->Args({100'000, 99});
 BENCHMARK(BM_Storage_SoleIter_Sparse)->Args({100'000, 1})->Args({100'000, 50})->Args({100'000, 99});
-BENCHMARK(BM_Storage_SparseDrivenWrite_Serial)->Args({100'000, 50})->Args({1'000'000, 50});
-BENCHMARK(BM_Storage_SparseDrivenWrite_Parallel)->Args({100'000, 50})->Args({1'000'000, 50});
+BENCHMARK(BM_Storage_SparseDrivenWrite_Serial)->Args({100'000, 50})->Args({1'000'000, 50})->UseRealTime();
+BENCHMARK(BM_Storage_SparseDrivenWrite_Parallel)->Args({100'000, 50})->Args({1'000'000, 50})->UseRealTime();
 BENCHMARK(BM_Storage_RandomGet_Table)->Arg(10'000)->Arg(100'000)->Arg(1'000'000);
 BENCHMARK(BM_Storage_RandomGet_Sparse)->Arg(10'000)->Arg(100'000)->Arg(1'000'000);
 BENCHMARK(BM_Storage_RandomGet_Universal)->Arg(10'000)->Arg(100'000)->Arg(1'000'000);
