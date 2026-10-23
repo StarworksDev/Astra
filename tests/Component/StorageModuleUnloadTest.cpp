@@ -8,6 +8,7 @@
 #include <Astra/Registry/Registry.hpp>
 #include "../TestComponents.hpp"
 #include "../Support/StorageOverride.hpp"
+#include "../Support/DiagnosticsTestGuards.hpp"
 
 namespace
 {
@@ -20,6 +21,14 @@ namespace
         std::vector<bool> installedAtCall;
         std::vector<Astra::ComponentDescriptor::DestructFn*> destructs;
     };
+
+    struct AssertCount { int n = 0; };
+
+    Astra::AssertAction CountAndContinue(const Astra::AssertContext&, void* user) noexcept
+    {
+        ++static_cast<AssertCount*>(user)->n;
+        return Astra::AssertAction::Continue;
+    }
 
     void RecordRelease(void* ctx, Astra::ComponentID id, const Astra::ComponentDescriptor& departing)
     {
@@ -416,10 +425,12 @@ TEST(StorageModuleUnload, UnloadingAPluginUniversalComponentDestroysItsColumn)
 // RULINGS Task 36 (PINNED): the suspended-Universal state (spec s4.4). After the
 // column is dropped "always present" is suspended for that type: typed
 // Has/Get answer absent, typed Add/Emplace answer false (an add never revives a
-// slot, never creates a column and emits nothing), views never visit the
-// entity, and nothing reads an unconstructed slot. Entities created after the
-// type is registered again get a rebuilt column; entities that predate the
-// unload stay without a value.
+// slot, never creates a column and emits nothing), a typed remove is a quiet
+// false, views never visit the entity (Not<U> matches every entity), and
+// nothing reads an unconstructed slot. Once the type is registered again the
+// next create rebuilds the column AND fills it for EVERY live entity (default +
+// init, the s4.4 "until it is registered again" reading), so no partially-live
+// column exists and every View surface agrees with HasComponent.
 TEST(StorageModuleUnload, ASuspendedUniversalAnswersAbsentThroughTheTypedApiAndViews)
 {
     Astra::TestSupport::ScopedDefaultTypeContext ctx;
@@ -448,6 +459,21 @@ TEST(StorageModuleUnload, ASuspendedUniversalAnswersAbsentThroughTheTypedApiAndV
         EXPECT_FALSE(reg.EmplaceComponent<RelocationCanary>(e, 2));
     }
     EXPECT_EQ(reg.GetComponentStorage()->FindUniversal(id), nullptr) << "no read or add path creates a column";
+    {
+        AssertCount count;
+        Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &count);
+        for (const Astra::Entity e : old)
+        {
+            EXPECT_FALSE(reg.RemoveComponent<RelocationCanary>(e)) << "the entity does not hold it (Has is false)";
+            EXPECT_FALSE(reg.RemoveComponentByID(e, id));
+        }
+        EXPECT_EQ(count.n, 0) << "a quiet false, not a refusal: nothing to refuse";
+    }
+    size_t notMatches = 0;
+    reg.CreateView<Position, Astra::Not<RelocationCanary>>().ForEach([&](Astra::Entity, Position&) { ++notMatches; });
+    EXPECT_EQ(notMatches, old.size()) << "Not<U> matches every entity while U is suspended, like HasComponent == false";
+    EXPECT_EQ((reg.CreateView<Position, Astra::Not<RelocationCanary>>().Size()), old.size());
+    EXPECT_TRUE((reg.CreateView<Position, Astra::Not<RelocationCanary>>().Contains(old[0])));
     int visited = 0;
     reg.CreateView<RelocationCanary>().ForEach([&](Astra::Entity, RelocationCanary&) { ++visited; });
     reg.CreateView<Position, RelocationCanary>().ForEach([&](Astra::Entity, Position&, RelocationCanary&) { ++visited; });
@@ -459,22 +485,132 @@ TEST(StorageModuleUnload, ASuspendedUniversalAnswersAbsentThroughTheTypedApiAndV
     EXPECT_EQ(g_postUnloadDestructs, 0);
     EXPECT_EQ(reg.ValidateStorageInvariants(), "");
 
-    // The type is registered again (a reloaded module): a later create rebuilds the column.
+    // The type is registered again (a reloaded module): the next create rebuilds the
+    // column and fills it for every live entity, predating ones included.
     (void)InstallPluginCanary(*creg, Astra::Storage::Table);
+    EXPECT_EQ(reg.GetComponentStorage()->FindUniversal(id), nullptr) << "registering alone builds nothing: a create or access does";
     const Astra::Entity reborn = reg.CreateEntity<Position>();
-    EXPECT_TRUE(reg.HasComponent<RelocationCanary>(reborn));
-    EXPECT_NE(reg.GetComponentStorage()->FindUniversal(id), nullptr);
-    EXPECT_FALSE(reg.HasComponent<RelocationCanary>(old[0])) << "predating entities are not retro-filled";
-    EXPECT_FALSE(reg.HasComponent<RelocationCanary>(whileSuspended));
-    // Per-entity answers stay exact while the column is partially live. (Size() on a
-    // partially-live Universal is chunk-granular and not part of this pin.)
-    int rebuiltVisits = 0;
-    reg.CreateView<RelocationCanary>().ForEach([&](Astra::Entity e, RelocationCanary&) { EXPECT_EQ(e, reborn); ++rebuiltVisits; });
-    EXPECT_EQ(rebuiltVisits, 1);
-    EXPECT_TRUE(reg.CreateView<RelocationCanary>().Contains(reborn));
-    EXPECT_FALSE(reg.CreateView<RelocationCanary>().Contains(old[0]));
-    reg.DestroyEntities(old);
+    ASSERT_NE(reg.GetComponentStorage()->FindUniversal(id), nullptr);
+    std::vector<Astra::Entity> everyone = old;
+    everyone.push_back(whileSuspended);
+    everyone.push_back(reborn);
+    for (const Astra::Entity e : everyone)
+    {
+        EXPECT_TRUE(reg.HasComponent<RelocationCanary>(e)) << "retro-filled: always present holds again";
+        EXPECT_NE(reg.GetComponent<RelocationCanary>(e), nullptr);
+    }
+    EXPECT_TRUE(reg.AddComponent(old[0], RelocationCanary(1))) << "a live Universal: the present-component no-op answer";
+    EXPECT_EQ(reg.Size(), everyone.size());
+    // Every View surface agrees with HasComponent: Size == ForEach count == live entities.
+    size_t visits = 0;
+    reg.CreateView<RelocationCanary>().ForEach([&](Astra::Entity, RelocationCanary&) { ++visits; });
+    EXPECT_EQ(visits, everyone.size());
+    EXPECT_EQ(reg.CreateView<RelocationCanary>().Size(), everyone.size());
+    EXPECT_EQ((reg.CreateView<Position, RelocationCanary>().Size()), everyone.size());
+    for (const Astra::Entity e : everyone)
+        EXPECT_TRUE(reg.CreateView<RelocationCanary>().Contains(e));
+    size_t withVisits = 0;
+    reg.CreateView<Position, Astra::With<RelocationCanary>>().ForEach([&](Astra::Entity, Position&) { ++withVisits; });
+    EXPECT_EQ(withVisits, everyone.size());
+    EXPECT_EQ((reg.CreateView<Position, Astra::With<RelocationCanary>>().Size()), everyone.size());
+    EXPECT_TRUE((reg.CreateView<Position, Astra::With<RelocationCanary>>().Contains(old[0])));
+    size_t notVisits = 0;
+    reg.CreateView<Position, Astra::Not<RelocationCanary>>().ForEach([&](Astra::Entity, Position&) { ++notVisits; });
+    EXPECT_EQ(notVisits, 0u) << "every entity holds U again, so Not<U> matches none";
+    EXPECT_EQ((reg.CreateView<Position, Astra::Not<RelocationCanary>>().Size()), 0u);
+    {
+        AssertCount count;
+        Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &count);
+        EXPECT_FALSE(reg.RemoveComponent<RelocationCanary>(reborn));
+#if MOSAIC_ASSERTS_ACTIVE
+        EXPECT_EQ(count.n, 1) << "a live Universal remove stays refused (and asserts in Debug)";
+#else
+        EXPECT_EQ(count.n, 0);
+#endif
+        EXPECT_TRUE(reg.HasComponent<RelocationCanary>(reborn));
+    }
+    reg.DestroyEntities(everyone);
     EXPECT_EQ(g_postUnloadDestructs, 0);
+    EXPECT_EQ(RelocationCanary::s_live, 0);
+    EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+}
+
+// Spec s5.1: an ENABLEABLE Universal also owns a mirror slot, and its chunk blocks
+// carry present == nullptr ("all present") plus the disabled words. The unload
+// releases those mirror-only blocks in every chunk, so a slot reused by a new
+// Sparse type starts clean. (Timer is the suite's enableable test type.)
+TEST(StorageModuleUnload, UnloadingAnEnableableUniversalReleasesItsMirrorOnlyBlocksInEveryChunk)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    static int s_timerImage = 0;
+    static bool s_timerUnloaded = false;
+    static int s_timerPostUnloadDestructs = 0;
+    s_timerUnloaded = false;
+    s_timerPostUnloadDestructs = 0;
+    struct TimerImage
+    {
+        static void Destruct(void* p)
+        {
+            if (s_timerUnloaded) { ++s_timerPostUnloadDestructs; return; }
+            static_cast<Timer*>(p)->~Timer();
+        }
+    };
+
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponents<Position>();
+    const Astra::ComponentID id = Astra::TypeID<Timer>::Value();
+    Astra::ComponentDescriptor desc = Astra::ComponentRegistry::MakeDescriptor<Timer>(id, nullptr);
+    desc.destruct = &TimerImage::Destruct;
+    desc.name = "PluginTimer";
+    const uint32_t owner = creg->OpenModuleId("TimerPlugin");
+    ASSERT_EQ(creg->InstallOwned(id, owner, desc, &s_timerImage), Astra::InstallResult::Installed);
+
+    Astra::Registry::Config cfg;
+    cfg.AddUniversal<Timer>();
+    Astra::Registry reg(creg, cfg);
+    std::vector<Astra::Entity> es;
+    for (int i = 0; i < 300; ++i) es.push_back(reg.CreateEntity<Position>());   // several chunks
+    for (int i = 0; i < 300; i += 7) ASSERT_TRUE(reg.SetEnabled<Timer>(es[i], false));
+
+    const int slot = reg.GetComponentStorage()->SparseSlotOf(id);
+    ASSERT_GE(slot, 0) << "an enableable Universal owns a mirror slot";
+    size_t chunksWithBlock = 0;
+    size_t chunks = 0;
+    for (Astra::Archetype* archetype : reg.GetArchetypeManager()->GetArchetypes())
+        for (const auto& chunk : archetype->GetChunks())
+            if (chunk && chunk->GetCount() > 0)
+            {
+                ++chunks;
+                if (const auto* b = chunk->FindSparseBlock(static_cast<uint16_t>(slot)))
+                {
+                    ++chunksWithBlock;
+                    EXPECT_EQ(b->present, nullptr) << "mirror-only block";
+                }
+            }
+    ASSERT_GE(chunksWithBlock, 1u);
+    ASSERT_EQ(reg.ValidateStorageInvariants(), "");
+
+    (void)creg->ReleaseModule(owner);
+    s_timerUnloaded = true;
+
+    EXPECT_EQ(reg.GetComponentStorage()->SparseSlotOf(id), -1);
+    EXPECT_FALSE(AnyChunkHasBlock(reg, slot)) << "every chunk's mirror-only block is released";
+    EXPECT_EQ(reg.GetComponentStorage()->FindUniversal(id), nullptr);
+    EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+
+    // A new Sparse type reusing the freed slot must not see stale disabled bits.
+    const Astra::ComponentID nameId = Astra::TestSupport::InstallWithStorage<Name>(*creg, Astra::Storage::Sparse);
+    Name n;
+    ASSERT_TRUE(reg.AddComponentByID(es[0], nameId, &n, sizeof(n)));
+    EXPECT_EQ(reg.GetComponentStorage()->SparseSlotOf(nameId), slot);
+    const Astra::SparseSet* nameSet = reg.GetComponentStorage()->FindSparse(nameId);
+    ASSERT_NE(nameSet, nullptr);
+    EXPECT_FALSE(nameSet->IsDisabled(es[0]));
+    EXPECT_FALSE(nameSet->Contains(es[7]));
+    EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+
+    reg.DestroyEntities(es);
+    EXPECT_EQ(s_timerPostUnloadDestructs, 0);
     EXPECT_EQ(reg.ValidateStorageInvariants(), "");
 }
 

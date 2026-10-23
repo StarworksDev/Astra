@@ -802,7 +802,6 @@ namespace Astra
             m_matchRequired = QueryBuilder::GetTableRequiredMask();
             m_matchExcluded = QueryBuilder::GetTableExcludedMask();
             m_anyUniversal = false;
-            m_neverMatches = false;
 
             ComponentStorage* storage = m_archetypeManager ? m_archetypeManager->GetComponentStorage() : nullptr;
             [&]<typename... Ts>(std::tuple<Ts...>*)
@@ -820,12 +819,6 @@ namespace Astra
                     : void()), ...);
             }(static_cast<PlanTypes*>(nullptr));
 
-            // Not<U> on a Universal U: every live entity holds U, so nothing matches.
-            [&]<typename... Ts>(std::tuple<Ts...>*)
-            {
-                ((m_neverMatches = m_neverMatches || m_kinds[PlanIndex<Ts>] == StorageKind::Universal), ...);
-            }(static_cast<ExcludedTypes*>(nullptr));
-
             m_matchCount = m_matchRequired.Count();
         }
 
@@ -833,8 +826,6 @@ namespace Astra
         // with the Sparse/Universal members taken out (spec s6.1).
         ASTRA_NODISCARD bool MatchesArchetype(const ComponentMask& mask) const
         {
-            if (m_neverMatches) ASTRA_UNLIKELY
-                return false;
             if (!mask.HasAll(m_matchRequired))
                 return false;
             if ((mask & m_matchExcluded).Any())
@@ -1759,7 +1750,7 @@ namespace Astra
         bool ExcludePresent(ArchetypeChunk* chunk, size_t count, ChunkFilter& f) const
         {
             if (m_kinds[PlanIndex<T>] != StorageKind::Sparse)
-                return true;                                   // Not<Universal> never reaches a chunk (m_neverMatches)
+                return true;                                   // Not<Universal>: ExcludedUniversalHeld, per walk
             const StoreRef& s = m_stores[PlanIndex<T>];
             if (s.slot < 0)
                 return true;
@@ -1984,6 +1975,7 @@ namespace Astra
                     ((ok = ok && (m_kinds[PlanIndex<std::remove_const_t<Ts>>] != StorageKind::Universal
                                   || EntityHolds<std::remove_const_t<Ts>>(rec, e, st))), ...);
                 }(static_cast<NamedRequiredTypes*>(nullptr));
+                ok = ok && !ExcludedUniversalHeld(st);
             }
             [&]<typename... Ts>(std::tuple<Ts...>*)
             {
@@ -2185,6 +2177,21 @@ namespace Astra
             return true;
         }
 
+        // Not<U> on a Universal U: while U's column exists every live entity holds it (the
+        // column is always filled for all of them, s4.4), so nothing matches. With no column
+        // (U suspended after a module unload) no entity holds U, so Not<U> matches all,
+        // consistent with HasComponent == false. Decided per walk from the resolved stores,
+        // never cached with the archetype list.
+        ASTRA_NODISCARD bool ExcludedUniversalHeld(const StoreArray& st) const noexcept
+        {
+            bool held = false;
+            [&]<typename... Ts>(std::tuple<Ts...>*)
+            {
+                ((held = held || (m_kinds[PlanIndex<Ts>] == StorageKind::Universal && st[PlanIndex<Ts>].universal != nullptr)), ...);
+            }(static_cast<ExcludedTypes*>(nullptr));
+            return held;
+        }
+
         // Every per-chunk constraint. Returns false when nothing in the chunk can match.
         bool BuildChunkFilter(Archetype* archetype, [[maybe_unused]] ArchetypeChunk* chunk,
                               [[maybe_unused]] size_t count, [[maybe_unused]] ChunkFilter& f) const
@@ -2200,6 +2207,7 @@ namespace Astra
                     ((pass = pass && (m_kinds[PlanIndex<std::remove_const_t<Ts>>] != StorageKind::Universal
                                       || m_stores[PlanIndex<std::remove_const_t<Ts>>].universal != nullptr)), ...);
                 }(static_cast<NamedRequiredTypes*>(nullptr));
+                pass = pass && !ExcludedUniversalHeld(m_stores);
             }
             [&]<typename... Ts>(std::tuple<Ts...>*)
             {
@@ -2873,7 +2881,6 @@ namespace Astra
         ComponentMask m_matchExcluded{};   // Table-kind Not<>
         size_t m_matchCount = 0;           // m_matchRequired.Count(): CollectArchetypes' pre-filter
         bool m_anyUniversal = false;       // some named type is Universal in this registry
-        bool m_neverMatches = false;       // Not<U> on a Universal U
         StoreArray m_stores{};             // resolved per walk (ResolveStores)
         ViewIterHooks m_iterHooks{};       // handed to range-for iterators by begin()
     };

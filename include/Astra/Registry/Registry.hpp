@@ -157,6 +157,7 @@ namespace Astra
         template<Component... Components>
         Entity CreateEntity()
         {
+            RefillSuspendedUniversals();
             Entity entity = m_entityManager.Create();
             if (!entity.IsValid()) ASTRA_UNLIKELY
                 return Entity::Invalid();
@@ -184,6 +185,7 @@ namespace Astra
         {
             static_assert(sizeof...(Components) > 0, "CreateEntityWith requires at least one component");
             AssertContextAffinity();
+            RefillSuspendedUniversals();
             Entity entity = m_entityManager.Create();
             if (!entity.IsValid()) ASTRA_UNLIKELY
                 return Entity::Invalid();
@@ -207,6 +209,7 @@ namespace Astra
             if (count == 0 || outEntities.size() < count)
                 return 0;
 
+            RefillSuspendedUniversals();
             size_t created = m_entityManager.CreateBatch(count, outEntities.begin());
             for (size_t i = created; i < count; ++i)
             {
@@ -228,6 +231,7 @@ namespace Astra
             if (count == 0 || outEntities.size() < count)
                 return 0;
 
+            RefillSuspendedUniversals();
             size_t created = m_entityManager.CreateBatch(count, outEntities.begin());
             for (size_t i = created; i < count; ++i)
             {
@@ -492,7 +496,7 @@ namespace Astra
         {
             AssertContextAffinity();
             if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
-                return m_entityManager.IsValid(entity) ? RefuseUniversalRemove() : false;
+                return UniversalRemoveAnswer(entity, TypeID<T>::Value());
             if constexpr (StorageOfV<T> == Storage::Sparse)
             {
                 if (ResolveKind<T>() == StorageKind::Sparse)
@@ -1032,7 +1036,7 @@ namespace Astra
         bool RemoveComponentByID(Entity entity, ComponentID componentId)
         {
             if (IsUniversalId(componentId)) ASTRA_UNLIKELY
-                return m_entityManager.IsValid(entity) ? RefuseUniversalRemove() : false;
+                return UniversalRemoveAnswer(entity, componentId);
             if (IsSparseId(componentId)) ASTRA_UNLIKELY
                 return SparseRemoveByID(entity, componentId, /*emit*/ true);
 
@@ -2307,6 +2311,17 @@ namespace Astra
             return false;
         }
 
+        // The single-entity form for a declared Universal id. An entity that holds it is
+        // refused (RefuseUniversalRemove). One whose slot is not live (the type is SUSPENDED
+        // after a module unload, spec s4.4) does not hold it: a quiet false, consistent with
+        // HasComponent == false, nothing to refuse. A stale handle is a quiet miss too.
+        bool UniversalRemoveAnswer(Entity entity, ComponentID id) const noexcept
+        {
+            if (!m_entityManager.IsValid(entity) || StoreLookup(entity, id) == nullptr)
+                return false;
+            return RefuseUniversalRemove();
+        }
+
         // Batch form: one refusal per call if any handle is live (a batch of only stale
         // handles misses quietly). Returns 0, the removed count. (A CommandBuffer batch
         // remove executes per entity, so it refuses once per live entity.)
@@ -2774,6 +2789,7 @@ namespace Astra
         {
             if (!preallocated.IsValid()) ASTRA_UNLIKELY
                 return Entity::Invalid();
+            RefillSuspendedUniversals();
             m_archetypeManager->AddEntity(preallocated);   // root archetype
             ConstructUniversalsFor(preallocated, nullptr, 0);
             m_signalManager.Emit<Events::EntityCreated>(preallocated);
@@ -3136,8 +3152,9 @@ namespace Astra
         // store write. It stays truthful after a module unload (spec s4.4): once the column
         // is dropped "always present" is SUSPENDED for the type, an entity whose slot is not
         // live does not hold it, and an add must neither lie (true) nor revive the slot, so
-        // it answers false. Columns are rebuilt only by creating an entity once the type is
-        // registered again; entities that predate the unload are not retro-filled.
+        // it answers false. Once the type is registered again, the next create rebuilds
+        // the column and fills it for EVERY live entity (RefillSuspendedUniversals), so
+        // "always present" holds again and no column is ever partially live.
         ASTRA_NODISCARD bool UniversalAddAnswer(Entity entity, ComponentID id) const noexcept
         {
             return StoreLookup(entity, id) != nullptr;
@@ -3147,6 +3164,30 @@ namespace Astra
         // these constructors, subscribes once to its ComponentRegistry's
         // store-release hooks. Registry is non-copyable and non-movable, so `this`
         // stays valid for the subscription's whole life.
+        // s4.4 "until it is registered again": a Universal released at module unload is
+        // remembered here. At the head of every creation funnel, once such a type's
+        // descriptor is registered again, ONE FillMissingUniversals() walk rebuilds the
+        // column for every live entity (default + init, the same fill Load runs), so a
+        // column is never partially live and Has/Get/views all agree. Runs before the new
+        // entity exists, so the new entity takes the ordinary construct path. One branch
+        // while nothing is suspended; a type that stays unregistered costs nothing here.
+        void RefillSuspendedUniversals()
+        {
+            if (m_suspendedUniversals.empty()) ASTRA_LIKELY
+                return;
+            bool reregistered = false;
+            for (size_t i = m_suspendedUniversals.size(); i-- > 0;)
+            {
+                if (m_componentRegistry->GetComponentDescriptor(m_suspendedUniversals[i]) != nullptr)
+                {
+                    m_suspendedUniversals.erase(m_suspendedUniversals.begin() + static_cast<std::ptrdiff_t>(i));
+                    reregistered = true;
+                }
+            }
+            if (reregistered)
+                FillMissingUniversals();
+        }
+
         void InstallStoreReleaseHook()
         {
             if (m_componentRegistry)
@@ -3172,17 +3213,21 @@ namespace Astra
         // descriptor, so a purged shadowed Sparse entry whose live override says Table
         // would otherwise be skipped and keep a dangling destructor.
         // Universal: its spec stays declared, so the type is SUSPENDED afterwards (see
-        // UniversalAddAnswer; Has/Get answer absent, views skip it via the live bit).
+        // UniversalAddAnswer; Has/Get answer absent, Remove is a quiet false, views skip
+        // it) until RefillSuspendedUniversals rebuilds and fills the column.
         void ReleaseStoredComponent(ComponentID id, const ComponentDescriptor& departing)
         {
             ComponentStorage& storage = *m_componentStorage;
             bool holdsDeparting = false;
+            bool wasUniversal = false;
             if (const SparseSet* set = storage.FindSparse(id))          // never create a store here
                 holdsDeparting = set->Descriptor().destruct == departing.destruct;
             else if (const UniversalColumn* column = storage.FindUniversal(id))
-                holdsDeparting = column->Descriptor().destruct == departing.destruct;
+                holdsDeparting = wasUniversal = column->Descriptor().destruct == departing.destruct;
             if (!holdsDeparting)
                 return;
+            if (wasUniversal && std::find(m_suspendedUniversals.begin(), m_suspendedUniversals.end(), id) == m_suspendedUniversals.end())
+                m_suspendedUniversals.push_back(id);   // refilled when it is registered again
 
             const int slot = storage.SparseSlotOf(id);   // Sparse, or an enableable Universal's mirror slot
             storage.ReleaseComponent(id);
@@ -3308,6 +3353,7 @@ namespace Astra
         Config m_config;   // retained so Clear()/Load() preserve pool + storage policy
         inline static std::atomic<std::uint64_t> s_nextInstanceId{1};   // 0 is never assigned
         uint64_t m_storeReleaseHook = 0;   // ComponentRegistry store-release subscription (s4.4)
+        std::vector<ComponentID> m_suspendedUniversals;   // unloaded Universal types awaiting re-registration (s4.4)
         std::uint64_t m_instanceId;   // last member: initialized last in every ctor
     };
 
