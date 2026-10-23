@@ -2751,9 +2751,11 @@ namespace Astra
         // Universal construction for a freshly placed entity (steps 1-2). `supplied` lists
         // the universal ids whose value the caller already moved in; those skip default
         // and init. Costs one branch in a registry with no universal.
-        void ConstructUniversalsFor(Entity entity, const ComponentID* supplied, size_t suppliedCount)
+        // The guard is inline (a Registry bool, no call, no shared_ptr hop): every single-entity
+        // create runs it, and a Universal-free registry must not pay a function call for it.
+        ASTRA_FORCEINLINE void ConstructUniversalsFor(Entity entity, const ComponentID* supplied, size_t suppliedCount)
         {
-            if (m_componentStorage->HasUniversals()) ASTRA_UNLIKELY
+            if (m_hasUniversals) ASTRA_UNLIKELY
                 m_componentStorage->ConstructUniversals(entity, supplied, suppliedCount);
         }
 
@@ -2761,10 +2763,15 @@ namespace Astra
         // and after the pack's own ComponentAdded. Supplied or not, a universal is "added"
         // at create (s3.3 signals row). By-id payload: a present tag yields
         // EmptyComponentSentinel().
-        void EmitUniversalAdded(Entity entity)
+        ASTRA_FORCEINLINE void EmitUniversalAdded(Entity entity)
         {
-            if (!m_componentStorage->HasUniversals()) ASTRA_LIKELY
+            if (!m_hasUniversals) ASTRA_LIKELY
                 return;
+            EmitUniversalAddedSlow(entity);
+        }
+
+        ASTRA_NOINLINE void EmitUniversalAddedSlow(Entity entity)
+        {
             if (!m_signalManager.IsSignalEnabled(Signal::ComponentAdded)) ASTRA_LIKELY
                 return;
             for (const UniversalSpec& spec : m_componentStorage->UniversalSpecs())
@@ -2780,7 +2787,7 @@ namespace Astra
         // Batch twins of the two helpers above: the guard is tested once, then the loop runs.
         void ConstructUniversalsForBatch(std::span<const Entity> made)
         {
-            if (m_componentStorage->HasUniversals()) ASTRA_UNLIKELY
+            if (m_hasUniversals) ASTRA_UNLIKELY
             {
                 for (const Entity entity : made)
                     m_componentStorage->ConstructUniversals(entity, nullptr, 0);
@@ -2789,7 +2796,7 @@ namespace Astra
 
         void EmitUniversalAddedBatch(std::span<const Entity> made)
         {
-            if (!m_componentStorage->HasUniversals()) ASTRA_LIKELY
+            if (!m_hasUniversals) ASTRA_LIKELY
                 return;
             if (!m_signalManager.IsSignalEnabled(Signal::ComponentAdded)) ASTRA_LIKELY
                 return;
@@ -3187,10 +3194,15 @@ namespace Astra
         // column is never partially live and Has/Get/views all agree. Runs before the new
         // entity exists, so the new entity takes the ordinary construct path. One branch
         // while nothing is suspended; a type that stays unregistered costs nothing here.
-        void RefillSuspendedUniversals()
+        ASTRA_FORCEINLINE void RefillSuspendedUniversals()
         {
             if (m_suspendedUniversals.empty()) ASTRA_LIKELY
                 return;
+            RefillSuspendedUniversalsSlow();
+        }
+
+        ASTRA_NOINLINE void RefillSuspendedUniversalsSlow()
+        {
             bool reregistered = false;
             for (size_t i = m_suspendedUniversals.size(); i-- > 0;)
             {
