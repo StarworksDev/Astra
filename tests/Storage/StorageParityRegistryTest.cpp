@@ -32,7 +32,10 @@ TYPED_TEST(StorageParityPos, VariantIsInForce)
     {
         EXPECT_TRUE(reg->HasComponent<C>(e));                    // always present
         EXPECT_NE(reg->GetComponent<C>(e), nullptr);
-        EXPECT_EQ(reg->GetArchetypeCount(), archetypesBefore);   // not in any archetype mask
+        Astra::Registry plain;                                   // same create, no Universal declared
+        plain.CreateEntity<Velocity>();
+        EXPECT_EQ(archetypesBefore, plain.GetArchetypeCount());  // not in any archetype mask: no extra archetype vs a plain registry
+        EXPECT_EQ(reg->GetArchetypeCount(), archetypesBefore);
     }
     else
     {
@@ -143,6 +146,7 @@ TYPED_TEST(StorageParityPos, StaleHandleAfterDestroyAndRecycleMisses)
         Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &cap);
         EXPECT_FALSE(reg->RemoveComponent<C>(stale));
         EXPECT_FALSE(reg->RemoveComponentByID(stale, Astra::TypeID<C>::Value()));
+        EXPECT_EQ(cap.count, 0) << "a stale handle stays quiet for every kind (Task 12)";
     }
     EXPECT_TRUE(reg->HasComponent<C>(occupant));
     EXPECT_EQ(*reg->GetComponent<C>(occupant), MakePos<C>(5.0f));   // the occupant is untouched
@@ -290,6 +294,7 @@ TYPED_TEST(StorageParityPos, SignalsFireOnGenuineChangeOnly)
     {
         ASSERT_EQ(added.size(), 1u);   // Universal: ComponentAdded at create (s3.3)
         EXPECT_EQ(added[0].first, e);
+        EXPECT_EQ(added[0].second, C{});   // the create-time payload is the default-constructed element
         added.clear();
     }
     else
