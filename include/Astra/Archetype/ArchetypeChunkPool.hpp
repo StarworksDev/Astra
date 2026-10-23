@@ -151,6 +151,7 @@ namespace Astra
             m_count(other.m_count),
             m_entities(std::move(other.m_entities)),
             m_meta(other.m_meta),
+            m_hasSparse(other.m_hasSparse),
             m_columnVersion(other.m_columnVersion),
             m_chunkSize(other.m_chunkSize),
             m_sparseBlocks(std::move(other.m_sparseBlocks)),
@@ -163,6 +164,7 @@ namespace Astra
             other.m_meta = nullptr;
             other.m_count = 0;
             other.m_sparseBlocks.clear();   // the blocks' words now belong to *this
+            other.m_hasSparse = false;
         }
         
         ArchetypeChunk(const ArchetypeChunk&) = delete;
@@ -543,7 +545,7 @@ namespace Astra
             // Sparse presence carry (storage policies, spec s5.3): the tail's bits
             // fill the vacated slot, then the tail is cleared. With index == lastIndex
             // this only clears the removed entity's own bits.
-            if (!m_sparseBlocks.empty()) ASTRA_UNLIKELY
+            if (m_hasSparse) ASTRA_UNLIKELY
                 SwapRemoveSparseBits(index, lastIndex);
 
             // Remove last entity
@@ -717,6 +719,7 @@ namespace Astra
                 SparseBlock fresh;
                 fresh.slot = slot;
                 m_sparseBlocks.insert(m_sparseBlocks.begin() + pos, fresh);
+                m_hasSparse = true;
             }
             SparseBlock& b = m_sparseBlocks[pos];
             if (withDisabled && !b.disabled)
@@ -813,7 +816,7 @@ namespace Astra
         {
             return std::span<const SparseBlock>(m_sparseBlocks.data(), m_sparseBlocks.size());
         }
-        ASTRA_NODISCARD bool HasSparseBlocks() const noexcept { return !m_sparseBlocks.empty(); }
+        ASTRA_NODISCARD bool HasSparseBlocks() const noexcept { return m_hasSparse; }
 
         // Drops one slot's block and returns its words (module unload, Task 36).
         void ReleaseSparseBlock(uint16_t slot) noexcept
@@ -824,6 +827,7 @@ namespace Astra
             m_sparseWords->Release(b->present, words);
             m_sparseWords->Release(b->disabled, words);
             m_sparseBlocks.erase(b);
+            m_hasSparse = !m_sparseBlocks.empty();
         }
 
         // ===================== Change detection: chunk column versions =====================
@@ -1073,7 +1077,7 @@ namespace Astra
 
         void ReleaseSparseBlocks() noexcept
         {
-            if (m_sparseBlocks.empty()) return;
+            if (!m_hasSparse) return;
             const size_t words = WordsForCapacity(m_capacity);
             for (SparseBlock& b : m_sparseBlocks)
             {
@@ -1081,6 +1085,7 @@ namespace Astra
                 m_sparseWords->Release(b.disabled, words);
             }
             m_sparseBlocks.clear();
+            m_hasSparse = false;
         }
 
         ASTRA_NODISCARD static bool TestSparseBit(const uint64_t* words, size_t i) noexcept
@@ -1155,6 +1160,11 @@ namespace Astra
         size_t m_count;
         std::vector<Entity> m_entities;
         const ArchetypeColumnMeta* m_meta{nullptr};  // shared per-archetype metadata (not owned)
+        // == !m_sparseBlocks.empty(), kept HERE beside the hot header: m_sparseBlocks sits
+        // behind the 4 KB column array, and every swap-remove and archetype move of the Table
+        // path asks "does this chunk hold sparse bits" (spec s5.3) -- a cold-line load each
+        // time if it read the vector. Written only where the block list changes.
+        bool m_hasSparse{false};
         Column m_columns[MAX_COMPONENTS]{};          // [0, m_meta->columnCount) live
         Tick* m_columnVersion{nullptr};              // arena-carved, [0, columnCount) live; 0 == never
         size_t m_chunkSize;

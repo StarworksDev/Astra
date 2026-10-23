@@ -57,14 +57,42 @@ namespace Astra
             return m_kinds[Detail::TupleIndexOf<std::remove_const_t<T>, PlanTypes>::value];
         }
 
+        // The ComponentID of a named type, resolved once per Relations object: the Table
+        // traversals hand it to the manager's *WithID fetches instead of paying the runtime
+        // TypeID<T>::Value() lookup (an out-of-line call) several times per entity.
+        template<typename T>
+        ASTRA_NODISCARD ComponentID IdOfT() const noexcept
+        {
+            return m_ids[Detail::TupleIndexOf<std::remove_const_t<T>, PlanTypes>::value];
+        }
+
         void ResolveKinds() noexcept
         {
             m_kinds.fill(StorageKind::Table);
+            m_ids.fill(INVALID_COMPONENT);
+            m_allTable = true;
             const ComponentStorage* storage = m_archetypeManager ? m_archetypeManager->GetComponentStorage() : nullptr;
             [&]<typename... Ts>(std::tuple<Ts...>*)
             {
                 ((m_kinds[Detail::TupleIndexOf<Ts, PlanTypes>::value] = Detail::EffectiveKindOf<Ts>(storage)), ...);
+                ((m_ids[Detail::TupleIndexOf<Ts, PlanTypes>::value] = TypeID<Ts>::Value()), ...);
             }(static_cast<PlanTypes*>(nullptr));
+            for (StorageKind k : m_kinds)
+                m_allTable = m_allTable && k == StorageKind::Table;
+        }
+
+        // Presence of T on `entity`. `Fast` (every named type is Table-kind in this registry,
+        // m_allTable, resolved once per Relations object and dispatched ONCE per traversal)
+        // is the manager's direct typed test, exactly as before storage policies, with no
+        // storage, kind or flag load per entity (spec s6.4 / s11 R2). Otherwise the
+        // kind-dispatched test.
+        template<bool Fast, typename T>
+        ASTRA_FORCEINLINE bool HasT(Entity entity) const
+        {
+            if constexpr (Fast)
+                return m_archetypeManager->HasComponentWithID(entity, IdOfT<T>());
+            else
+                return Detail::HasInStorage<T>(*m_archetypeManager, entity, KindOfT<T>());
         }
 
     public:
@@ -278,6 +306,9 @@ namespace Astra
             }
 
             constexpr size_t kBatchSize = 64;
+            auto run = [&](auto fastTag)
+            {
+            constexpr bool Fast = decltype(fastTag)::value;
             m_scheduler->ParallelFor(count, kBatchSize, [&](size_t begin, size_t end, uint32_t /*worker*/)
             {
                 for (size_t i = begin; i < end; ++i)
@@ -286,7 +317,7 @@ namespace Astra
                     Entity entity = entry.entity;
                     size_t depth = entry.depth;
 
-                    if (PassesFilter(entity))
+                    if (PassesFilterK<Fast>(entity))
                     {
                         // Empty RequiredTuple covers the unfiltered case too
                         // (no QueryArgs => no required components).
@@ -296,11 +327,16 @@ namespace Astra
                         }
                         else
                         {
-                            InvokeParallelWithDepth(entity, depth, func, RequiredTuple{});
+                            InvokeParallelWithDepth<Fast>(entity, depth, func, RequiredTuple{});
                         }
                     }
                 }
             });
+            };
+            if (m_allTable) ASTRA_LIKELY
+                run(std::true_type{});
+            else
+                run(std::false_type{});
         }
         
     private:
@@ -329,14 +365,32 @@ namespace Astra
         }
         
         template<typename Container, typename Func, size_t... Is>
-        ASTRA_FORCEINLINE void ForEachEntityList(const Container& entities, Func&& func, std::index_sequence<Is...>)
+        ASTRA_FORCEINLINE void ForEachEntityList(const Container& entities, Func&& func, std::index_sequence<Is...> is)
         {
             if (!m_archetypeManager) ASTRA_UNLIKELY
                 return;  // Registry destroyed
-            
+
+            // The Table/other-kind choice is made once per traversal, not per entity.
+            if (m_allTable) ASTRA_LIKELY
+                ForEachEntityListK<true>(entities, std::forward<Func>(func), is);
+            else
+                ForEachEntityListCold(entities, std::forward<Func>(func), is);
+        }
+
+        // The Sparse/Universal-aware loop, kept out of line so the Table loop above is the
+        // only code inlined into the caller (the pre-storage shape).
+        template<typename Container, typename Func, size_t... Is>
+        ASTRA_NOINLINE void ForEachEntityListCold(const Container& entities, Func&& func, std::index_sequence<Is...> is)
+        {
+            ForEachEntityListK<false>(entities, std::forward<Func>(func), is);
+        }
+
+        template<bool Fast, typename Container, typename Func, size_t... Is>
+        ASTRA_FORCEINLINE void ForEachEntityListK(const Container& entities, Func&& func, std::index_sequence<Is...>)
+        {
             for (Entity entity : entities)
             {
-                if (PassesFilter(entity))
+                if (PassesFilterK<Fast>(entity))
                 {
                     if constexpr (!HAS_FILTERING)
                     {
@@ -349,25 +403,42 @@ namespace Astra
                     else
                     {
                         // Expand components using index_sequence
-                        func(entity, *FetchYield<std::tuple_element_t<Is, RequiredTuple>>(entity)...);
+                        func(entity, *FetchYield<Fast, false, std::tuple_element_t<Is, RequiredTuple>>(entity)...);
                     }
                 }
             }
         }
         
         template<typename Func, size_t... Is>
-        ASTRA_FORCEINLINE void ForEachCachedWithDepth(const RelationshipGraph::TraversalCache& cache, size_t count, Func&& func, std::index_sequence<Is...>)
+        ASTRA_FORCEINLINE void ForEachCachedWithDepth(const RelationshipGraph::TraversalCache& cache, size_t count, Func&& func, std::index_sequence<Is...> is)
         {
             if (!m_archetypeManager) ASTRA_UNLIKELY
                 return;  // Registry destroyed
-            
+
+            // The Table/other-kind choice is made once per traversal, not per entity.
+            if (m_allTable) ASTRA_LIKELY
+                ForEachCachedWithDepthK<true>(cache, count, std::forward<Func>(func), is);
+            else
+                ForEachCachedWithDepthCold(cache, count, std::forward<Func>(func), is);
+        }
+
+        // Out of line, as ForEachEntityListCold.
+        template<typename Func, size_t... Is>
+        ASTRA_NOINLINE void ForEachCachedWithDepthCold(const RelationshipGraph::TraversalCache& cache, size_t count, Func&& func, std::index_sequence<Is...> is)
+        {
+            ForEachCachedWithDepthK<false>(cache, count, std::forward<Func>(func), is);
+        }
+
+        template<bool Fast, typename Func, size_t... Is>
+        ASTRA_FORCEINLINE void ForEachCachedWithDepthK(const RelationshipGraph::TraversalCache& cache, size_t count, Func&& func, std::index_sequence<Is...>)
+        {
             for (size_t i = 0; i < count; ++i)
             {
                 const auto& entry = cache.entries[i];
                 Entity entity = entry.entity;
                 size_t depth = entry.depth;
                 
-                if (PassesFilter(entity))
+                if (PassesFilterK<Fast>(entity))
                 {
                     if constexpr (!HAS_FILTERING)
                     {
@@ -380,13 +451,13 @@ namespace Astra
                     else
                     {
                         // Expand components using index_sequence
-                        func(entity, depth, *FetchYield<std::tuple_element_t<Is, RequiredTuple>>(entity)...);
+                        func(entity, depth, *FetchYield<Fast, false, std::tuple_element_t<Is, RequiredTuple>>(entity)...);
                     }
                 }
             }
         }
         
-        template<typename Func, typename... Components>
+        template<bool Fast, typename Func, typename... Components>
         ASTRA_FORCEINLINE void InvokeParallelWithDepth(Entity entity, size_t depth, Func&& func, std::tuple<Components...>)
         {
             if (!m_archetypeManager) ASTRA_UNLIKELY
@@ -398,7 +469,7 @@ namespace Astra
             }
             else
             {
-                func(entity, depth, *FetchYield<Components>(entity)...);
+                func(entity, depth, *FetchYield<Fast, true, Components>(entity)...);
             }
         }
         
@@ -416,18 +487,37 @@ namespace Astra
         // workers over a dense descendant range (not chunk-partitioned), so a chunk's
         // column version can be stamped by several workers: GetInStorage stamps it with
         // the Par=true relaxed shared store (same value from every worker, RULINGS
-        // Task 28), while the per-entity `changed` tick has one owner and stays plain.
-        template<typename C>
+        // Task 28; the parallel callers pass Par, the serial ones stamp plainly), while the per-entity `changed` tick has one owner and stays plain.
+        template<bool Fast, bool Par, typename C>
         ASTRA_FORCEINLINE C* FetchYield(Entity entity) const
         {
-            // Any kind (spec 2026-10-01 s6.5): Table via the manager, Sparse/Universal via
-            // their stores. A non-const request is still a write for every kind; the
-            // store stamps go through the Par=true (relaxed atomic_ref) forms, since the
-            // parallel traversals call this from workers (RULINGS Task 28).
-            return Detail::GetInStorage<C>(*m_archetypeManager, entity, KindOfT<C>());
+            if constexpr (Fast)
+            {
+                // All-Table plan: the manager's direct fetch, the pre-storage code.
+                if constexpr (Detail::IsMutableYield<C>)
+                    return m_archetypeManager->template GetComponentMutWithID<C, Par>(entity, IdOfT<C>());
+                else
+                    return m_archetypeManager->template GetComponentWithID<C>(entity, IdOfT<C>());
+            }
+            else
+            {
+                // Any kind (spec 2026-10-01 s6.5): Table via the manager, Sparse/Universal via
+                // their stores. A non-const request is still a write for every kind. `Par`
+                // (the parallel traversals, RULINGS Task 28) selects the relaxed atomic_ref
+                // stamps; the serial traversals take the plain ones.
+                return Detail::GetInStorage<C, Par>(*m_archetypeManager, entity, KindOfT<C>());
+            }
         }
 
+        // Single-entity filter (Parent(), GetChildren(), GetLinks()): not a hot loop, so the
+        // kind choice is a plain runtime branch.
         ASTRA_FORCEINLINE bool PassesFilter(Entity entity) const
+        {
+            return m_allTable ? PassesFilterK<true>(entity) : PassesFilterK<false>(entity);
+        }
+
+        template<bool Fast>
+        ASTRA_FORCEINLINE bool PassesFilterK(Entity entity) const
         {
             if constexpr (!HAS_FILTERING)
             {
@@ -438,7 +528,7 @@ namespace Astra
                 // Check required components
                 if constexpr (std::tuple_size_v<RequiredTuple> > 0)
                 {
-                    if (!HasAllRequired(entity, RequiredTuple{}))
+                    if (!HasAllRequired<Fast>(entity, RequiredTuple{}))
                     {
                         return false;
                     }
@@ -447,7 +537,7 @@ namespace Astra
                 // Check excluded components
                 if constexpr (std::tuple_size_v<ExcludedTuple> > 0)
                 {
-                    if (HasAnyExcluded(entity, ExcludedTuple{}))
+                    if (HasAnyExcluded<Fast>(entity, ExcludedTuple{}))
                     {
                         return false;
                     }
@@ -456,7 +546,7 @@ namespace Astra
                 // Check Any groups
                 if constexpr (std::tuple_size_v<AnyGroups> > 0)
                 {
-                    if (!CheckAnyGroups(entity))
+                    if (!CheckAnyGroups<Fast>(entity))
                     {
                         return false;
                     }
@@ -465,7 +555,7 @@ namespace Astra
                 // Check OneOf groups
                 if constexpr (std::tuple_size_v<OneOfGroups> > 0)
                 {
-                    if (!CheckOneOfGroups(entity))
+                    if (!CheckOneOfGroups<Fast>(entity))
                     {
                         return false;
                     }
@@ -476,7 +566,7 @@ namespace Astra
         }
         
         // Simplified component checking helpers (only compiled if HAS_FILTERING)
-        template<typename... Ts>
+        template<bool Fast, typename... Ts>
         bool HasAllRequired(Entity entity, std::tuple<Ts...>) const
         {
             if constexpr (sizeof...(Ts) == 0)
@@ -487,11 +577,11 @@ namespace Astra
             {
                 if (!m_archetypeManager) ASTRA_UNLIKELY
                     return false;  // Registry destroyed
-                return (Detail::HasInStorage<Ts>(*m_archetypeManager, entity, KindOfT<Ts>()) && ...);
+                return (HasT<Fast, Ts>(entity) && ...);
             }
         }
         
-        template<typename... Ts>
+        template<bool Fast, typename... Ts>
         bool HasAnyExcluded(Entity entity, std::tuple<Ts...>) const
         {
             if constexpr (sizeof...(Ts) == 0)
@@ -502,60 +592,62 @@ namespace Astra
             {
                 if (!m_archetypeManager) ASTRA_UNLIKELY
                     return false;  // Registry destroyed
-                return (Detail::HasInStorage<Ts>(*m_archetypeManager, entity, KindOfT<Ts>()) || ...);
+                return (HasT<Fast, Ts>(entity) || ...);
             }
         }
         
+        template<bool Fast>
         bool CheckAnyGroups(Entity entity) const
         {
-            return CheckAnyGroupsImpl(entity, std::make_index_sequence<std::tuple_size_v<AnyGroups>>{});
+            return CheckAnyGroupsImpl<Fast>(entity, std::make_index_sequence<std::tuple_size_v<AnyGroups>>{});
         }
         
-        template<size_t... Is>
+        template<bool Fast, size_t... Is>
         bool CheckAnyGroupsImpl(Entity entity, std::index_sequence<Is...>) const
         {
-            return (CheckSingleAnyGroup<Is>(entity) && ...);
+            return (CheckSingleAnyGroup<Fast, Is>(entity) && ...);
         }
         
-        template<size_t I>
+        template<bool Fast, size_t I>
         bool CheckSingleAnyGroup(Entity entity) const
         {
             using Group = std::tuple_element_t<I, AnyGroups>;
-            return HasAnyInGroup(entity, Group{});
+            return HasAnyInGroup<Fast>(entity, Group{});
         }
         
-        template<typename... Ts>
+        template<bool Fast, typename... Ts>
         bool HasAnyInGroup(Entity entity, std::tuple<Ts...>) const
         {
             if (!m_archetypeManager) ASTRA_UNLIKELY
                 return false;  // Registry destroyed
-            return (Detail::HasInStorage<Ts>(*m_archetypeManager, entity, KindOfT<Ts>()) || ...);
+            return (HasT<Fast, Ts>(entity) || ...);
         }
         
+        template<bool Fast>
         bool CheckOneOfGroups(Entity entity) const
         {
-            return CheckOneOfGroupsImpl(entity, std::make_index_sequence<std::tuple_size_v<OneOfGroups>>{});
+            return CheckOneOfGroupsImpl<Fast>(entity, std::make_index_sequence<std::tuple_size_v<OneOfGroups>>{});
         }
         
-        template<size_t... Is>
+        template<bool Fast, size_t... Is>
         bool CheckOneOfGroupsImpl(Entity entity, std::index_sequence<Is...>) const
         {
-            return (CheckSingleOneOfGroup<Is>(entity) && ...);
+            return (CheckSingleOneOfGroup<Fast, Is>(entity) && ...);
         }
         
-        template<size_t I>
+        template<bool Fast, size_t I>
         bool CheckSingleOneOfGroup(Entity entity) const
         {
             using Group = std::tuple_element_t<I, OneOfGroups>;
-            return CountInGroup(entity, Group{}) == 1;
+            return CountInGroup<Fast>(entity, Group{}) == 1;
         }
         
-        template<typename... Ts>
+        template<bool Fast, typename... Ts>
         size_t CountInGroup(Entity entity, std::tuple<Ts...>) const
         {
             if (!m_archetypeManager) ASTRA_UNLIKELY
                 return 0;  // Registry destroyed
-            return ((Detail::HasInStorage<Ts>(*m_archetypeManager, entity, KindOfT<Ts>()) ? 1 : 0) + ...);
+            return ((HasT<Fast, Ts>(entity) ? 1 : 0) + ...);
         }
 
         std::shared_ptr<ArchetypeManager> m_archetypeManager;
@@ -563,5 +655,7 @@ namespace Astra
         std::shared_ptr<const RelationshipGraph> m_relationsGraph;
         std::shared_ptr<IWorkScheduler> m_scheduler;
         std::array<StorageKind, NPlanSlots> m_kinds{};
+        std::array<ComponentID, NPlanSlots> m_ids{};
+        bool m_allTable = true;   // every named type is Table-kind in this registry (ResolveKinds)
     };
 }

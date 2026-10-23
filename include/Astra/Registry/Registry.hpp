@@ -105,6 +105,7 @@ namespace Astra
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
             m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            m_hasUniversals = m_componentStorage->HasUniversals();
             InstallStoreReleaseHook();
         }
 
@@ -121,6 +122,7 @@ namespace Astra
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
             m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            m_hasUniversals = m_componentStorage->HasUniversals();
             InstallStoreReleaseHook();
         }
 
@@ -137,6 +139,7 @@ namespace Astra
         {
             m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
             m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            m_hasUniversals = m_componentStorage->HasUniversals();
             InstallStoreReleaseHook();
         }
 
@@ -406,7 +409,7 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return false;
-            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
                 return UniversalAddAnswer(entity, TypeID<T>::Value());   // always present: today's present-component rule, no signal (s3.3, s12.2)
 
             if constexpr (StorageOfV<T> == Storage::Sparse)
@@ -452,7 +455,7 @@ namespace Astra
             // See AddComponent (IM-24): stale/invalid handle -> graceful false, no abort.
             if (!m_entityManager.IsValid(entity))
                 return false;
-            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
                 return UniversalAddAnswer(entity, TypeID<T>::Value());   // always present: see AddComponent
 
             if constexpr (StorageOfV<T> == Storage::Sparse)
@@ -495,7 +498,7 @@ namespace Astra
         bool RemoveComponent(Entity entity)
         {
             AssertContextAffinity();
-            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
                 return UniversalRemoveAnswer(entity, TypeID<T>::Value());
             if constexpr (StorageOfV<T> == Storage::Sparse)
             {
@@ -544,7 +547,7 @@ namespace Astra
         {
             if (entities.empty())
                 return;
-            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
                 return;        // present on every entity: a no-op, no signal
 
             SmallVector<Entity, 256> validEntities;
@@ -596,7 +599,7 @@ namespace Astra
         {
             if (entities.empty())
                 return;
-            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
                 return;        // present on every entity: a no-op, no signal
             
             // Filter out invalid entities
@@ -653,7 +656,7 @@ namespace Astra
         {
             if (entities.empty())
                 return 0;
-            if (IsUniversalId(TypeID<T>::Value())) ASTRA_UNLIKELY
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
                 return RefuseUniversalRemoveBatch(entities);
             if constexpr (StorageOfV<T> == Storage::Sparse)
             {
@@ -2298,7 +2301,7 @@ namespace Astra
             if constexpr (StorageOfV<T> == Storage::Sparse)
                 return true;
             else
-                return m_componentStorage->HasUniversals() && m_componentStorage->IsDeclaredUniversal(TypeID<T>::Value());
+                return m_hasUniversals && m_componentStorage->IsDeclaredUniversal(TypeID<T>::Value());
         }
 
         // D2's single exception (spec 2026-10-01 s3.3, s12.3): a universal component is
@@ -2343,7 +2346,16 @@ namespace Astra
         // a registry with no universal).
         ASTRA_NODISCARD bool IsUniversalId(ComponentID id) const noexcept
         {
-            return m_componentStorage->HasUniversals() && m_componentStorage->IsDeclaredUniversal(id);
+            return m_hasUniversals && m_componentStorage->IsDeclaredUniversal(id);
+        }
+
+        // IsUniversalId(TypeID<T>::Value()) with the id resolved only when this registry
+        // has a universal at all: the TypeID lookup is an out-of-line call, and a typed
+        // Table add/remove must not pay it for a check that cannot succeed.
+        template<Component T>
+        ASTRA_NODISCARD bool IsUniversalT() const noexcept
+        {
+            return m_hasUniversals && m_componentStorage->IsDeclaredUniversal(TypeID<T>::Value());
         }
 
         // Kind of `id` for SetEnabled/IsEnabled, with no descriptor read: Universal by the
@@ -2604,7 +2616,10 @@ namespace Astra
         // ResolveKind<T>() == Sparse for the type-erased paths.
         ASTRA_NODISCARD bool IsSparseId(ComponentID id) const noexcept
         {
-            return m_componentStorage->KindOf(id) == StorageKind::Sparse;
+            // A Table-only registry (no Sparse-trait descriptor ever installed) answers
+            // without a descriptor read: Sparse can only come from the trait, and a
+            // Universal declaration wins over it anyway.
+            return m_componentRegistry->MaySpawnSparse() && m_componentStorage->KindOf(id) == StorageKind::Sparse;
         }
 
         // Overwrites a default-constructed element with the type-erased source through
@@ -3077,6 +3092,7 @@ namespace Astra
             // rebuilt, so re-point them; a stale pointer would be a use-after-free.
             registry->m_componentStorage->SetTickSource(registry->m_archetypeManager->TickSource());
             registry->m_archetypeManager->SetComponentStorage(registry->m_componentStorage.get());
+            registry->m_hasUniversals = registry->m_componentStorage->HasUniversals();
             const StorageLoadHooks hooks{registry.get(), &LoadHookIsDiverted, &LoadHookAcquire, &LoadHookSetDisabled};
             if (!registry->m_archetypeManager->Deserialize(reader, &hooks))
             {
@@ -3343,6 +3359,11 @@ namespace Astra
         // cleared in place by Clear(), rebuilt fresh by LoadInternal. Declared right after
         // m_archetypeManager: every ctor initializes it in that order.
         std::shared_ptr<ComponentStorage> m_componentStorage;
+        // HasUniversals() of m_componentStorage, cached on the Registry itself: the typed
+        // Get/Has/Add/Remove routing tests it on EVERY call, and the storage's own answer is
+        // a shared_ptr hop plus two vector-pointer loads. The set of universals is fixed at
+        // ComponentStorage construction (ctor / LoadInternal), the only writers of this flag.
+        bool m_hasUniversals = false;
         std::shared_ptr<RelationshipGraph> m_relationshipGraph;
         SignalManager m_signalManager;
         ResourceStorage m_resourceStorage;

@@ -538,41 +538,62 @@ namespace Astra
             return removedCount;
         }
 
-        template<Component T>
-        ASTRA_NODISCARD T* GetComponent(Entity entity)
+        // The validated record for a typed COLUMN access (non-tag), or nullptr: live handle,
+        // located, `id` in range, chunk present.
+        ASTRA_NODISCARD ASTRA_FORCEINLINE EntityRecord* ColumnRecord(Entity entity, ComponentID id)
         {
             EntityRecord* rec = m_records->GetRecord(entity.GetID());
             if (!rec || rec->version != entity.GetVersion() || !rec->archetype) ASTRA_UNLIKELY
                 return nullptr;
 
+            // Load-bearing guard, not decoration: the old path's safety for
+            // over-ceiling/collision-refused ids (INVALID_COMPONENT, Theme E) came
+            // from Bitmap::Test's internal range check, which this fast path skips.
+            // Without it, idToColumn[id] is an OOB read in Release. Register-only
+            // compare -- zero memory traffic. Spec sec 4.4/4.5.
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return nullptr;
+
+            // Defense-in-depth (Lever 1 final-review Minor #1): a record can hold
+            // archetype != nullptr with chunk == nullptr only via SetEntityLocation
+            // fed a degenerate location -- unreachable today, but the ByID sites
+            // all guard, so the typed path matches them rather than null-deref.
+            if (!rec->chunk) ASTRA_UNLIKELY
+                return nullptr;
+
+            ASTRA_ASSERT(rec->chunk ==
+                         rec->archetype->GetChunks()[rec->location.GetChunkIndex()].get(),
+                         "EntityRecord chunk/location desync");
+            return rec;
+        }
+
+        template<Component T>
+        ASTRA_NODISCARD T* GetComponent(Entity entity)
+        {
+            return GetComponentWithID<T>(entity, TypeID<T>::Value());
+        }
+
+        // The one body of the typed fetch. `id` MUST be TypeID<T>::Value(): a caller that
+        // walks many entities (the Relations traversals) resolves it once instead of paying
+        // the runtime TypeID lookup per entity. A tag ignores it (presence is the mask's).
+        template<Component T>
+        ASTRA_NODISCARD T* GetComponentWithID(Entity entity, ComponentID id)
+        {
             if constexpr (std::is_empty_v<T>)
             {
+                EntityRecord* rec = m_records->GetRecord(entity.GetID());
+                if (!rec || rec->version != entity.GetVersion() || !rec->archetype) ASTRA_UNLIKELY
+                    return nullptr;
                 // Tags have no storage column (idToColumn == -1 whether present or not),
                 // so presence MUST come from the archetype mask.
                 return rec->archetype->GetComponent<T>(rec->location);
             }
             else
             {
-                // Load-bearing guard, not decoration: the old path's safety for
-                // over-ceiling/collision-refused ids (INVALID_COMPONENT, Theme E) came
-                // from Bitmap::Test's internal range check, which this fast path skips.
-                // Without it, idToColumn[id] is an OOB read in Release. Register-only
-                // compare -- zero memory traffic. Spec sec 4.4/4.5.
-                const ComponentID id = TypeID<T>::Value();
-                if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                EntityRecord* rec = ColumnRecord(entity, id);
+                if (!rec) ASTRA_UNLIKELY
                     return nullptr;
-
-                // Defense-in-depth (Lever 1 final-review Minor #1): a record can hold
-                // archetype != nullptr with chunk == nullptr only via SetEntityLocation
-                // fed a degenerate location -- unreachable today, but the ByID sites
-                // all guard, so the typed path matches them rather than null-deref.
-                if (!rec->chunk) ASTRA_UNLIKELY
-                    return nullptr;
-
-                ASTRA_ASSERT(rec->chunk ==
-                             rec->archetype->GetChunks()[rec->location.GetChunkIndex()].get(),
-                             "EntityRecord chunk/location desync");
-                return rec->chunk->GetComponent<T>(rec->location.GetEntityIndex());
+                return static_cast<T*>(rec->chunk->GetComponentPointer(id, rec->location.GetEntityIndex()));
             }
         }
 
@@ -585,19 +606,33 @@ namespace Astra
         template<Component T, bool Par = false>
         ASTRA_NODISCARD T* GetComponentMut(Entity entity)
         {
-            T* ptr = GetComponent<T>(entity);
-            if constexpr (!std::is_empty_v<T>)
+            return GetComponentMutWithID<T, Par>(entity, TypeID<T>::Value());
+        }
+
+        // GetComponentMut with the caller's resolved `id` (== TypeID<T>::Value()): ONE record
+        // lookup, then the column, the pointer and the stamp all from that chunk.
+        template<Component T, bool Par = false>
+        ASTRA_NODISCARD T* GetComponentMutWithID(Entity entity, ComponentID id)
+        {
+            if constexpr (std::is_empty_v<T>)
             {
-                if (ptr) ASTRA_LIKELY
-                {
-                    const EntityRecord* rec = m_records->GetRecord(entity.GetID());   // validated by GetComponent above
-                    const int col = rec->archetype->GetColumnMeta().idToColumn[TypeID<T>::Value()];
-                    rec->chunk->template StampColumn<Par>(col, m_tick);
-                    if constexpr (IsChangeTrackedV<T>)
-                        rec->chunk->GetTicks(col)[rec->location.GetEntityIndex()].changed = m_tick;
-                }
+                return GetComponentWithID<T>(entity, id);   // a tag has no column to stamp
             }
-            return ptr;
+            else
+            {
+                EntityRecord* rec = ColumnRecord(entity, id);
+                if (!rec) ASTRA_UNLIKELY
+                    return nullptr;
+                const int col = rec->archetype->GetColumnMeta().idToColumn[id];
+                if (col < 0) ASTRA_UNLIKELY
+                    return nullptr;   // absent
+                const size_t index = rec->location.GetEntityIndex();
+                T* ptr = static_cast<T*>(rec->chunk->GetColumnPointer(static_cast<uint16_t>(col), index));
+                rec->chunk->template StampColumn<Par>(col, m_tick);
+                if constexpr (IsChangeTrackedV<T>)
+                    rec->chunk->GetTicks(col)[index].changed = m_tick;
+                return ptr;
+            }
         }
 
         // Explicit "I wrote T on this entity" for raw-pointer code (Registry::Modified).
@@ -621,10 +656,16 @@ namespace Astra
         template<Component T>
         ASTRA_NODISCARD bool HasComponent(Entity entity) const
         {
+            return HasComponentWithID(entity, TypeID<T>::Value());
+        }
+
+        // HasComponent<T> with the caller's resolved `id` (== TypeID<T>::Value()).
+        ASTRA_NODISCARD bool HasComponentWithID(Entity entity, ComponentID id) const
+        {
             const EntityRecord* rec = m_records->GetRecord(entity.GetID());
             if (!rec || rec->version != entity.GetVersion() || !rec->archetype) ASTRA_UNLIKELY
                 return false;
-            return rec->archetype->HasComponent<T>();
+            return rec->archetype->HasComponent(id);
         }
 
         template<Component... Components>
@@ -1732,7 +1773,12 @@ namespace Astra
                     // The shared ladder (memcpy / constructWith / copy / move-out-of-buffer
                     // for a move-only type / default) lives on the descriptor.
                     if (newDesc.size != 0) ASTRA_LIKELY
-                        newDesc.ConstructFromErased(dstPtr, componentData);
+                    {
+                        if (newDesc.is_trivially_copyable) ASTRA_LIKELY
+                            std::memcpy(dstPtr, componentData, newDesc.size);
+                        else
+                            newDesc.ConstructFromErased(dstPtr, componentData);
+                    }
                 }
                 else
                 {

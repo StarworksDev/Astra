@@ -229,6 +229,12 @@ namespace Astra
             return dropped;
         }
 
+        // False until a descriptor with the Sparse storage trait has EVER been installed here
+        // (monotonic: unloading it does not reset). While false, no id of this registry can
+        // be Sparse-trait, so the type-erased Table paths skip the per-call descriptor read
+        // (Registry::IsSparseId). True only means "maybe": callers still ask KindOf.
+        ASTRA_NODISCARD bool MaySpawnSparse() const noexcept { return m_anySparse.load(std::memory_order_relaxed); }
+
         ASTRA_NODISCARD const ComponentDescriptor* GetComponentDescriptor(ComponentID id) const
         {
             // Directly-indexed, pointer-stable: &m_components[id] never moves for
@@ -523,6 +529,7 @@ namespace Astra
                 if (!refusedReplace)   // refused: the slot is left untouched
                 {
                     m_components[id] = desc;
+                    NoteStorage(desc);
                     m_present.Set(id);
                     m_hashToID[desc.hash] = id;
                     m_owner[id] = owner;
@@ -701,6 +708,7 @@ namespace Astra
                 it->second.pop_back();
                 if (it->second.empty()) m_shadow.Erase(it);
                 m_components[id]  = restored.desc;        // same address, new contents
+                NoteStorage(restored.desc);
                 m_owner[id]       = restored.owner;
                 m_metaModule[id]  = restored.module;
             }
@@ -808,6 +816,7 @@ namespace Astra
 
                 // Directly indexed; the array slot is pointer-stable for life.
                 m_components[id] = desc;
+                NoteStorage(desc);
                 m_present.Set(id);
                 m_hashToID[desc.hash] = id;
                 m_owner[id] = 0;  // anonymous: this path never goes through a ComponentModule
@@ -928,6 +937,12 @@ namespace Astra
         // ResourceStorage teardown segfault). A fixed array never moves, so every
         // GetComponentDescriptor() pointer stays valid for the registry's life.
         std::array<ComponentDescriptor, MAX_COMPONENTS> m_components{};
+        std::atomic<bool> m_anySparse{false};   // see MaySpawnSparse
+        void NoteStorage(const ComponentDescriptor& d) noexcept
+        {
+            if (d.storage == Storage::Sparse)
+                m_anySparse.store(true, std::memory_order_relaxed);
+        }
         ComponentMask m_present;  // which ids in m_components hold a registered descriptor
         FlatMap<uint64_t, ComponentID> m_hashToID;  // hash -> id (sparse; stays a hash map)
         // Use deque instead of vector to prevent pointer invalidation when adding new names.

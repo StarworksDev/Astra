@@ -79,9 +79,10 @@ namespace Astra::Detail
     // WRITE, as on the Table arm (GetComponentMut): Universal through MarkWritten, Sparse
     // through StampSparseWrite. Callable from parallel workers: it never creates a store,
     // and the shared stamp locations (coarse version, Universal page version) go through
-    // the relaxed atomic_ref store (RULINGS Task 28; all workers write the same value).
+    // the relaxed atomic_ref store (RULINGS Task 28; all workers write the same value) when
+    // `Par` is set; the serial traversals take the plain stamps.
     // A present tag yields the shared per-type instance.
-    template<typename T>
+    template<typename T, bool Par = false>
     ASTRA_NODISCARD std::remove_const_t<T>* GetInStorage(ArchetypeManager& am, Entity e, StorageKind kind)
     {
         using Bare = std::remove_const_t<T>;
@@ -98,7 +99,7 @@ namespace Astra::Detail
             else
             {
                 if constexpr (Write)
-                    col->template MarkWritten<true>(e, am.CurrentTick());
+                    col->template MarkWritten<Par>(e, am.CurrentTick());
                 return static_cast<Bare*>(col->Get(e));
             }
         }
@@ -112,12 +113,12 @@ namespace Astra::Detail
             else
             {
                 if constexpr (Write)
-                    (void)StampSparseWrite<true>(*storage, *set, id, e, am.CurrentTick());
+                    (void)StampSparseWrite<Par>(*storage, *set, id, e, am.CurrentTick());
                 return static_cast<Bare*>(set->Get(e));
             }
         }
         if constexpr (Write)
-            return am.template GetComponentMut<Bare, true>(e);
+            return am.template GetComponentMut<Bare, Par>(e);
         else
             return am.template GetComponent<Bare>(e);
     }
