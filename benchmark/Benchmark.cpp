@@ -1,11 +1,14 @@
 #include <Astra/Astra.hpp>
 #include <Support/TestWorkerPool.hpp>  // reference pool via the "tests" includedir
 #include <benchmark/benchmark.h>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <queue>
 #include <random>
+#include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 namespace
@@ -1361,5 +1364,277 @@ BENCHMARK(BM_SystemScheduler_Parallel)->Arg(10'000)->Arg(100'000);
 BENCHMARK(BM_SystemScheduler_ManyIndependent);
 BENCHMARK(BM_SystemScheduler_WithDependencies);
 BENCHMARK(BM_SystemScheduler_CustomExecutor)->Arg(10'000)->Arg(100'000);
+
+// ============================================================================
+// S4 Table-only by-id set (RULINGS Task 41, from the Task 18 review). The by-id add/remove
+// paths now read a descriptor via IsSparseId; nothing else measures them. These are
+// deliberately NOT named BM_Storage_*: Task 42's `--benchmark_filter=-BM_Storage_` gate keeps
+// them in the 2% comparison against the pre-storage baselines. Only APIs that exist at 975cdb7
+// are used, so the same source builds on both baselines.
+// ============================================================================
+
+// Registry::AddComponentByID / RemoveComponentByID churn of a Table component (Velocity).
+static void BM_AddRemoveByID(benchmark::State& state)
+{
+    const size_t count = static_cast<size_t>(state.range(0));
+    Astra::Registry registry;
+    std::vector<Astra::Entity> entities;
+    entities.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        Astra::Entity e = registry.CreateEntity();
+        registry.EmplaceComponent<Position>(e);
+        entities.push_back(e);
+    }
+    // Registers Velocity and warms the {Position} <-> {Position, Velocity} archetype pair.
+    registry.EmplaceComponent<Velocity>(entities[0]);
+    registry.RemoveComponent<Velocity>(entities[0]);
+    const Astra::ComponentID id = Astra::TypeID<Velocity>::Value();
+    const Velocity value{1, 2};
+
+    for (auto _ : state)
+    {
+        for (Astra::Entity e : entities) benchmark::DoNotOptimize(registry.AddComponentByID(e, id, &value, sizeof(value)));
+        for (Astra::Entity e : entities) benchmark::DoNotOptimize(registry.RemoveComponentByID(e, id));
+    }
+    state.SetItemsProcessed(state.iterations() * count * 2);
+}
+
+// CommandBuffer playback of the same add/remove (Execute -> Registry::AddComponentByID /
+// RemoveComponentByID). The timed op records N adds, plays them back, records N removes, plays those back.
+static void BM_CommandBufferAddRemove(benchmark::State& state)
+{
+    const size_t count = static_cast<size_t>(state.range(0));
+    Astra::Registry registry;
+    std::vector<Astra::Entity> entities;
+    entities.reserve(count);
+    for (size_t i = 0; i < count; ++i)
+    {
+        Astra::Entity e = registry.CreateEntity();
+        registry.EmplaceComponent<Position>(e);
+        entities.push_back(e);
+    }
+    registry.EmplaceComponent<Velocity>(entities[0]);
+    registry.RemoveComponent<Velocity>(entities[0]);
+    Astra::CommandBuffer cmd(&registry);
+
+    for (auto _ : state)
+    {
+        for (Astra::Entity e : entities) cmd.AddComponent(e, Velocity{1, 2});
+        benchmark::DoNotOptimize(cmd.Execute());
+        for (Astra::Entity e : entities) cmd.RemoveComponent<Velocity>(e);
+        benchmark::DoNotOptimize(cmd.Execute());
+    }
+    state.SetItemsProcessed(state.iterations() * count * 2);
+}
+
+// ============================================================================
+// Storage policies (spec 2026-10-01 s9.3). Every name starts with BM_Storage_ so
+// the S4 Table-only regression gate excludes them: --benchmark_filter=-BM_Storage_
+// ============================================================================
+namespace StorageBench
+{
+    // The Arcane Identity shape: 16 B GUID + std::string name (48 B on MSVC x64 with
+    // _ITERATOR_DEBUG_LEVEL 0; the Debug runtime's checked std::string is larger),
+    // non-trivially copyable -- every archetype move string-moves it while it is Table.
+    // bench-compare/bench_storage.cpp repeats these small types on purpose: the two are
+    // independent executables.
+    struct BenchIdentity
+    {
+        std::uint64_t guidHi = 0;
+        std::uint64_t guidLo = 0;
+        std::string name;
+
+        template<typename Archive>
+        void Serialize(Archive& ar) { ar(guidHi)(guidLo)(name); }
+    };
+#if defined(_MSC_VER) && _ITERATOR_DEBUG_LEVEL == 0
+    static_assert(sizeof(BenchIdentity) == 48, "BenchIdentity must match Arcane::Identity's 48 bytes");
+#endif
+    static_assert(!std::is_trivially_copyable_v<BenchIdentity>);
+
+    struct ChurnT { std::uint64_t a, b; };                                                    // 16 B, Table
+    struct ChurnS { static constexpr auto AstraStorage = Astra::Storage::Sparse; std::uint64_t a, b; };   // 16 B, Sparse
+    static_assert(sizeof(ChurnT) == 16 && sizeof(ChurnS) == 16);
+
+    template<class... Ts>
+    std::shared_ptr<Astra::ComponentRegistry> Components()
+    {
+        auto creg = std::make_shared<Astra::ComponentRegistry>();
+        creg->RegisterComponents<Ts...>();
+        return creg;
+    }
+
+    // Scattered membership at `pct` percent (multiplicative hash, deterministic): the
+    // realistic case -- holders are interleaved with non-holders inside every chunk.
+    inline bool Holds(size_t i, int pct) { return ((i * 2654435761ull) >> 7) % 100 < static_cast<size_t>(pct); }
+
+    // 1. Structural churn with the 48 B Identity present on every entity: one timed op =
+    //    add Velocity + remove Velocity (2 archetype moves). Universal takes Identity out of both.
+    template<bool Universal>
+    void IdentityChurn(benchmark::State& state)
+    {
+        const size_t count = static_cast<size_t>(state.range(0));
+        Astra::Registry::Config cfg;
+        if constexpr (Universal) cfg.AddUniversal<BenchIdentity>();
+        Astra::Registry registry(Components<Position, Velocity, BenchIdentity>(), cfg);
+        std::vector<Astra::Entity> entities;
+        entities.reserve(count);
+        for (size_t i = 0; i < count; ++i)
+            entities.push_back(registry.CreateEntityWith(Position{i, i}, BenchIdentity{i, ~i, "Entity " + std::to_string(i)}));
+        for (auto _ : state)
+        {
+            for (Astra::Entity e : entities) registry.EmplaceComponent<Velocity>(e);
+            for (Astra::Entity e : entities) registry.RemoveComponent<Velocity>(e);
+        }
+        state.SetItemsProcessed(state.iterations() * count * 2);
+    }
+
+    // 2. Add/remove churn of a 16 B component (S4: Sparse must beat Table at every size).
+    template<class C>
+    void AddRemoveChurn(benchmark::State& state)
+    {
+        const size_t count = static_cast<size_t>(state.range(0));
+        Astra::Registry registry(Components<Position, C>());
+        std::vector<Astra::Entity> entities;
+        entities.reserve(count);
+        for (size_t i = 0; i < count; ++i) entities.push_back(registry.CreateEntityWith(Position{i, i}));
+        for (auto _ : state)
+        {
+            for (Astra::Entity e : entities) registry.AddComponent(e, C{1, 2});
+            for (Astra::Entity e : entities) registry.RemoveComponent<C>(e);
+        }
+        state.SetItemsProcessed(state.iterations() * count * 2);
+    }
+
+    // 3. Filtered iteration View<Position, C> with C on pct% of the entities.
+    template<class C>
+    void FilteredIter(benchmark::State& state)
+    {
+        const size_t count = static_cast<size_t>(state.range(0));
+        const int pct = static_cast<int>(state.range(1));
+        Astra::Registry registry(Components<Position, C>());
+        size_t matched = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            Astra::Entity e = registry.CreateEntityWith(Position{i, i});
+            if (Holds(i, pct)) { registry.AddComponent(e, C{i, i}); ++matched; }
+        }
+        auto view = registry.CreateView<Position, C>();
+        for (auto _ : state)
+        {
+            std::uint64_t sum = 0;
+            view.ForEach([&](Astra::Entity, Position& p, C& c) { sum += p.x + c.a; });
+            benchmark::DoNotOptimize(sum);
+        }
+        state.SetItemsProcessed(state.iterations() * count);   // per scanned entity
+        state.counters["matched"] = static_cast<double>(matched);
+    }
+
+    // 3b. View<C> alone at the same densities: the Sparse one is sparse-driven (s6.2).
+    template<class C>
+    void SoleIter(benchmark::State& state)
+    {
+        const size_t count = static_cast<size_t>(state.range(0));
+        const int pct = static_cast<int>(state.range(1));
+        Astra::Registry registry(Components<Position, C>());
+        size_t matched = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            Astra::Entity e = registry.CreateEntityWith(Position{i, i});
+            if (Holds(i, pct)) { registry.AddComponent(e, C{i, i}); ++matched; }
+        }
+        auto view = registry.CreateView<C>();
+        for (auto _ : state)
+        {
+            std::uint64_t sum = 0;
+            view.ForEach([&](Astra::Entity, C& c) { sum += c.a; });
+            benchmark::DoNotOptimize(sum);
+        }
+        state.SetItemsProcessed(state.iterations() * matched);
+        state.counters["matched"] = static_cast<double>(matched);
+    }
+
+    // 3c. Sparse-driven View<C> with a NON-const, untracked yield: every visited entity writes,
+    //     so the walk stamps the shared per-component coarse version. Serial vs ParallelForEach
+    //     on a worker pool measures that shared-stamp cache-line contention (RULINGS Task 41,
+    //     Task 28 review). Compare the two rows: a Parallel row slower than Serial at the same
+    //     size is the contention signature.
+    template<class C, bool Parallel>
+    void SparseDrivenWrite(benchmark::State& state)
+    {
+        const size_t count = static_cast<size_t>(state.range(0));
+        const int pct = static_cast<int>(state.range(1));
+        Astra::Registry::Config cfg;
+        if constexpr (Parallel) cfg.workScheduler = BenchPool();
+        Astra::Registry registry(Components<Position, C>(), cfg);
+        size_t matched = 0;
+        for (size_t i = 0; i < count; ++i)
+        {
+            Astra::Entity e = registry.CreateEntityWith(Position{i, i});
+            if (Holds(i, pct)) { registry.AddComponent(e, C{i, i}); ++matched; }
+        }
+        auto view = registry.CreateView<C>();
+        for (auto _ : state)
+        {
+            if constexpr (Parallel) view.ParallelForEach([](Astra::Entity, C& c) { c.a += 1; });
+            else view.ForEach([](Astra::Entity, C& c) { c.a += 1; });
+        }
+        state.SetItemsProcessed(state.iterations() * matched);
+        state.counters["matched"] = static_cast<double>(matched);
+    }
+
+    // 4. Random GetComponent, shuffled order (cache-hostile), per kind.
+    template<class C, bool Universal>
+    void RandomGet(benchmark::State& state)
+    {
+        const size_t count = static_cast<size_t>(state.range(0));
+        Astra::Registry::Config cfg;
+        if constexpr (Universal) cfg.AddUniversal<C>();
+        Astra::Registry registry(Components<Position, C>(), cfg);
+        std::vector<Astra::Entity> entities(count);
+        for (size_t i = 0; i < count; ++i) entities[i] = registry.CreateEntityWith(Position{i, i}, C{i, i});
+        std::mt19937 rng(0xC0FFEE);
+        std::shuffle(entities.begin(), entities.end(), rng);
+        for (auto _ : state)
+        {
+            std::uint64_t sum = 0;
+            for (Astra::Entity e : entities) sum += registry.GetComponent<C>(e)->a;
+            benchmark::DoNotOptimize(sum);
+        }
+        state.SetItemsProcessed(state.iterations() * count);
+    }
+} // namespace StorageBench
+
+static void BM_Storage_IdentityChurn_Table(benchmark::State& s)     { StorageBench::IdentityChurn<false>(s); }
+static void BM_Storage_IdentityChurn_Universal(benchmark::State& s) { StorageBench::IdentityChurn<true>(s); }
+static void BM_Storage_AddRemoveChurn_Table(benchmark::State& s)    { StorageBench::AddRemoveChurn<StorageBench::ChurnT>(s); }
+static void BM_Storage_AddRemoveChurn_Sparse(benchmark::State& s)   { StorageBench::AddRemoveChurn<StorageBench::ChurnS>(s); }
+static void BM_Storage_FilteredIter_Table(benchmark::State& s)      { StorageBench::FilteredIter<StorageBench::ChurnT>(s); }
+static void BM_Storage_FilteredIter_Sparse(benchmark::State& s)     { StorageBench::FilteredIter<StorageBench::ChurnS>(s); }
+static void BM_Storage_SoleIter_Table(benchmark::State& s)          { StorageBench::SoleIter<StorageBench::ChurnT>(s); }
+static void BM_Storage_SoleIter_Sparse(benchmark::State& s)         { StorageBench::SoleIter<StorageBench::ChurnS>(s); }
+static void BM_Storage_SparseDrivenWrite_Serial(benchmark::State& s)   { StorageBench::SparseDrivenWrite<StorageBench::ChurnS, false>(s); }
+static void BM_Storage_SparseDrivenWrite_Parallel(benchmark::State& s) { StorageBench::SparseDrivenWrite<StorageBench::ChurnS, true>(s); }
+static void BM_Storage_RandomGet_Table(benchmark::State& s)         { StorageBench::RandomGet<StorageBench::ChurnT, false>(s); }
+static void BM_Storage_RandomGet_Sparse(benchmark::State& s)        { StorageBench::RandomGet<StorageBench::ChurnS, false>(s); }
+static void BM_Storage_RandomGet_Universal(benchmark::State& s)     { StorageBench::RandomGet<StorageBench::ChurnT, true>(s); }
+
+BENCHMARK(BM_AddRemoveByID)->Arg(1'000)->Arg(10'000)->Arg(100'000);
+BENCHMARK(BM_CommandBufferAddRemove)->Arg(1'000)->Arg(10'000)->Arg(100'000);
+
+BENCHMARK(BM_Storage_IdentityChurn_Table)->Arg(10'000)->Arg(100'000);
+BENCHMARK(BM_Storage_IdentityChurn_Universal)->Arg(10'000)->Arg(100'000);
+BENCHMARK(BM_Storage_AddRemoveChurn_Table)->Arg(1'000)->Arg(10'000)->Arg(100'000);
+BENCHMARK(BM_Storage_AddRemoveChurn_Sparse)->Arg(1'000)->Arg(10'000)->Arg(100'000);
+BENCHMARK(BM_Storage_FilteredIter_Table)->Args({100'000, 1})->Args({100'000, 50})->Args({100'000, 99});
+BENCHMARK(BM_Storage_FilteredIter_Sparse)->Args({100'000, 1})->Args({100'000, 50})->Args({100'000, 99});
+BENCHMARK(BM_Storage_SoleIter_Table)->Args({100'000, 1})->Args({100'000, 50})->Args({100'000, 99});
+BENCHMARK(BM_Storage_SoleIter_Sparse)->Args({100'000, 1})->Args({100'000, 50})->Args({100'000, 99});
+BENCHMARK(BM_Storage_SparseDrivenWrite_Serial)->Args({100'000, 50})->Args({1'000'000, 50});
+BENCHMARK(BM_Storage_SparseDrivenWrite_Parallel)->Args({100'000, 50})->Args({1'000'000, 50});
+BENCHMARK(BM_Storage_RandomGet_Table)->Arg(10'000)->Arg(100'000)->Arg(1'000'000);
+BENCHMARK(BM_Storage_RandomGet_Sparse)->Arg(10'000)->Arg(100'000)->Arg(1'000'000);
+BENCHMARK(BM_Storage_RandomGet_Universal)->Arg(10'000)->Arg(100'000)->Arg(1'000'000);
 
 BENCHMARK_MAIN();
