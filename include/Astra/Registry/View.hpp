@@ -1507,15 +1507,17 @@ namespace Astra
                 : void()), ...);
         }
 
-        // Per-chunk filtered visit. Storage-path views (a Sparse type, or a Universal
-        // member in this registry) take VisitChunkStorage; every other view keeps the
-        // pre-existing loop (VisitChunkTable), which a HasSparseArg view never instantiates.
+        // Per-chunk filtered visit. A view with a Sparse argument takes the inline storage
+        // visit (VisitChunkStorageInline: it is that view's hot path, and such a view never
+        // instantiates the Table loop); a Table-only view with a Universal member in this
+        // registry takes the split VisitChunkStorage as its cold branch; every other view
+        // keeps the pre-existing loop (VisitChunkTable).
         template<bool Stamp, bool Par = false, typename Func, size_t... ReqIs, size_t... OptIs>
         ASTRA_FORCEINLINE void VisitChunkFiltered(Archetype* archetype, ArchetypeChunk* chunk, Func&& func, Tick now, Tick since,
                                                   std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
         {
             if constexpr (HasSparseArg)
-                VisitChunkStorage<Stamp, Par>(archetype, chunk, func, now, since, reqSeq, optSeq);
+                VisitChunkStorageInline<Stamp, Par>(archetype, chunk, func, now, since, reqSeq, optSeq);
             else if (m_anyUniversal) ASTRA_UNLIKELY
                 VisitChunkStorage<Stamp, Par>(archetype, chunk, func, now, since, reqSeq, optSeq);
             else
@@ -2759,6 +2761,30 @@ namespace Astra
                 std::tuple<typename YieldType<std::tuple_element_t<ReqIs, RequiredTypes>>::type...> y{
                     MakeStorageYield<ReqIs>(std::get<ReqIs>(w.req), std::get<ReqIs>(s.rp), s.e, s.i, now)... };
                 func(s.e, std::get<ReqIs>(y)..., static_cast<std::tuple_element_t<OptIs, OptionalTypes>*>(std::get<OptIs>(s.op))...);
+            }
+        }
+
+        // The storage-path chunk visit of a view with a Sparse argument (Task 42 fix 4). Such a
+        // view never instantiates the Table loop, so there is no hot Table loop for an escaping
+        // capture to poison, and this visit IS its hot path: the per-entity fetch + stamp runs
+        // inline (InvokeStorageEntity -> FetchAndStampEntity, the sequence the split visit's
+        // NextStorageEntity also runs) instead of one out-of-line NextStorageEntity call per
+        // yielded entity. Only the per-chunk setup stays out of line (BeginStorageChunk).
+        // Table-only views with a Universal member keep the split visit above.
+        template<bool Stamp, bool Par = false, typename Func, size_t... ReqIs, size_t... OptIs>
+        ASTRA_FORCEINLINE void VisitChunkStorageInline(Archetype* archetype, ArchetypeChunk* chunk, Func& func, Tick now, Tick since,
+                                                       std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
+        {
+            static_assert(HasSparseArg, "View: the inline storage visit is for Sparse-argument views only (see VisitChunkStorage)");
+            StorageChunkWalk w;
+            if (!BeginStorageChunk<Stamp, Par>(archetype, chunk, now, since, w, reqSeq, optSeq))
+                return;
+            size_t begin = 0;
+            size_t end = 0;
+            while (w.runs.Next(begin, end))
+            {
+                for (size_t i = begin; i < end; ++i)
+                    InvokeStorageEntity<Stamp, Par>(w.entities[i], i, w.req, w.opt, func, now, reqSeq, optSeq);
             }
         }
 
