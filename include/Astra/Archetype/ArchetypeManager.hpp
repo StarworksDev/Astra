@@ -1767,18 +1767,12 @@ namespace Astra
 
                 if (id == newComponentId) ASTRA_UNLIKELY
                 {
-                    // Copy new component data - use memcpy for trivially copyable types. An
-                    // enableable tag's bit-only column (size 0) has no data; the by-id add
-                    // path may pass componentData == nullptr for a tag, so write nothing.
-                    // The shared ladder (memcpy / constructWith / copy / move-out-of-buffer
-                    // for a move-only type / default) lives on the descriptor.
-                    if (newDesc.size != 0) ASTRA_LIKELY
-                    {
-                        if (newDesc.is_trivially_copyable) ASTRA_LIKELY
-                            std::memcpy(dstPtr, componentData, newDesc.size);
-                        else
-                            newDesc.ConstructFromErased(dstPtr, componentData);
-                    }
+                    // Write the new component through the descriptor's ONE shared ladder
+                    // (memcpy for trivially copyable / constructWith / copy / move-out-of-buffer
+                    // for a move-only type / default). It writes nothing for size 0: an
+                    // enableable tag's bit-only column has no data, and the by-id add path may
+                    // pass componentData == nullptr for a tag.
+                    newDesc.ConstructFromErased(dstPtr, componentData);
                 }
                 else
                 {
