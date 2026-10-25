@@ -160,17 +160,18 @@ namespace Astra
         template<Component... Components>
         Entity CreateEntity()
         {
-            RefillSuspendedUniversals();
-            Entity entity = m_entityManager.Create();
-            if (!entity.IsValid()) ASTRA_UNLIKELY
-                return Entity::Invalid();
-
             if constexpr (sizeof...(Components) == 0)
             {
-                return CreateEntityInternal(entity);
+                // The funnel runs the suspended-universal refill itself (once; final review M2).
+                return CreateEntityInternal(m_entityManager.Create());
             }
             else
             {
+                RefillSuspendedUniversals();
+                Entity entity = m_entityManager.Create();
+                if (!entity.IsValid()) ASTRA_UNLIKELY
+                    return Entity::Invalid();
+
                 // Spec s7.1: Table members choose the archetype, Sparse members go to their
                 // sets, and a NAMED Universal member is left to ConstructUniversals (no
                 // value was passed, so default + init).
@@ -2827,15 +2828,16 @@ namespace Astra
             return preallocated;
         }
 
-        // True if any of Ts is declared universal in this registry. Table-trait members
-        // only reach the archetype in one piece when this is false.
+        // True if any of Ts is declared universal in this registry: the Registry-local bool,
+        // then one declaration-mask test per member, no descriptor read (final review M7).
+        // Table-trait members take today's typed placement only when this is false.
         template<Component... Ts>
         ASTRA_NODISCARD bool AnyUniversal() const noexcept
         {
             if constexpr (sizeof...(Ts) == 0)
                 return false;
             else
-                return m_componentStorage->HasUniversals() && ((KindOfT<Ts>() == StorageKind::Universal) || ...);
+                return m_hasUniversals && (m_componentStorage->IsDeclaredUniversal(TypeID<Ts>::Value()) || ...);
         }
 
         // Effective kind of a creation-pack member. A Table-trait member reads no descriptor:
@@ -3067,8 +3069,9 @@ namespace Astra
             }(Detail::StorageIndexSeq<Storage::Sparse, Vs...>{});
         }
 
-        // ComponentAdded for one pack member, by its runtime kind (Table: the chunk slot,
-        // today's payload; Sparse: the set element, or the per-type static for a tag).
+        // ComponentAdded for one pack member, by its effective kind (PackMemberKind: no
+        // descriptor read for a Table-trait member, final review M7). Table: the chunk slot,
+        // today's payload; Sparse: the set element, or the per-type static for a tag.
         // Universal members are skipped here because EmitUniversalAdded covers each
         // universal exactly once.
         template<Component C>
@@ -3077,7 +3080,7 @@ namespace Astra
             const ComponentID id = TypeID<C>::Value();
             if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
                 return;
-            switch (m_componentStorage->KindOf(id))
+            switch (PackMemberKind<C>(id))
             {
                 case StorageKind::Table:
                     if (const EntityRecord* record = m_archetypeManager->GetEntityRecord(entity))
