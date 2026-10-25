@@ -104,7 +104,7 @@ namespace Astra
              */
             // Hot path: exactly the pre-storage walk -- one index increment and one compare
             // against m_chunkEntityCount. With hooks, m_chunkEntityCount is the END OF THE
-            // CURRENT RUN (the chunk's real count is m_hookChunkCount), so a run boundary
+            // CURRENT RUN (the chunk's real count is HookWalk::chunkCount), so a run boundary
             // takes the same cold branch a chunk boundary does.
             ASTRA_FORCEINLINE Iterator& operator++()
             {
@@ -155,15 +155,20 @@ namespace Astra
                     m_chunkIndex = 0;
                 }
 
-                // End state
+                // End state. A hook walk forgets its last chunk, so ++ on an end iterator
+                // stays at the end instead of re-seeking that chunk's runs.
                 m_entityIndex = 0;
                 m_chunkEntityCount = 0;
+                if (m_walk.p)
+                    m_walk.p->chunkCount = 0;
             }
 
             // Past the current run (hooks: the next run of this chunk), else the next chunk.
             ASTRA_FORCEINLINE void AdvanceChunk()
             {
-                if (m_hooks && SeekRun(m_entityIndex))
+                // m_walk.p is null until the first hooked chunk is entered (an end iterator of a
+                // view that never entered one): no run to seek.
+                if (m_hooks && m_walk.p && SeekRun(m_entityIndex))
                     return;
                 ++m_chunkIndex;
                 FindFirstValidPosition();

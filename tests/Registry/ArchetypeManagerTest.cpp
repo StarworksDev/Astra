@@ -1141,6 +1141,39 @@ TEST_F(ArchetypeManagerTest, WithIDFormsMatchTheTypedForms)
     ASSERT_GE(col, 0);
     EXPECT_EQ(rec->chunk->GetColumnVersion(col), now);
 
+    // Task 42 fix 2 (re-review M4): a change-tracked T also gets the entity's `changed` tick.
+    componentRegistry->RegisterComponents<TrackedPos, Player, EnTag>();
+    const Astra::ComponentID trackedId = Astra::TypeID<TrackedPos>::Value();
+    manager->AddComponent<TrackedPos>(e, 4.f, 5.f, 6.f);
+    const Astra::Tick trackedNow = manager->AdvanceTick();
+    TrackedPos* tp = manager->GetComponentMutWithID<TrackedPos>(e, trackedId);
+    ASSERT_NE(tp, nullptr);
+    EXPECT_EQ(tp->x, 4.f);
+    rec = manager->GetEntityRecord(e);
+    const int tcol = rec->archetype->GetColumnMeta().idToColumn[trackedId];
+    ASSERT_GE(tcol, 0);
+    ASSERT_NE(rec->chunk->GetTicks(tcol), nullptr);
+    EXPECT_EQ(rec->chunk->GetTicks(tcol)[rec->location.GetEntityIndex()].changed, trackedNow);
+    EXPECT_EQ(rec->chunk->GetColumnVersion(tcol), trackedNow);
+
+    // Tag forms: a present tag yields the typed form's static instance and stamps nothing
+    // (an enableable tag's bit-only column keeps its version); an absent tag misses.
+    const Astra::ComponentID playerId = Astra::TypeID<Player>::Value();
+    const Astra::ComponentID enTagId = Astra::TypeID<EnTag>::Value();
+    EXPECT_EQ(manager->GetComponentMutWithID<Player>(e, playerId), nullptr);
+    manager->AddComponent<Player>(e);
+    manager->AddComponent<EnTag>(e);
+    rec = manager->GetEntityRecord(e);
+    const int enCol = rec->archetype->GetColumnMeta().idToColumn[enTagId];
+    ASSERT_GE(enCol, 0);   // the enableable tag's bit-only column
+    const Astra::Tick enBefore = rec->chunk->GetColumnVersion(enCol);
+    manager->AdvanceTick();
+    EXPECT_NE(manager->GetComponentMutWithID<Player>(e, playerId), nullptr);
+    EXPECT_EQ(manager->GetComponentMutWithID<Player>(e, playerId), manager->GetComponent<Player>(e));
+    EXPECT_NE(manager->GetComponentMutWithID<EnTag>(e, enTagId), nullptr);
+    EXPECT_EQ(manager->GetComponentMutWithID<EnTag>(e, enTagId), manager->GetComponent<EnTag>(e));
+    EXPECT_EQ(rec->chunk->GetColumnVersion(enCol), enBefore);
+
     // Stale handle: every form misses.
     manager->RemoveEntity(e);
     EXPECT_EQ(manager->GetComponentWithID<Position>(e, posId), nullptr);

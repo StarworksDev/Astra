@@ -308,30 +308,30 @@ namespace Astra
             constexpr size_t kBatchSize = 64;
             auto run = [&](auto fastTag)
             {
-            constexpr bool Fast = decltype(fastTag)::value;
-            m_scheduler->ParallelFor(count, kBatchSize, [&](size_t begin, size_t end, uint32_t /*worker*/)
-            {
-                for (size_t i = begin; i < end; ++i)
+                constexpr bool Fast = decltype(fastTag)::value;
+                m_scheduler->ParallelFor(count, kBatchSize, [&](size_t begin, size_t end, uint32_t /*worker*/)
                 {
-                    const auto& entry = cache.entries[i];
-                    Entity entity = entry.entity;
-                    size_t depth = entry.depth;
-
-                    if (PassesFilterK<Fast>(entity))
+                    for (size_t i = begin; i < end; ++i)
                     {
-                        // Empty RequiredTuple covers the unfiltered case too
-                        // (no QueryArgs => no required components).
-                        if constexpr (std::tuple_size_v<RequiredTuple> == 0)
+                        const auto& entry = cache.entries[i];
+                        Entity entity = entry.entity;
+                        size_t depth = entry.depth;
+
+                        if (PassesFilterK<Fast>(entity))
                         {
-                            func(entity, depth);
-                        }
-                        else
-                        {
-                            InvokeParallelWithDepth<Fast>(entity, depth, func, RequiredTuple{});
+                            // Empty RequiredTuple covers the unfiltered case too
+                            // (no QueryArgs => no required components).
+                            if constexpr (std::tuple_size_v<RequiredTuple> == 0)
+                            {
+                                func(entity, depth);
+                            }
+                            else
+                            {
+                                InvokeParallelWithDepth<Fast>(entity, depth, func, RequiredTuple{});
+                            }
                         }
                     }
-                }
-            });
+                });
             };
             if (m_allTable) ASTRA_LIKELY
                 run(std::true_type{});

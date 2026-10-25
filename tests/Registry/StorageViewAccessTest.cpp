@@ -232,13 +232,18 @@ TEST(StorageViewAccess, RangeForSurvivesDestroyingBystandersOnUniversalYield)
 
 // S4 fix round (Task 42): the hook-path iterator keeps its walk state per iterator, so two
 // live iterators over the SAME view (nested loops, an iterator copy) never share a mask.
+// The members span TWO archetypes ({Position} and {Position, Velocity}): an inner loop or a
+// copied iterator that walks on into the second chunk rewrites the walk's chunk, count and
+// mask, so a walk SHARED between iterators (not only a shallow copy) is caught too.
 TEST(StorageViewAccess, NestedAndCopiedRangeForIteratorsKeepIndependentWalks)
 {
     Astra::Registry reg;
-    constexpr size_t N = 7;
+    constexpr size_t N = 12;
     for (size_t i = 0; i < N; ++i)
     {
         Astra::Entity e = reg.CreateEntity<Position>();
+        if (i >= N / 2)
+            reg.AddComponent(e, Velocity{});        // second archetype
         if (i % 3 != 0)
             reg.AddComponent(e, PosS{float(i), 0.0f, 0.0f});
     }
@@ -248,10 +253,14 @@ TEST(StorageViewAccess, NestedAndCopiedRangeForIteratorsKeepIndependentWalks)
     {
         const size_t n = view.Size();
         ASSERT_GT(n, 0u);
+        std::vector<Astra::Entity> order;
+        for (auto a : view) order.push_back(std::get<0>(a));
+        ASSERT_EQ(order.size(), n);
+
         size_t pairs = 0, innerSum = 0;
         for (auto a : view)
         {
-            (void)a;
+            EXPECT_EQ(std::get<0>(a), order[pairs]) << "the outer walk survives the inner one";
             size_t seen = 0;
             for (auto b : view) { (void)b; ++seen; }
             innerSum += seen;
@@ -260,16 +269,54 @@ TEST(StorageViewAccess, NestedAndCopiedRangeForIteratorsKeepIndependentWalks)
         EXPECT_EQ(pairs, n);
         EXPECT_EQ(innerSum, n * n);
 
-        // A copied iterator continues from its own position, independently.
+        // A copied iterator continues from its own position, independently -- also after
+        // the original has walked on into the other archetype's chunk and to the end.
         auto it = view.begin();
         auto copy = it;
         ++it;
         if (n > 1)
             EXPECT_NE(std::get<0>(*it), std::get<0>(*copy));
-        size_t viaCopy = 0;
-        for (; copy != view.end(); ++copy) ++viaCopy;
-        EXPECT_EQ(viaCopy, n);
+        for (; it != view.end(); ++it) {}
+        std::vector<Astra::Entity> viaCopy;
+        for (; copy != view.end(); ++copy) viaCopy.push_back(std::get<0>(*copy));
+        EXPECT_EQ(viaCopy, order);
     };
     expectNested(reg.CreateView<Position, PosS>());                 // per-entity stepping
     expectNested(reg.CreateView<Position, Astra::With<PosS>>());    // run stepping
+}
+
+// Task 42 fix 2 (re-review M5): ++ on the end iterator of a hooked view is a no-op, as it was
+// before the per-iterator walk -- whether the view never entered a chunk (no walk allocated)
+// or walked to the end (the walk still names its last chunk).
+TEST(StorageViewAccess, IncrementingAnEndHookIteratorStaysAtTheEnd)
+{
+    auto expectStaysEnd = [](auto view)
+    {
+        auto it = view.begin();
+        for (; it != view.end(); ++it) {}
+        for (int k = 0; k < 3; ++k)
+        {
+            ++it;
+            EXPECT_TRUE(it == view.end()) << "increment " << k;
+        }
+    };
+
+    Astra::Registry none;             // no matching archetype: the walk is never allocated
+    expectStaysEnd(none.CreateView<Position, PosS>());
+    expectStaysEnd(none.CreateView<Position, Astra::With<PosS>>());
+
+    Astra::Registry empty;
+    empty.CreateEntity<Position>();   // a chunk that holds no member: never a visible entity
+    expectStaysEnd(empty.CreateView<Position, PosS>());
+    expectStaysEnd(empty.CreateView<Position, Astra::With<PosS>>());
+
+    Astra::Registry reg;
+    for (size_t i = 0; i < 5; ++i)
+    {
+        Astra::Entity e = reg.CreateEntity<Position>();
+        if (i != 0)
+            reg.AddComponent(e, PosS{});
+    }
+    expectStaysEnd(reg.CreateView<Position, PosS>());
+    expectStaysEnd(reg.CreateView<Position, Astra::With<PosS>>());
 }
