@@ -142,7 +142,7 @@ registry.RemoveComponent<Identity>(e);                 // refused: ASTRA_ASSERT 
 Rules:
 - **Universality is per registry.** A registry that does not declare `T` universal uses `T`'s trait. Registries that share one `ComponentRegistry` do not affect each other.
 - **Sparse slots.** A registry holds at most `ASTRA_MAX_SPARSE_COMPONENTS` (default 32) Sparse components. Past the cap, the add asserts and is refused.
-- **Tags.** Every tag may be enableable. Table tags use a bit-only column; Sparse tags keep the bit in the store.
+- **Tags.** Every tag may be enableable. Enableable Table tags use a bit-only column (a non-enableable tag still has no column); Sparse tags keep the bit in the store.
 - **Adding a present component** is a no-op, for every layout, and no signal fires. The typed `AddComponent`/`EmplaceComponent` return `true`; the by-id form (`AddComponentByID`) returns `false`. A Universal component is always present, so adding one is always this no-op.
 - **Archives load whatever the storage was when they were written** (format v6). Values move into the layout the loading registry assigns. A Universal component missing from an archive is default-constructed and then `init`-ed. v5 archives load as all-Table.
 - **Pointer validity** is unchanged: a component pointer is valid until the next structural change.

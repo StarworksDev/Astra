@@ -1601,14 +1601,16 @@ above.
 `bench-compare/` — `build_one.bat` (vcvars+cl wrapper), `bench_{astra,entt,flecs}.cpp`, shared `bench_common.hpp`. EnTT/flecs sources under `bench-compare/vendor/`. **Build with the full-opt flag set above (2026-07-24 baseline), not bare `/O2`.**
 `bench-clean.ps1` (2026-09-19): clean-room wrapper for a busy dev box — see its header comment for the full mechanism list (privilege-enable, power-scheme lock, P-core pinning, quiet gate). Requires one UAC approval per run (the `powercfg` clock lock). `python analyze_definitive.py --stat min <csv>` for the matching headline statistic.
 
-## Storage policies (spec 2026-10-01; branch `feat/storage-policies` @ `94f4346`, measured 2026-10-25)
+## Storage policies (spec 2026-10-01; branch `feat/storage-policies` @ `94f4346`, fix round 4 @ `0b5bd45`, measured 2026-10-25)
 
 **Verdict.**
-- **S4 part 1: PENDING (desk under load; numbers recorded).** The Table-only gate is not claimed as passed. Several rows are open with a stable positive sign (below), and the 3-round two-base gate lists 10 (vs 975cdb7) and 11 (vs c2dcf2f) FAIL rows from a window with a contaminated round, and the 9-rep re-measure that followed is mostly LOUD, so neither can be called a pass under the tightened rule.
+- **S4 part 1: PENDING (desk under load; numbers recorded).** The Table-only gate is not claimed as passed. The 3-round two-base gate lists 10 (vs 975cdb7) and 11 (vs c2dcf2f) FAIL rows from a window with a contaminated round, and the 9-rep re-measure that followed is mostly LOUD, so neither can be called a pass under the tightened rule. Open rows, stated explicitly:
+  - **Re-measured (9 reps), stable positive sign:** `AddRemoveByID` +6..9 %, `CommandBufferAddRemove` +3.8..4.6 %, `RangeForFiveComponents` +1.3..4.9 %, `CreateEntities` +3.4..7.7 %, `RemoveComponents/1000000` +3.5 % (vs 975cdb7; vs c2dcf2f also `RemoveComponents/100000` +2.9 %).
+  - **Flagged by this gate, NOT re-measured, UNJUDGED:** the 23 rows with a flagged delta above 2 % and the 25 other flagged rows listed in "Flagged, not re-measured, unjudged" below. Among them are the two 3-round FAIL rows `ParallelIterateSingleComponent/100000` and `ParallelIterateThreeComponents/100000`, and the `ParallelIterate*` family, which is positive at most sizes vs both bases. Fix round 4 tried to re-measure them and found no quiet window (below).
 - **S4 part 2 (Universal removes a 48 B component from archetype moves): PASS** (18 % faster structural churn at both sizes, far above the 0.1-4.6 % repetition spread).
 - **S4 part 3 (Sparse add/remove churn beats Table): PASS** at 1K, 10K and 100K (32-37 % faster).
 
-**Machine:** 12th Gen Intel(R) Core(TM) i7-12700K (20 logical), 64 GB, Windows 10 Pro 19045, MSVC v143 (VS 18 msbuild), Release (`/O2 /Oi /Ot /Oy /GL` + `/LTCG`, `/arch:AVX`, `/fp:fast`). Power plan and clock were NOT locked and nothing was pinned: this is not the clean-room protocol of the 2026-09-19 section. **Load:** a shared dev desk where other sessions build Arcane trees (background 11-30 % total CPU). Every process run was preceded by a quiet check (no non-`/Zs` `cl`/`link`; mean total CPU <= 25 % over 5 x 2 s samples) and watched for `cl`/`link` while it ran; a run that saw one was redone (at most 2 tries). The per-process log is quoted below.
+**Machine:** 12th Gen Intel(R) Core(TM) i7-12700K (20 logical), 64 GB, Windows 10 Pro 19045, MSVC v143 (VS 18 msbuild), Release (`/O2 /Oi /Ot /Oy /GL` + `/LTCG`, `/arch:AVX`, `/fp:fast`). Power plan and clock were NOT locked and nothing was pinned: this is not the clean-room protocol of the 2026-09-19 section. **Load:** a shared dev desk where other sessions build Arcane trees (background 11-30 % total CPU). Two pre-checks were used. The 3-round gate preceded every process run with a quiet check (no non-`/Zs` `cl`/`link`; mean total CPU <= 25 % over 5 x 2 s samples), watched for `cl`/`link` while it ran and redid a run that saw one (at most 2 tries); its per-process log is quoted below. The 9-rep re-measure (`rerun.log`) and the round-3 A/Bs (`partA`, `m2ab`, `m3`) logged 3 CPU samples per run (e.g. `cpu=19,32,23`) plus the `cl`/`link` count, with the same at-most-2-tries redo in the re-measure; one of those samples reached 32 %, above the 11-30 % band stated above. Fix round 4's runs log `cl`/`link` and 3 x 1 s CPU samples per round, and sample `cl`/`link` every second while each process runs (redo once on a hit).
 
 **Protocol.**
 - `975cdb7` (the spec's letter) and `c2dcf2f` (the branch tip before any storage code: `975cdb7` + the dev merge + docs, which isolates the storage work) were exported with `git archive` and built with the identical premake/msbuild Release configuration. The two Table-only benchmarks that do not exist at `975cdb7` (`BM_AddRemoveByID`, `BM_CommandBufferAddRemove`, 6 rows) were carried into both base exports as source, so the base binaries differ from the pure commits only by those two added benchmarks. The comparison is therefore 106 rows, not 100.
@@ -1827,7 +1829,7 @@ vs `c2dcf2f` (the non-PASS rows only):
 
 An earlier 3-round pass of the same binary (05:00-05:25) ran while other sessions built (the round 2 and 3 pre-checks showed 3 `cl`): `S4 GATE: 106 compared, 45 PASS, 10 NOISY, 45 LOUD, 6 FAIL, 0 missing on branch, 0 branch-only without base` vs 975cdb7 and `S4 GATE: 106 compared, 19 PASS, 7 NOISY, 74 LOUD, 6 FAIL, 0 missing on branch, 0 branch-only without base` vs c2dcf2f. It is not judgeable and is kept only as history.
 
-**Re-measure, 9 interleaved reps (the 40 rows of the families the gate flagged), vs `975cdb7`:**
+**Re-measure, 9 interleaved reps, vs `975cdb7`.** 40 rows: the families fix round 2's gate flagged, a SUBSET of the families this gate flagged (the rest were not re-measured; they are listed as unjudged below). One sample in the nine is contaminated: rep 4's branch run saw `peak-cl/link=4` and then `=7` on its only two tries, and the second (contaminated) try was kept (`rerun.log`). That biases at most one rank of the branch median, toward a slower branch. Rep 5's branch run saw 4 on try 1 and was redone clean.
 
 | benchmark | 975cdb7 median | branch median | delta % | base spread % | rounds | verdict |
 |---|---|---|---|---|---|---|
@@ -1930,7 +1932,69 @@ An earlier 3-round pass of the same binary (05:00-05:25) ran while other session
   - `RemoveComponents`: +3.5 % at 1M vs 975cdb7; +2.9 % at 100K and 1M vs c2dcf2f.
 - Resolved: `IterateTwoComponentsHalf` (fix round 2): +1.0 / +0.3 % vs 975cdb7 (100K / 1M). Vs c2dcf2f 100K reads +2.7 % NOISY (spread 2.35 %).
 - `IterateTwoComponentsOne` is about 10 ns per call (a zero-work body). It reads +4.3..+5.2 % vs c2dcf2f and +0.0..+0.2 % vs 975cdb7, i.e. the two bases differ by about 0.5 ns on this row; recorded, not argued.
-- FAIL rows. The 3-round gate itself lists 10 FAIL rows vs 975cdb7 and 11 vs c2dcf2f (the two summary lines above), from a pass whose round-2 branch run was contaminated (up to 9 `cl`). The 9-rep interleaved re-measure covered the families of all of them except `ParallelIterateSingleComponent/100000` (+2.07 %, spread 0.97 %) and `ParallelIterateThreeComponents/100000` (+2.19 %, spread 0.64 %) vs 975cdb7, which were not re-measured; each of those two is a near-threshold delta on a single 3-round median. In the re-measure no row is a FAIL: every row above 2 % reads NOISY (spread over half the delta) or LOUD (unjudgeable). That is a statement about this window, not a pass.
+- FAIL rows. The 3-round gate itself lists 10 FAIL rows vs 975cdb7 and 11 vs c2dcf2f (the two summary lines above), from a pass whose round-2 branch run was contaminated (up to 9 `cl`). The 9-rep interleaved re-measure covered the families of all of them except `ParallelIterateSingleComponent/100000` (+2.07 %, spread 0.97 %) and `ParallelIterateThreeComponents/100000` (+2.19 %, spread 0.64 %) vs 975cdb7, which were not re-measured and stay unjudged (next block); each of those two is a near-threshold delta on a single 3-round median. In the re-measure no row is a FAIL: every row above 2 % reads NOISY (spread over half the delta) or LOUD (unjudgeable). That is a statement about this window, not a pass, and it covers only the re-measured families.
+
+**Flagged, not re-measured, unjudged (fix round 4, review I2).** These rows are non-PASS in this gate (vs 975cdb7 and/or c2dcf2f) and are not among the 40 re-measured rows. They are neither passed nor failed. Format: `row` delta vs 975cdb7, verdict (base spread %) / delta vs c2dcf2f, verdict (base spread %), from `gate_975.md` / `gate_c2.md` (the tables above).
+
+With a flagged delta above 2 % (23 rows; the candidates for an open regression):
+- `AddComponentsBatch/10000` +2.07 % NOISY (2.88) / -2.09 % PASS (3.07)
+- `AddComponentsBatch/100000` +2.36 % LOUD (9.10) / -2.42 % PASS (2.38)
+- `CreateEntitiesBatch/10000` -0.77 % LOUD (9.75) / +6.40 % LOUD (14.48)
+- `IterateFiveComponents/100000` +2.60 % NOISY (4.07) / +1.08 % PASS (2.36)
+- `IterateFiveComponents/1000000` +2.11 % NOISY (2.50) / +1.18 % LOUD (6.74)
+- `IterateSingleComponent/1000000` +2.88 % NOISY (3.64) / -0.34 % LOUD (6.81)
+- `IterateThreeComponents/10000` +2.21 % LOUD (5.16) / +0.48 % PASS (2.61)
+- `ParallelIterateFiveComponents/10000` +2.45 % NOISY (2.35) / +2.35 % LOUD (5.24)
+- `ParallelIterateFiveComponents/1000000` +2.01 % LOUD (7.05) / -0.37 % LOUD (9.87)
+- `ParallelIterateSingleComponent/100000` +2.07 % FAIL (0.97) / +1.51 % PASS (3.25)
+- `ParallelIterateSingleComponent/1000000` +3.68 % NOISY (2.71) / +1.48 % LOUD (6.46)
+- `ParallelIterateThreeComponents/10000` +6.27 % LOUD (6.98) / +6.39 % LOUD (6.40)
+- `ParallelIterateThreeComponents/100000` +2.19 % FAIL (0.64) / +1.20 % PASS (3.40)
+- `ParallelIterateThreeComponents/1000000` +6.63 % LOUD (5.22) / +2.25 % LOUD (9.52)
+- `ParallelIterateTwoComponents/10000` +4.26 % LOUD (5.16) / +5.41 % LOUD (5.58)
+- `ParallelIterateTwoComponents/1000000` +4.33 % NOISY (2.59) / +3.38 % LOUD (7.33)
+- `RangeForSingleComponent/1000000` -5.49 % LOUD (9.84) / +2.62 % LOUD (13.61)
+- `RangeForThreeComponents/10000` +3.25 % LOUD (7.23) / -0.12 % LOUD (10.41)
+- `RangeForThreeComponents/100000` +2.40 % LOUD (9.16) / +4.79 % LOUD (7.38)
+- `RangeForThreeComponents/1000000` +2.06 % LOUD (7.02) / +1.74 % LOUD (8.49)
+- `RangeForTwoComponents/10000` +3.67 % NOISY (3.82) / -0.59 % PASS (1.98)
+- `RemoveComponentsBatch/10000` +2.42 % LOUD (10.55) / +0.99 % PASS (2.89)
+- `RemoveComponentsBatch/100000` +2.83 % NOISY (3.91) / -2.66 % LOUD (6.79)
+
+Flagged with a delta at or below 2 %, or a large win read in a LOUD window (25 rows; not candidate regressions, but not passes either):
+- `AddComponents/10000` -1.17 % LOUD (5.33) / +0.33 % PASS (2.03)
+- `AddComponentsBatch/1000000` -1.85 % LOUD (7.03) / -2.59 % PASS (4.22)
+- `CreateEntitiesBatch/100000` -4.70 % LOUD (5.94) / -4.95 % PASS (3.79)
+- `CreateEntitiesBatch/1000000` +0.25 % LOUD (9.96) / -1.95 % LOUD (13.38)
+- `ForEachAncestor/1000` -42.12 % LOUD (6.97) / -40.82 % LOUD (7.75)
+- `ForEachChild/1000` -40.40 % PASS (4.47) / -38.68 % LOUD (5.58)
+- `ForEachChild/100000` -41.43 % PASS (3.44) / -40.19 % LOUD (12.32)
+- `ForEachDescendant/10000` -44.73 % LOUD (6.45) / -43.57 % LOUD (7.31)
+- `ForEachDescendant/100000` -41.55 % PASS (4.21) / -38.86 % LOUD (5.18)
+- `ForEachLink/1000` -38.93 % LOUD (6.80) / -41.30 % PASS (3.10)
+- `ForEachLink/10000` -40.43 % LOUD (6.36) / -42.17 % PASS (1.52)
+- `ForEachLink/100000` -46.38 % LOUD (12.03) / -41.70 % LOUD (5.78)
+- `GetComponent/10000` -32.11 % PASS (4.65) / -33.19 % LOUD (7.63)
+- `GetComponent/100000` -30.44 % LOUD (7.50) / -26.77 % PASS (4.86)
+- `GetComponent/1000000` -27.80 % PASS (2.51) / -30.94 % LOUD (7.38)
+- `IterateThreeComponents/100000` -2.01 % LOUD (5.01) / -0.88 % PASS (0.70)
+- `IterateThreeComponents/1000000` -3.73 % LOUD (8.08) / +0.20 % PASS (2.86)
+- `ParallelForEachDescendant/1000` -28.65 % LOUD (7.24) / -25.56 % LOUD (7.10)
+- `ParallelForEachDescendant/10000` -7.33 % LOUD (7.37) / -6.43 % LOUD (5.22)
+- `ParallelIterateFiveComponents/100000` +1.60 % PASS (4.19) / -0.43 % LOUD (6.33)
+- `ParallelIterateSingleComponent/10000` +1.58 % PASS (1.03) / +1.39 % LOUD (10.10)
+- `ParallelIterateTwoComponentsOne/100000` -9.53 % PASS (4.68) / -2.85 % LOUD (5.25)
+- `RangeForSingleComponent/100000` -1.02 % PASS (2.81) / -0.37 % LOUD (6.59)
+- `RangeForTwoComponents/1000000` -3.12 % LOUD (9.61) / -5.32 % LOUD (6.99)
+- `RemoveComponentsBatch/1000000` -3.32 % LOUD (7.60) / -3.42 % LOUD (6.32)
+
+Fix round 4 tried to re-measure the 13 families of the first list (39 rows, all sizes; 9 reps interleaved per rep, 975cdb7 / c2dcf2f / `0b5bd45`, base exports rebuilt with the two carried benchmarks). It found no quiet window inside its 90-minute budget. The foreign load was a game client, not a compile, so the `cl`/`link` probe could not see it; total CPU showed it:
+- 16:08: round 1 started at 61-66 % total CPU; it was stopped during its second leg and the data discarded.
+- 16:11-17:19 (`waitquiet.ps1`, 5 x 2 s samples about every 30 s; quiet = no `cl`/`link` and mean <= 25 %, twice in a row): 136 checks, 133 loud (mean total CPU median 52 %, 10th-90th percentile 47-58 %, max 85 %). The only quiet check before 17:18:58 was a single one at 16:43:22, between two games (the next one started at 16:43:37).
+- 17:20: round 1 started quiet (12-21 %), but a new game process started at 17:22:18, inside the round and 38 s before its branch leg. The run was stopped and the whole round discarded.
+- 17:31: still loud (a 2-row smoke run measured 58 % mean foreign CPU during its leg).
+
+A 9-round run needs about 40 quiet minutes (one round = three legs = about 4.3 min). From fix round 4 on, `ab.ps1` also logs FOREIGN CPU per leg (total CPU minus the benchmark's own share) and redoes a leg above a threshold, so a non-compile load is visible in the log.
 
 **Fix-round history (S4 part 1).**
 - Round 1: Relations iteration -40..-47 % vs both bases, typed `GetComponent` -30 %; range-for +22..55 % found by the bisect and fixed (the hot loop called `TypeID<T>::Value()` out of line); `IterateTwoComponentsHalf` +13..18 % found, not fixed.
@@ -1954,6 +2018,8 @@ BM_Storage_SoleIter_Sparse/100000/99               816,894.2   802,856.9      10
 ```
 
 ### S4 (2) and (3): storage benchmarks (Google Benchmark, 3 repetitions, median)
+
+Measured at `94f4346`. The `FilteredIter_Sparse` rows below predate fix round 4 (`0b5bd45`), which made them 11-35 % faster (see "Fix round 4" below). The churn rows that S4 (2) and (3) judge do not run the iteration visit and are unaffected.
 
 | benchmark | median real time | unit |
 |---|---|---|
@@ -2016,7 +2082,7 @@ Caveats:
 - `SparseDrivenWrite_Parallel` shows scaling vs serial (408 us -> 73 us at 100K, 4.67 ms -> 1.01 ms at 1M); it does not prove contention absent (the coarse stamp is per visited chunk).
 - Only the Google Benchmark numbers feed S4. The hand-rolled harness below builds fresh state each round, so first-touch page and chunk allocation is inside its timed region (Sparse pays page allocation every round).
 
-**Cost of the round-2 storage-path split on Sparse iteration (re-review m3): `dfdfada` vs `94f4346`, 8 interleaved rounds, quiet (CPU 9-29 %, no `cl`/`link`).** `dfdfada` is the tree before the visit was split. The split makes archetype-driven Sparse/Universal walks pay one out-of-line call per visited entity and one per chunk:
+**Sparse iteration since `dfdfada` (fix round 2: run cursor + visit split; re-review m3): `dfdfada` vs `94f4346`, 8 interleaved rounds, quiet (CPU 9-29 %, no `cl`/`link`).** `dfdfada` is the tree before fix round 2 (`ce21c91` run cursor + force-inlined visit, `4302024`, `1c1c531` visit split, `818cee9`); the cost below is not isolated to one of those commits. The split visit makes archetype-driven Sparse/Universal walks pay one out-of-line call per visited entity and one per chunk. This is the state BEFORE fix round 4 (next block):
 
 ```
 row                                                  dfdfada         fix  spread0%     dfix%
@@ -2036,9 +2102,47 @@ BM_Storage_SoleIter_Table/100000/99                145,517.8    35,437.8       3
 
 - `FilteredIter_Sparse` is +10.4 / +26.3 / +44.7 % slower at 1 / 50 / 99 % density. `SoleIter_Sparse` is unchanged (+0.1 / -1.7 / -2.6 %, base spread 9-12 %); it is sparse-driven and goes through the inline `InvokeStorageEntity`.
 - The Table rows of the same benchmarks are 66-76 % FASTER on `94f4346` than on `dfdfada` (consistent with the round-2 functor-escape fix; not separately disassembled).
-- S4 sets no numeric bar for Sparse iteration ("recorded"). A cheaper design exists if this cost matters: the split is only needed where the storage visit is the cold branch of a pure-Table view, and a Sparse-argument view could use an inline body built on `FetchAndStampEntity`. It is not done here.
+- S4 sets no numeric bar for Sparse iteration ("recorded"). The split is only needed where the storage visit is the cold branch of a pure-Table view; fix round 4 gives Sparse-argument views an inline body instead (next block).
 
-**Enableable Table filtered walk (re-review m2): `dfdfada` vs `94f4346`, 8 interleaved rounds, quiet (CPU 10-31 %, no `cl`/`link`).** No committed benchmark iterates an enableable Table view, and `ForEachEnabledRun` was rebuilt on `MatchingRunCursor` in round 2. A scratch benchmark (not in the committed suite): `View<Position, EnV>::ForEach` over 100K entities with `EnV` enableable and disabled on 1 / 10 / 50 / 90 / 99 % scattered, and in clustered runs of 256, built standalone from each tree's headers with the Release flags above:
+**Fix round 4 (`0b5bd45`, Task 42 review I1): Sparse-argument views take an inline storage visit.** A view with a Sparse argument never instantiates the Table loop, so its storage visit is its hot path and the split bought it nothing. It now runs `BeginStorageChunk` (out of line, once per chunk) and then a `MatchingRunCursor` loop that calls `InvokeStorageEntity` (the shared `FetchAndStampEntity` sequence) inline per entity. The split NOINLINE `NextStorageEntity` visit is kept only for the cold `m_anyUniversal` arms of Table-only views. 8 interleaved rounds (order rotated per round), `e542abf` (the tree before this fix) vs `0b5bd45` vs `dfdfada`, 15:55-16:03, quiet (load log first; no `cl`/`link`, CPU 9-19 %); columns are medians over the 8 rounds, `spread0%` is `e542abf`'s (max-min)/median, `sp_X%` is X's own spread, `d_X%` is X vs `e542abf`:
+
+```
+round 1 start 2026-10-25T15:55:41 cl/link=0 msbuild(cpu-s)=[] cpu=14,10,10
+round 2 start 2026-10-25T15:56:39 cl/link=0 msbuild(cpu-s)=[] cpu=10,9,18
+round 3 start 2026-10-25T15:57:36 cl/link=0 msbuild(cpu-s)=[] cpu=16,10,10
+round 4 start 2026-10-25T15:58:35 cl/link=0 msbuild(cpu-s)=[] cpu=19,17,11
+round 5 start 2026-10-25T15:59:33 cl/link=0 msbuild(cpu-s)=[] cpu=11,16,12
+round 6 start 2026-10-25T16:00:30 cl/link=0 msbuild(cpu-s)=[] cpu=10,13,15
+round 7 start 2026-10-25T16:01:28 cl/link=0 msbuild(cpu-s)=[] cpu=11,9,11
+round 8 start 2026-10-25T16:02:25 cl/link=0 msbuild(cpu-s)=[] cpu=10,13,15
+row                                                        e542abf       0b5bd45       dfdfada  spread0% sp_0b5bd45% d_0b5bd45% sp_dfdfada% d_dfdfada%
+BM_IterateFiveComponents/10000                            64,375.5      64,031.8      64,022.3       2.6       3.8      -0.5       3.1      -0.5
+BM_IterateFiveComponents/100000                          665,239.5     669,612.3     666,668.3       4.7       4.0      +0.7       4.8      +0.2
+BM_IterateFiveComponents/1000000                       6,778,036.6   6,763,324.1   6,780,779.5       2.9       6.1      -0.2       2.1      +0.0
+BM_IterateTwoComponentsHalf/10000                          9,874.3       9,788.9      11,502.5       1.8      11.8      -0.9       4.7     +16.5
+BM_IterateTwoComponentsHalf/100000                       105,410.7     103,403.8     120,310.0       3.2       3.5      -1.9       1.4     +14.1
+BM_IterateTwoComponentsHalf/1000000                    1,224,850.2   1,197,008.8   1,312,115.8      11.1       8.6      -2.3       7.7      +7.1
+BM_Storage_FilteredIter_Sparse/100000/1                    8,596.9       7,620.2       7,732.1       2.8       7.3     -11.4       4.5     -10.1
+BM_Storage_FilteredIter_Sparse/100000/50                 245,347.0     192,985.3     197,196.7       4.3       4.1     -21.3       5.1     -19.6
+BM_Storage_FilteredIter_Sparse/100000/99                 400,495.8     258,579.0     282,637.8       6.7       3.2     -35.4       5.7     -29.4
+BM_Storage_FilteredIter_Table/100000/1                       415.3         412.6       1,455.7       2.1       6.8      -0.7       3.2    +250.5
+BM_Storage_FilteredIter_Table/100000/50                   21,908.7      21,834.2      69,314.7       6.3      11.7      -0.3       3.5    +216.4
+BM_Storage_FilteredIter_Table/100000/99                   46,582.5      47,689.0     137,303.3       5.8       9.3      +2.4       2.4    +194.8
+BM_Storage_SoleIter_Sparse/100000/1                        8,309.8       8,335.6       8,246.5      23.7       3.0      +0.3       4.9      -0.8
+BM_Storage_SoleIter_Sparse/100000/50                     405,762.3     424,461.1     415,379.9       5.3       3.9      +4.6       4.4      +2.4
+BM_Storage_SoleIter_Sparse/100000/99                     791,525.8     837,190.8     808,809.2       7.7       4.6      +5.8       1.9      +2.2
+BM_Storage_SoleIter_Table/100000/1                           382.2         383.9       1,459.8       1.8      16.1      +0.5       2.8    +282.0
+BM_Storage_SoleIter_Table/100000/50                       17,237.9      17,571.7      70,839.6       4.3       7.6      +1.9       3.9    +311.0
+BM_Storage_SoleIter_Table/100000/99                       34,943.1      35,038.8     141,406.4       4.5       3.1      +0.3       3.3    +304.7
+```
+
+- `FilteredIter_Sparse` is back to `dfdfada` or better: -11.4 / -21.3 / -35.4 % vs `e542abf` at 1 / 50 / 99 % (and 1.4 / 2.1 / 8.5 % faster than `dfdfada`). Two earlier 8-round A/Bs of the same binaries agree (-12.7 / -21.2 / -36.4 % and -11.2 / -21.6 / -34.4 %).
+- The pure-Table rows do not move, as expected (a pure-Table view does not instantiate the changed arm): `IterateFiveComponents` -0.5 / +0.7 / -0.2 %, `IterateTwoComponentsHalf` -0.9 / -1.9 / -2.3 %, the `_Table` storage rows -0.7..+2.4 % with the branch's own spreads at 3-16 %.
+- `SoleIter_Sparse` is sparse-driven (`VisitSparseRange`), not this visit. Over four A/Bs it read +0.3 / +4.6 / +5.8 % (above), +1.0 / +3.8 / +1.3 %, +0.8 / +1.0 / +0.2 % and, in a focused 12-round run, +1.4 / +1.1 / +2.4 % (spreads 6-13 %: LOUD under the gate rule). The disassembly of `VisitSparseRange<..SoleIter<ChurnS>..>` is instruction-for-instruction identical in `e542abf` and `0b5bd45` (159 lines each, addresses stripped); only its placement differs (`...F120` vs `...0840`, a different 64-byte offset), and the calling `SoleIter<ChurnS>` grew (393 -> 600 lines) because its never-taken archetype fallback now inlines the visit. So no per-entity work changed; the small positive reading is recorded as layout/noise, not claimed as zero.
+- In `FilteredIter<ChurnS>` the two `NextStorageEntity` calls are gone (`BeginStorageChunk` is the only storage-visit call left; the cold `SparseSet::Find` / `UniversalColumn` lookups of the fetchers now inline).
+- **Universal-member views keep the split cost by necessity.** A Table-only view with a Universal member in its registry runs the split visit (its storage visit is the cold branch of a view that also instantiates the Table loop, where an out-of-line call receiving the functor would make captures escape, fix round 2). That is the Arcane `Identity` adoption path. No committed benchmark iterates such a view, so its per-entity cost is not measured here; by construction it is the same one-out-of-line-call-per-entity shape `FilteredIter_Sparse` paid at `e542abf`.
+
+**Enableable Table filtered walk (re-review m2): `dfdfada` vs `94f4346`, 8 interleaved rounds, quiet (CPU 10-31 %, no `cl`/`link`).** No committed benchmark iterates an enableable Table view, and `ForEachEnabledRun` was rebuilt on `MatchingRunCursor` in round 2. A scratch benchmark (not in the committed suite): `View<Position, EnV>::ForEach` over 100K entities with `EnV` enableable and disabled on 1 / 10 / 50 / 90 / 99 % scattered, and in clustered runs of 256, built standalone from each tree's headers with the Release flags above. The original source was deleted with `bin\fix3`; fix round 4 recreated it from this definition as `.superpowers/sdd/2026-10-01-astra-storage-policies/evidence-task42/m2_enableable_table.cpp` (local evidence, not committed; build line in its header; it compiles and lists the six rows at `0b5bd45`, but it is not byte-identical to the binary measured below):
 
 ```
 row                                                  dfdfada         fix  spread0%     dfix%
@@ -2091,6 +2195,6 @@ ns/op is defined per op:
 ### Reading the numbers
 
 - **Churn (Sparse).** Sparse add/remove churn is 32-37 % faster than Table at every measured size (43.4 us vs 68.3 us at 1K, 431 us vs 633 us at 10K, 4.24 ms vs 6.72 ms at 100K); the hand-rolled harness agrees (29-31 vs 37-41 ns per add+remove).
-- **Iteration and lookup (Table stays ahead).** Dense iteration is a Table strength: `FilteredIter` at 99 % is 50.0 us (Table) vs 405 us (Sparse), `SoleIter` at 99 % is 35.3 us vs 793 us. At 1 % the Table variants are still far ahead (0.42 us vs 8.5 us) because they skip the non-holder archetype wholesale. Random `GetComponent` at 100K is 1.26 ms (Table) vs 2.74 ms (Sparse) vs 2.50 ms (Universal); at 1M, 67.5 / 109.5 / 103.8 ns per lookup.
+- **Iteration and lookup (Table stays ahead).** Dense iteration is a Table strength: `FilteredIter` at 99 % is 47.7 us (Table) vs 259 us (Sparse) at `0b5bd45` (fix-round-4 A/B above, median of 8 rounds; the 3-rep storage run at `94f4346` read 50.0 vs 405 us, before the inline Sparse visit), `SoleIter` at 99 % is 35.3 us vs 793 us (storage run; that hot loop is codegen-identical at `0b5bd45`). At 1 % the Table variants are still far ahead (0.41 us vs 7.6 us at `0b5bd45`) because they skip the non-holder archetype wholesale. Random `GetComponent` at 100K is 1.26 ms (Table) vs 2.74 ms (Sparse) vs 2.50 ms (Universal); at 1M, 67.5 / 109.5 / 103.8 ns per lookup.
 - **Universal.** A 48 B string-bearing Identity as Universal makes structural churn 18.2 % (10K) and 18.4 % (100K) faster than keeping it in the archetype (0.656 vs 0.801 ms; 6.68 vs 8.19 ms), and 24 % faster per entity in the hand-rolled harness (36.2 vs 47.7 ns).
-- **Table-only users.** Not shown to be regression-free: S4 part 1 is PENDING. Iteration rows are within the base's noise or better (`IterateTwoComponentsHalf` resolved), but the by-id and command-buffer paths read 4-9 % slower, `RangeForFiveComponents` 1-5 %, and `CreateEntities` up to +7.7 % at 1M against 975cdb7, with a stable sign in an interleaved 9-rep re-measure on a shared desk. Re-judge in a clean-room window (`bench-clean.ps1`).
+- **Table-only users.** Not shown to be regression-free: S4 part 1 is PENDING. In the interleaved 9-rep re-measure on a shared desk, the by-id and command-buffer paths read 4-9 % slower, `RangeForFiveComponents` 1-5 %, `CreateEntities` up to +7.7 % at 1M and `RemoveComponents/1000000` +3.5 % against 975cdb7, with a stable sign; `IterateTwoComponentsHalf` is resolved. Iteration is NOT shown to be within noise: two `ParallelIterate*` rows are 3-round FAILs, and 23 flagged rows (most of them `ParallelIterate*`, `Iterate*`, `RangeFor*`) were never re-measured and are unjudged (listed above). Re-judge all of them in a clean-room window (`bench-clean.ps1`).
