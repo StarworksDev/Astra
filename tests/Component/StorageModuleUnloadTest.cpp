@@ -1,6 +1,8 @@
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 #include <gtest/gtest.h>
 #include <Astra/Component/ComponentModule.hpp>
@@ -532,6 +534,77 @@ TEST(StorageModuleUnload, ASuspendedUniversalAnswersAbsentThroughTheTypedApiAndV
     reg.DestroyEntities(everyone);
     EXPECT_EQ(g_postUnloadDestructs, 0);
     EXPECT_EQ(RelocationCanary::s_live, 0);
+    EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+}
+
+// Final review M3: a SUSPENDED Universal is held by no entity on every surface, so an
+// Any/OneOf group naming it agrees with Contains/HasComponent: ForEach and Size count
+// exactly the entities Contains accepts. A batch remove is a quiet 0, like the
+// single-entity form (nothing to refuse while no slot is live).
+TEST(StorageModuleUnload, ASuspendedUniversalInAnAnyOrOneOfGroupAgreesWithContains)
+{
+    Astra::TestSupport::ScopedDefaultTypeContext ctx;
+    auto creg = std::make_shared<Astra::ComponentRegistry>();
+    creg->RegisterComponents<Position, Velocity>();
+    const PluginInstall plugin = InstallPluginCanary(*creg, Astra::Storage::Table);
+    Astra::Registry::Config cfg;
+    cfg.AddUniversal<RelocationCanary>();
+    Astra::Registry reg(creg, cfg);
+    std::vector<Astra::Entity> moving, still;
+    for (int i = 0; i < 3; ++i) moving.push_back(reg.CreateEntityWith(Position{}, Velocity{}));
+    for (int i = 0; i < 2; ++i) still.push_back(reg.CreateEntity<Position>());
+
+    // {ForEach visits, Size, Contains over every entity} of one view.
+    auto counts = [&](auto view)
+    {
+        size_t visited = 0;
+        view.ForEach([&](Astra::Entity, Position&) { ++visited; });
+        size_t contained = 0;
+        for (const Astra::Entity e : moving) contained += view.Contains(e) ? 1u : 0u;
+        for (const Astra::Entity e : still) contained += view.Contains(e) ? 1u : 0u;
+        return std::array<size_t, 3>{visited, view.Size(), contained};
+    };
+    auto anyCounts = [&] { return counts(reg.CreateView<Position, Astra::Any<RelocationCanary, Velocity>>()); };
+    auto oneOfCounts = [&] { return counts(reg.CreateView<Position, Astra::OneOf<RelocationCanary, Velocity>>()); };
+
+    // Live: every entity holds U, so Any passes all five and OneOf only the two without Velocity.
+    EXPECT_EQ(anyCounts(), (std::array<size_t, 3>{5, 5, 5}));
+    EXPECT_EQ(oneOfCounts(), (std::array<size_t, 3>{2, 2, 2}));
+
+    (void)creg->ReleaseModule(plugin.owner);
+    g_pluginUnloaded = true;
+    ASSERT_EQ(reg.GetComponentStorage()->FindUniversal(plugin.id), nullptr);
+
+    // Suspended: no entity holds U, so both groups reduce to "holds Velocity".
+    EXPECT_EQ(anyCounts(), (std::array<size_t, 3>{3, 3, 3}));
+    EXPECT_EQ(oneOfCounts(), (std::array<size_t, 3>{3, 3, 3}));
+    {
+        AssertCount count;
+        Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &count);
+        EXPECT_EQ(reg.RemoveComponents<RelocationCanary>(std::span<Astra::Entity>{moving}), 0u);
+        EXPECT_EQ(reg.RemoveComponentsByID(std::span<Astra::Entity>{still}, plugin.id), 0u);
+        EXPECT_EQ(count.n, 0) << "a suspended Universal batch remove is a quiet 0, like the single-entity form";
+    }
+
+    // Registered again: the next create refills the column for every entity, and the
+    // groups answer as before the unload.
+    (void)InstallPluginCanary(*creg, Astra::Storage::Table);
+    still.push_back(reg.CreateEntity<Position>());
+    EXPECT_EQ(anyCounts(), (std::array<size_t, 3>{6, 6, 6}));
+    EXPECT_EQ(oneOfCounts(), (std::array<size_t, 3>{3, 3, 3}));
+    {
+        AssertCount count;
+        Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &count);
+        EXPECT_EQ(reg.RemoveComponents<RelocationCanary>(std::span<Astra::Entity>{moving}), 0u);
+#if MOSAIC_ASSERTS_ACTIVE
+        EXPECT_EQ(count.n, 1) << "a live Universal batch remove stays refused, once per call";
+#else
+        EXPECT_EQ(count.n, 0);
+#endif
+    }
+    reg.DestroyEntities(moving);
+    reg.DestroyEntities(still);
+    EXPECT_EQ(g_postUnloadDestructs, 0);
     EXPECT_EQ(reg.ValidateStorageInvariants(), "");
 }
 

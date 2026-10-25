@@ -657,7 +657,7 @@ namespace Astra
             if (entities.empty())
                 return 0;
             if (IsUniversalT<T>()) ASTRA_UNLIKELY
-                return RefuseUniversalRemoveBatch(entities);
+                return RefuseUniversalRemoveBatch(entities, TypeID<T>::Value());
             if constexpr (StorageOfV<T> == Storage::Sparse)
             {
                 if (ResolveKind<T>() == StorageKind::Sparse)
@@ -1091,7 +1091,7 @@ namespace Astra
         size_t RemoveComponentsByID(std::span<Entity> entities, ComponentID componentId)
         {
             if (IsUniversalId(componentId)) ASTRA_UNLIKELY
-                return RefuseUniversalRemoveBatch(entities);
+                return RefuseUniversalRemoveBatch(entities, componentId);
             if (IsSparseId(componentId)) ASTRA_UNLIKELY
             {
                 size_t removed = 0;
@@ -2320,25 +2320,33 @@ namespace Astra
         // HasComponent == false, nothing to refuse. A stale handle is a quiet miss too.
         bool UniversalRemoveAnswer(Entity entity, ComponentID id) const noexcept
         {
-            if (!m_entityManager.IsValid(entity) || StoreLookup(entity, id) == nullptr)
+            if (!HoldsLiveUniversal(entity, id))
                 return false;
             return RefuseUniversalRemove();
         }
 
-        // Batch form: one refusal per call if any handle is live (a batch of only stale
-        // handles misses quietly). Returns 0, the removed count. (A CommandBuffer batch
-        // remove executes per entity, so it refuses once per live entity.)
-        size_t RefuseUniversalRemoveBatch(std::span<Entity> entities) const noexcept
+        // Batch form: one refusal per call if any entity holds the component, by the same
+        // test as the single form (final review M3): a batch of only stale handles, or one
+        // made while the type is suspended, misses quietly. Returns 0, the removed count. (A
+        // CommandBuffer batch remove executes per entity, so it refuses once per holder.)
+        size_t RefuseUniversalRemoveBatch(std::span<Entity> entities, ComponentID id) const noexcept
         {
             for (Entity entity : entities)
             {
-                if (m_entityManager.IsValid(entity))
+                if (HoldsLiveUniversal(entity, id))
                 {
                     (void)RefuseUniversalRemove();
                     break;
                 }
             }
             return 0;
+        }
+
+        // A live handle whose slot of the declared Universal `id` is live (false while the
+        // type is suspended after a module unload, spec s4.4).
+        ASTRA_NODISCARD bool HoldsLiveUniversal(Entity entity, ComponentID id) const noexcept
+        {
+            return m_entityManager.IsValid(entity) && StoreLookup(entity, id) != nullptr;
         }
 
         // True when `id` is declared Universal in this registry: a bool load plus a mask

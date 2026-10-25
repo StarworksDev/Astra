@@ -833,44 +833,67 @@ namespace Astra
             return GroupsPass(mask);
         }
 
-        // Archetype-level verdict of one Any/OneOf group (spec s6.3): how many members the
-        // archetype is KNOWN to hold -- Table members in its mask, plus Universal members,
-        // which every live entity holds -- and whether Sparse members leave the rest to a
+        // One resolved store per plan type (the storage path, below, resolves them). Refreshed
+        // on the walking thread before any chunk is visited and before any parallel dispatch:
+        // slots are acquired lazily (s3.2), so a sparse set may appear after the view was
+        // built. Workers only read.
+        struct StoreRef
+        {
+            int              slot = -1;            // sparse slot (Sparse; enableable Universal's mirror); -1 = none
+            SparseSet*       sparse = nullptr;     // Sparse kind with a slot
+            UniversalColumn* universal = nullptr;  // Universal kind
+        };
+        using StoreArray = std::array<StoreRef, NPlanSlots>;
+
+        // Verdict of one Any/OneOf group (spec s6.3): how many members are KNOWN to be held --
+        // Table members in the archetype mask, plus, at chunk level, every Universal member
+        // whose column is live (a live column holds every entity; a suspended one, after a
+        // module unload, none: spec s4.4) -- and whether Sparse members leave the rest to a
         // per-entity test. For a pure-Table group this is exactly QueryBuilder's mask test.
-        struct GroupVerdict { uint32_t known = 0; bool hasSparse = false; };
+        // At archetype level (`st == nullptr`) the Universal members are only COUNTED as
+        // undecided (`universal`): the cached archetype list must not depend on a column's
+        // state, which a module unload or a refill changes without an archetype event, so it
+        // keeps every archetype that could match and the chunk filter decides (final review M3).
+        struct GroupVerdict { uint32_t known = 0; uint32_t universal = 0; bool hasSparse = false; };
 
         template<typename T>
-        void CountGroupMember(const ComponentMask& mask, GroupVerdict& v) const
+        void CountGroupMember(const ComponentMask& mask, const StoreArray* st, GroupVerdict& v) const
         {
             switch (m_kinds[PlanIndex<T>])
             {
             case StorageKind::Table:     v.known += mask.Test(TypeID<std::remove_const_t<T>>::Value()) ? 1u : 0u; break;
-            case StorageKind::Universal: ++v.known; break;
+            case StorageKind::Universal:
+                if (!st)
+                    ++v.universal;
+                else if ((*st)[PlanIndex<T>].universal)
+                    ++v.known;
+                break;
             case StorageKind::Sparse:    v.hasSparse = true; break;
             }
         }
 
         template<typename Group>
-        GroupVerdict GroupAtArchetype([[maybe_unused]] const ComponentMask& mask) const
+        GroupVerdict GroupVerdictOf([[maybe_unused]] const ComponentMask& mask, [[maybe_unused]] const StoreArray* st) const
         {
             GroupVerdict v;
-            [&]<typename... Ts>(std::tuple<Ts...>*) { (CountGroupMember<Ts>(mask, v), ...); }(static_cast<Group*>(nullptr));
+            [&]<typename... Ts>(std::tuple<Ts...>*) { (CountGroupMember<Ts>(mask, st, v), ...); }(static_cast<Group*>(nullptr));
             return v;
         }
 
-        // Any: a member is known, or a Sparse member may supply it per entity.
+        // Any: a member is known, or a Universal / Sparse member may supply it.
         template<typename G>
         bool AnyGroupPasses(const ComponentMask& mask) const
         {
-            const GroupVerdict v = GroupAtArchetype<G>(mask);
-            return v.known > 0 || v.hasSparse;
+            const GroupVerdict v = GroupVerdictOf<G>(mask, nullptr);
+            return v.known > 0 || v.universal > 0 || v.hasSparse;
         }
-        // OneOf: exactly one known, or none known and a Sparse member may be the one.
+        // OneOf: exactly one could be held -- at most one known, and some member left to be
+        // the one when none is (a Universal member counts once its column state is known).
         template<typename G>
         bool OneOfGroupPasses(const ComponentMask& mask) const
         {
-            const GroupVerdict v = GroupAtArchetype<G>(mask);
-            return v.known == 1 || (v.known == 0 && v.hasSparse);
+            const GroupVerdict v = GroupVerdictOf<G>(mask, nullptr);
+            return v.known == 1 || (v.known == 0 && (v.universal > 0 || v.hasSparse));
         }
         template<typename... Gs>
         bool AnyGroupsPass([[maybe_unused]] const ComponentMask& mask, std::tuple<Gs...>*) const { return (AnyGroupPasses<Gs>(mask) && ...); }
@@ -1640,17 +1663,6 @@ namespace Astra
         // Universal-free registry instantiates it (the dispatcher names it) but never
         // runs it: it pays one m_anyUniversal test per archetype walk.
 
-        // One resolved store per plan type. Refreshed on the walking thread before any
-        // chunk is visited and before any parallel dispatch: slots are acquired lazily
-        // (s3.2), so a sparse set may appear after the view was built. Workers only read.
-        struct StoreRef
-        {
-            int              slot = -1;            // sparse slot (Sparse; enableable Universal's mirror); -1 = none
-            SparseSet*       sparse = nullptr;     // Sparse kind with a slot
-            UniversalColumn* universal = nullptr;  // Universal kind
-        };
-        using StoreArray = std::array<StoreRef, NPlanSlots>;
-
         ASTRA_NODISCARD bool UsesStoragePath() const noexcept
         {
             if constexpr (HasSparseArg)
@@ -1810,12 +1822,12 @@ namespace Astra
             any = true;
         }
 
-        // Any group: nothing to add when a Table/Universal member is known here; else the
-        // OR of the Sparse members' presence (false when no member has a block here).
+        // Any group: nothing to add when a Table member or a live Universal one is known here;
+        // else the OR of the Sparse members' presence (false when no member has a block here).
         template<typename Group>
         bool BuildAnyGroupWords(ArchetypeChunk* chunk, const ComponentMask& mask, size_t count, ChunkFilter& f, size_t g) const
         {
-            if (GroupAtArchetype<Group>(mask).known > 0)
+            if (GroupVerdictOf<Group>(mask, &m_stores).known > 0)
                 return true;
             auto& words = f.groups.words[g];
             const size_t nw = (count + 63) >> 6;
@@ -1829,12 +1841,13 @@ namespace Astra
             return true;
         }
 
-        // OneOf group: one member known here => every Sparse member must be absent
-        // (exclude their presence); none known => exactly one Sparse member per entity.
+        // OneOf group: one member known here (a live Universal counts) => every Sparse member
+        // must be absent (exclude their presence); none known => exactly one Sparse member
+        // per entity.
         template<typename Group>
         bool BuildOneOfGroupWords(ArchetypeChunk* chunk, const ComponentMask& mask, size_t count, ChunkFilter& f, size_t g) const
         {
-            const GroupVerdict v = GroupAtArchetype<Group>(mask);
+            const GroupVerdict v = GroupVerdictOf<Group>(mask, &m_stores);
             if (!v.hasSparse)
                 return v.known == 1;
             if (v.known > 1)
