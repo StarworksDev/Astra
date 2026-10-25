@@ -118,13 +118,15 @@ namespace Astra::Debug
 
     // Opt-in per-component churn counter for the "sparse-shaped" advisory. Attaching one
     // enables ComponentAdded/ComponentRemoved on the registry (a registry without a
-    // tracker pays nothing); the previous signal mask is restored on destruction. Must not
+    // tracker pays nothing); on destruction it disables only the signals it turned on, so
+    // anything the host enabled meanwhile, or had enabled before, stays on. Must not
     // outlive the registry, and follows only that registry (a Load builds a new one).
     class ChurnTracker
     {
     public:
         explicit ChurnTracker(Registry& registry)
-            : m_registry(&registry), m_previous(registry.GetEnabledSignals())
+            : m_registry(&registry)
+            , m_turnedOn((Signal::ComponentAdded | Signal::ComponentRemoved) & ~registry.GetEnabledSignals())
         {
             registry.EnableSignals(Signal::ComponentAdded | Signal::ComponentRemoved);
             SignalManager* signals = registry.GetSignalManager();
@@ -139,7 +141,7 @@ namespace Astra::Debug
             SignalManager* signals = m_registry->GetSignalManager();
             signals->On<Events::ComponentAdded>().Unregister(m_addedId);
             signals->On<Events::ComponentRemoved>().Unregister(m_removedId);
-            m_registry->SetEnabledSignals(m_previous);
+            m_registry->DisableSignals(m_turnedOn);
         }
 
         ChurnTracker(const ChurnTracker&) = delete;
@@ -151,7 +153,7 @@ namespace Astra::Debug
 
     private:
         Registry* m_registry;
-        Signal m_previous;
+        Signal m_turnedOn;   // the churn signals that were off when the tracker attached
         std::array<uint64_t, MAX_COMPONENTS> m_adds{};
         std::array<uint64_t, MAX_COMPONENTS> m_removes{};
         std::size_t m_addedId = 0;
@@ -347,12 +349,11 @@ namespace Astra::Debug
         out.registry.archetypeCount = out.archetypes.size();
 
         // ---- Per-component storage (s9.4) ------------------------------------------
-        std::vector<ComponentDescriptor> descriptors;
-        components->GetAllDescriptors(descriptors);   // ascending id
-        for (const ComponentDescriptor& d : descriptors)
+        // Visited in place, ascending id: no per-frame descriptor copy (final review M6).
+        components->ForEachComponent([&](ComponentID, const ComponentDescriptor& d)
         {
             if (d.id >= MAX_COMPONENTS)
-                continue;
+                return;
             StoreInfo s;
             s.name = d.name ? d.name : "?";
             s.id = d.id;
@@ -398,10 +399,10 @@ namespace Astra::Debug
             }
             // Unused Table components (and resource descriptors sharing the id space) are noise.
             if (s.kind == StorageKind::Table && s.population == 0 && s.adds == 0 && s.removes == 0)
-                continue;
+                return;
             Advise(s, out.registry.entityCount);
             out.components.push_back(std::move(s));
-        }
+        });
     }
 
     ASTRA_NODISCARD inline InspectorSnapshot Capture(Registry& registry, const ChurnTracker* churn = nullptr)

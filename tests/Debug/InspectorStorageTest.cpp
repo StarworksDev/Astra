@@ -279,3 +279,22 @@ TEST(InspectorStorage, ChurnTrackerRestoresTheSignalMask)
     }
     EXPECT_EQ(reg.GetEnabledSignals(), before);
 }
+
+// Final review M5: the tracker turns off only the bits IT turned on. Signals the host
+// enabled while it was attached stay on, and one the host had on before stays on.
+TEST(InspectorStorage, ChurnTrackerDisablesOnlyTheSignalsItEnabled)
+{
+    using Astra::Signal;
+    const auto on = [](Signal mask, Signal s) { return (mask & s) != Signal::None; };
+    Astra::Registry reg;
+    reg.EnableSignals(Signal::ComponentRemoved);                // the host's, before the tracker
+    {
+        Astra::Debug::ChurnTracker churn(reg);
+        reg.EnableSignals(Signal::EntityCreated | Signal::ComponentEnabled);   // the host's, while attached
+    }
+    const Signal after = reg.GetEnabledSignals();
+    EXPECT_TRUE(on(after, Signal::EntityCreated)) << "enabled by the host while the tracker was attached";
+    EXPECT_TRUE(on(after, Signal::ComponentEnabled));
+    EXPECT_TRUE(on(after, Signal::ComponentRemoved)) << "the host had it on before the tracker";
+    EXPECT_FALSE(on(after, Signal::ComponentAdded)) << "the tracker's own bit is turned off again";
+}
