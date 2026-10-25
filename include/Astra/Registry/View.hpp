@@ -2606,15 +2606,21 @@ namespace Astra
             }
             std::tuple<typename YieldType<std::tuple_element_t<ReqIs, RequiredTypes>>::type...> y{
                 MakeStorageYield<ReqIs>(std::get<ReqIs>(req), std::get<ReqIs>(rp), e, i, now)... };
-            std::apply([&](auto&... r)
-            {
-                func(e, r..., static_cast<std::tuple_element_t<OptIs, OptionalTypes>*>(std::get<OptIs>(op))...);
-            }, y);
+            // Called directly, not through std::apply: an out-of-line apply helper would receive
+            // the user's functor (see VisitChunkStorage).
+            func(e, std::get<ReqIs>(y)..., static_cast<std::tuple_element_t<OptIs, OptionalTypes>*>(std::get<OptIs>(op))...);
         }
 
         // The storage-path chunk visit (shared by the serial and parallel walks).
+        //
+        // Force-inlined, with the run loop written HERE (MatchingRunCursor, one call site)
+        // rather than as a callback: no out-of-line function may receive `func`. A pure-Table
+        // view instantiates this as its cold `m_anyUniversal` branch, so if any callee took the
+        // user's lambda, the lambda's by-reference captures would escape for the WHOLE caller
+        // and stay in memory in the hot Table loop too (Task 42 fix 2: a `[&counter]` ForEach
+        // lambda paid +13..17 % for exactly that -- BM_IterateTwoComponentsHalf).
         template<bool Stamp, bool Par = false, typename Func, size_t... ReqIs, size_t... OptIs>
-        void VisitChunkStorage(Archetype* archetype, ArchetypeChunk* chunk, Func& func, Tick now, [[maybe_unused]] Tick since,
+        ASTRA_FORCEINLINE void VisitChunkStorage(Archetype* archetype, ArchetypeChunk* chunk, Func& func, Tick now, [[maybe_unused]] Tick since,
                                std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
         {
             const size_t count = chunk->GetCount();
@@ -2658,12 +2664,13 @@ namespace Astra
                 MakeFetch<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, m_stores)... };
             const Entity* entities = chunk->GetEntities().data();
 
-            Detail::ForEachMatchingRun(f.exclude, f.nExclude, f.require, f.nRequire, count,
-                [&](size_t begin, size_t end)
-                {
-                    for (size_t i = begin; i < end; ++i)
-                        InvokeStorageEntity<Stamp, Par>(entities[i], i, req, opt, func, now, reqSeq, optSeq);
-                });
+            Detail::MatchingRunCursor runs(f.exclude, f.nExclude, f.require, f.nRequire, count);
+            size_t begin = 0, end = 0;
+            while (runs.Next(begin, end))
+            {
+                for (size_t i = begin; i < end; ++i)
+                    InvokeStorageEntity<Stamp, Par>(entities[i], i, req, opt, func, now, reqSeq, optSeq);
+            }
         }
 
         // ---- Random access (spec s6.5): Get / Single / Contains ----

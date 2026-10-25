@@ -47,6 +47,36 @@ namespace
             [&](size_t b, size_t e) { runs.emplace_back(b, e); });
         return runs;
     }
+
+    // The same runs pulled one at a time (the storage-path chunk walk's form).
+    Runs CollectCursor(const std::vector<std::vector<uint64_t>>& ex, const std::vector<std::vector<uint64_t>>& req, size_t count)
+    {
+        Runs runs;
+        auto pe = Ptrs(ex);
+        auto pr = Ptrs(req);
+        Astra::Detail::MatchingRunCursor cursor(pe.data(), pe.size(), pr.data(), pr.size(), count);
+        size_t b = 0, e = 0;
+        while (cursor.Next(b, e))
+            runs.emplace_back(b, e);
+        EXPECT_FALSE(cursor.Next(b, e)) << "an exhausted cursor stays exhausted";
+        return runs;
+    }
+}
+
+TEST(MatchingRuns, CursorPullsTheSameRunsAsTheCallbackWalk)
+{
+    EXPECT_EQ(CollectCursor({}, {}, 130), (Runs{{0, 130}}));
+    EXPECT_TRUE(CollectCursor({}, {}, 0).empty());
+
+    std::vector<uint64_t> req(3, 0);
+    req[0] = 0xF000000000000001ull;   // bit 0, bits 60..63
+    req[1] = ~0ull;                   // a whole word continues the open run
+    req[2] = 0x0000000000000007ull;   // bits 128..130
+    EXPECT_EQ(CollectCursor({}, {req}, 192), (Runs{{0, 1}, {60, 131}}));
+
+    std::vector<uint64_t> ex(1, 0b0010'0100ull);
+    EXPECT_EQ(CollectCursor({ex}, {std::vector<uint64_t>(1, 0xFFull)}, 8), (Runs{{0, 2}, {3, 5}, {6, 8}}));
+    EXPECT_EQ(CollectCursor({}, {std::vector<uint64_t>(1, ~0ull)}, 64), (Runs{{0, 64}}));   // open run closed at count
 }
 
 TEST(MatchingRuns, NoSetsYieldsOneWholeRun)
@@ -91,6 +121,7 @@ TEST(MatchingRuns, RandomSetsAgreeWithTheReferenceAndTheHelpers)
 
         const Runs expected = Reference(ex, req, count);
         ASSERT_EQ(Collect(ex, req, count), expected) << "round " << round;
+        ASSERT_EQ(CollectCursor(ex, req, count), expected) << "round " << round;
 
         size_t total = 0;
         for (auto [b, e] : expected) total += e - b;

@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <utility>
 
+#include "../Core/Base.hpp"
+
 namespace Astra::Detail
 {
     /**
@@ -12,7 +14,7 @@ namespace Astra::Detail
      * AND over every require set, AND NOT the OR over every exclude set, with the
      * bits at or beyond `count` masked off. With no sets at all every valid bit is set.
      */
-    inline uint64_t MatchWord(const uint64_t* const* exclude, size_t nExclude,
+    ASTRA_FORCEINLINE uint64_t MatchWord(const uint64_t* const* exclude, size_t nExclude,
                               const uint64_t* const* require, size_t nRequire,
                               size_t w, size_t count) noexcept
     {
@@ -30,68 +32,116 @@ namespace Astra::Detail
     }
 
     /**
-     * Generalised run extraction (spec 2026-10-01 s6.3). Invokes `fn(begin, end)` for
-     * every maximal run of indices in [0, count) whose bit is set in EVERY `require`
-     * set and in NO `exclude` set. Runs are ascending and stitched across word
-     * boundaries, exactly like the enabled-run walk this generalises. Each set points
-     * at (count + 63) / 64 words. Tail bits are masked, so whole-word regions may be
-     * passed. Both lists empty: the single run [0, count).
+     * Generalised run extraction (spec 2026-10-01 s6.3), pull form: Next() yields every
+     * maximal run [begin, end) of indices in [0, count) whose bit is set in EVERY `require`
+     * set and in NO `exclude` set, ascending and stitched across word boundaries, then
+     * false (and false again on every later call). Each set points at (count + 63) / 64
+     * words. Tail bits are masked, so whole-word regions may be passed. Both lists empty:
+     * the single run [0, count).
+     *
+     * A caller's per-run body sits in ONE place (`while (c.Next(b, e)) body;`), so it is
+     * inlined into the caller and no out-of-line callback ever receives the caller's
+     * functor: the storage-path chunk walk relies on that so a user lambda's by-reference
+     * captures stay promotable in a plain view's ForEach (Task 42 fix 2).
+     */
+    class MatchingRunCursor
+    {
+    public:
+        ASTRA_FORCEINLINE MatchingRunCursor(const uint64_t* const* exclude, size_t nExclude,
+                          const uint64_t* const* require, size_t nRequire, size_t count) noexcept
+            : m_exclude(exclude), m_require(require), m_nExclude(nExclude), m_nRequire(nRequire),
+              m_count(count), m_numWords((count + 63) >> 6)
+        {
+        }
+
+        ASTRA_FORCEINLINE bool Next(size_t& begin, size_t& end) noexcept
+        {
+            for (;;)
+            {
+                if (m_bits == 0ull)
+                {
+                    if (m_word >= m_numWords)
+                    {
+                        if (!m_open)
+                            return false;
+                        m_open = false;                      // a run reaching the last valid bit
+                        begin = m_openStart;
+                        end = m_count;
+                        return true;
+                    }
+                    m_bits = MatchWord(m_exclude, m_nExclude, m_require, m_nRequire, m_word, m_count);
+                    m_base = m_word << 6;
+                    ++m_word;
+
+                    // Stitch a run carried over from the previous word.
+                    if (m_open)
+                    {
+                        if (m_bits & 1ull)
+                        {
+                            const int cont = std::countr_one(m_bits);
+                            if (cont == 64)
+                            {
+                                m_bits = 0ull;               // whole word continues the run
+                                continue;
+                            }
+                            m_open = false;
+                            begin = m_openStart;
+                            end = m_base + static_cast<size_t>(cont);
+                            m_bits &= ~((uint64_t(1) << cont) - 1);   // consume the leading ones
+                            return true;
+                        }
+                        m_open = false;                      // run ended at the word boundary
+                        begin = m_openStart;
+                        end = m_base;
+                        return true;
+                    }
+                    continue;
+                }
+
+                // The next maximal one-run inside the current word.
+                const int start = std::countr_zero(m_bits);
+                const int len   = std::countr_one(m_bits >> start);
+                const int stop  = start + len;               // exclusive, within (0, 64]
+                if (stop == 64)
+                {
+                    m_open = true;                           // reaches the top: carry to the next word
+                    m_openStart = m_base + static_cast<size_t>(start);
+                    m_bits = 0ull;
+                    continue;
+                }
+                begin = m_base + static_cast<size_t>(start);
+                end = m_base + static_cast<size_t>(stop);
+                m_bits &= ~(((uint64_t(1) << len) - 1) << start);   // clear [start, stop)
+                return true;
+            }
+        }
+
+    private:
+        const uint64_t* const* m_exclude;
+        const uint64_t* const* m_require;
+        size_t   m_nExclude;
+        size_t   m_nRequire;
+        size_t   m_count;
+        size_t   m_numWords;
+        size_t   m_word = 0;           // next word to load
+        size_t   m_base = 0;           // first index of the current word
+        uint64_t m_bits = 0;           // unconsumed match bits of the current word
+        size_t   m_openStart = 0;
+        bool     m_open = false;       // a run left open at the top of the previous word
+    };
+
+    /**
+     * Callback form of MatchingRunCursor: invokes `fn(begin, end)` for every run, in order.
      */
     template<class Fn>
     inline void ForEachMatchingRun(const uint64_t* const* exclude, size_t nExclude,
                                    const uint64_t* const* require, size_t nRequire,
                                    size_t count, Fn&& fn)
     {
-        if (count == 0)
-            return;
-
-        const size_t numWords = (count + 63) >> 6;
-        bool   open = false;    // a run left open at the top of the previous word
-        size_t openStart = 0;
-
-        for (size_t w = 0; w < numWords; ++w)
-        {
-            uint64_t e = MatchWord(exclude, nExclude, require, nRequire, w, count);
-            const size_t base = w << 6;
-
-            // Stitch a run carried over from the previous word.
-            if (open)
-            {
-                if (e & 1ull)
-                {
-                    const int cont = std::countr_one(e);
-                    if (cont == 64)
-                        continue;                            // whole word continues the run
-                    fn(openStart, base + static_cast<size_t>(cont));
-                    open = false;
-                    e &= ~((uint64_t(1) << cont) - 1);       // consume the leading ones
-                }
-                else
-                {
-                    fn(openStart, base);                     // run ended at the word boundary
-                    open = false;
-                }
-            }
-
-            // Scan the remaining maximal one-runs inside this word.
-            while (e != 0ull)
-            {
-                const int start = std::countr_zero(e);
-                const int len   = std::countr_one(e >> start);
-                const int end   = start + len;               // exclusive, within (0, 64]
-                if (end == 64)
-                {
-                    open = true;                             // reaches the top: carry to next word
-                    openStart = base + static_cast<size_t>(start);
-                    break;
-                }
-                fn(base + static_cast<size_t>(start), base + static_cast<size_t>(end));
-                e &= ~(((uint64_t(1) << len) - 1) << start); // clear [start, end)
-            }
-        }
-
-        if (open)
-            fn(openStart, count);
+        MatchingRunCursor cursor(exclude, nExclude, require, nRequire, count);
+        size_t begin = 0, end = 0;
+        while (cursor.Next(begin, end))
+            fn(begin, end);
     }
 
     /**
