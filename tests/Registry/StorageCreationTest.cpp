@@ -196,6 +196,131 @@ TEST(StorageCreation, UniversalOverridesTheSparseTrait)
     EXPECT_EQ(std::as_const(reg).GetComponent<SparseProbe>(withValue)->v, 5);
 }
 
+// Spec s7.1 (final review I1): "Table members choose the archetype" in ONE placement, also
+// when the pack supplies or names a member this registry declares Universal (Arcane scene
+// load re-creates entities with their saved Identity). No root hop, no per-member move, so
+// none of the intermediate archetypes {V} and {V, H} is ever created. Every creation form,
+// each in a fresh registry so an earlier form cannot have pre-created an intermediate.
+namespace
+{
+    using Astra::Test::Health;
+    using Astra::Test::Player;
+    using Astra::Test::Transform;
+
+    Registry::Config UniversalPositionConfig()
+    {
+        Registry::Config cfg;
+        cfg.AddUniversal<Position>(&InitPositionY);
+        return cfg;
+    }
+
+    // The entity sits in exactly {Velocity, Health, Transform, Player}: Position is a column
+    // of no archetype in this registry.
+    void ExpectTablePartPlacedOnce(Registry& reg, Entity e, size_t archetypesBefore)
+    {
+        EXPECT_EQ(reg.GetArchetypeCount(), archetypesBefore + 1) << "one placement: only the destination archetype is created";
+        const Astra::EntityRecord* rec = reg.GetArchetypeManager()->GetEntityRecord(e);
+        ASSERT_NE(rec, nullptr);
+        EXPECT_EQ(rec->archetype->GetMask(), (Astra::MakeComponentMask<Velocity, Health, Transform, Player>()));
+        EXPECT_TRUE(reg.HasComponent<Position>(e));
+        EXPECT_EQ(reg.ValidateStorageInvariants(), "");
+    }
+}
+
+TEST(StorageCreation, AUniversalInThePackStillPlacesTheTableMembersInOnePlacement)
+{
+    {   // supplied values (CreateEntityWith): moved in, the universal never initialised
+        g_initCalls = 0;
+        Registry reg(UniversalPositionConfig());
+        const size_t before = reg.GetArchetypeCount();
+        const Entity e = reg.CreateEntityWith(Position{1.0f, 2.0f, 3.0f}, Velocity{4.0f, 5.0f, 6.0f},
+                                              Health{7, 8}, Transform{}, Player{});
+        ExpectTablePartPlacedOnce(reg, e, before);
+        EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(e)->y, 2.0f);
+        EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Velocity>(e)->dz, 6.0f);
+        EXPECT_EQ(std::as_const(reg).GetComponent<Health>(e)->max, 8);
+        EXPECT_EQ(g_initCalls, 0);
+        // A Sparse member rides along to its set, as on the all-Table path.
+        const Entity withSparse = reg.CreateEntityWith(Velocity{}, Position{}, SparseProbe{9}, Health{}, Transform{}, Player{});
+        EXPECT_EQ(reg.GetArchetypeCount(), before + 1);
+        EXPECT_EQ(std::as_const(reg).GetComponent<SparseProbe>(withSparse)->v, 9);
+    }
+    {   // named only (CreateEntity<...>): every Table member default-constructed, the universal default + init
+        g_initCalls = 0;
+        Registry reg(UniversalPositionConfig());
+        const size_t before = reg.GetArchetypeCount();
+        const Entity e = reg.CreateEntity<Velocity, Position, Health, Transform, Player>();
+        ExpectTablePartPlacedOnce(reg, e, before);
+        EXPECT_EQ(std::as_const(reg).GetComponent<Health>(e)->current, 100);
+        EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(e)->y, -1.0f);
+        EXPECT_EQ(g_initCalls, 1);
+    }
+    {   // batch, named only (CreateEntities<...>)
+        g_initCalls = 0;
+        Registry reg(UniversalPositionConfig());
+        const size_t before = reg.GetArchetypeCount();
+        std::vector<Entity> ents(5);
+        ASSERT_EQ((reg.CreateEntities<Velocity, Health, Position, Transform, Player>(5, std::span{ents})), 5u);
+        for (const Entity e : ents)
+            ExpectTablePartPlacedOnce(reg, e, before);
+        EXPECT_EQ(g_initCalls, 5);
+    }
+    {   // batch, supplied by a generator (CreateEntitiesWith<...>): once per index, in order
+        g_initCalls = 0;
+        Registry reg(UniversalPositionConfig());
+        const size_t before = reg.GetArchetypeCount();
+        std::vector<Entity> ents(5);
+        std::vector<size_t> calls;
+        ASSERT_EQ((reg.CreateEntitiesWith<Velocity, Position, Health, Transform, Player>(5, std::span{ents}, [&](size_t i)
+        {
+            calls.push_back(i);
+            const float f = static_cast<float>(i);
+            return std::tuple{Velocity{f, 0.0f, 0.0f}, Position{0.0f, f, 0.0f}, Health{static_cast<int>(i), 50}, Transform{}, Player{}};
+        })), 5u);
+        EXPECT_EQ(calls, (std::vector<size_t>{0, 1, 2, 3, 4}));
+        for (size_t i = 0; i < ents.size(); ++i)
+        {
+            ExpectTablePartPlacedOnce(reg, ents[i], before);
+            EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Velocity>(ents[i])->dx, static_cast<float>(i));
+            EXPECT_FLOAT_EQ(std::as_const(reg).GetComponent<Position>(ents[i])->y, static_cast<float>(i));
+            EXPECT_EQ(std::as_const(reg).GetComponent<Health>(ents[i])->current, static_cast<int>(i));
+        }
+        EXPECT_EQ(g_initCalls, 0);
+    }
+}
+
+// The same creates keep today's signal order and payloads: EntityCreated, then the pack's
+// ComponentAdded in pack order (Table members' payload is their chunk slot), then the
+// universal's (Position) last.
+TEST(StorageCreation, AUniversalInThePackKeepsTheSignalOrderAndPayloads)
+{
+    Registry reg(UniversalPositionConfig());
+    reg.EnableSignals(Astra::Signal::EntityCreated | Astra::Signal::ComponentAdded);
+    std::vector<Astra::ComponentID> ids;
+    int created = 0;
+    bool payloadsAreTheComponents = true;
+    auto* signals = reg.GetSignalManager();
+    auto onCreated = signals->On<Astra::Events::EntityCreated>().Register(
+        [&](const Astra::Events::EntityCreated&) { EXPECT_TRUE(ids.empty()); ++created; });
+    auto onAdded = signals->On<Astra::Events::ComponentAdded>().Register(
+        [&](const Astra::Events::ComponentAdded& ev)
+        {
+            ids.push_back(ev.componentId);
+            if (ev.componentId == Astra::TypeID<Health>::Value())
+                payloadsAreTheComponents = payloadsAreTheComponents && ev.component == std::as_const(reg).GetComponent<Health>(ev.entity);
+            if (ev.componentId == Astra::TypeID<Position>::Value())
+                payloadsAreTheComponents = payloadsAreTheComponents && ev.component == std::as_const(reg).GetComponent<Position>(ev.entity);
+        });
+    (void)reg.CreateEntityWith(Velocity{}, Position{}, Health{3, 4});
+    EXPECT_EQ(created, 1);
+    EXPECT_EQ(ids, (std::vector<Astra::ComponentID>{Astra::TypeID<Velocity>::Value(),
+                                                    Astra::TypeID<Health>::Value(),
+                                                    Astra::TypeID<Position>::Value()}));
+    EXPECT_TRUE(payloadsAreTheComponents);
+    signals->On<Astra::Events::EntityCreated>().Unregister(onCreated);
+    signals->On<Astra::Events::ComponentAdded>().Unregister(onAdded);
+}
+
 TEST(StorageCreation, ComponentAddedCoversSparseMembersInPackOrder)
 {
     Registry reg;

@@ -78,15 +78,7 @@ namespace Astra
                 archetype = GetOrCreateArchetype<Components...>();
             }
             
-            EntityLocation location = archetype->AddEntity(entity);
-            
-            if (!location.IsValid()) ASTRA_UNLIKELY
-            {
-                return;
-            }
-
-            EntityRecord* rec = m_records->GetOrCreateRecord(entity.GetID());
-            SetRecordLocation(rec, archetype, location);   // NEVER assign rec->version
+            CommitPlacement(entity, archetype, archetype->AddEntity(entity));
         }
 
         template<Component... Components>
@@ -98,15 +90,48 @@ namespace Astra
                 return;
             
             Archetype* archetype = GetOrCreateArchetype<std::decay_t<Components>...>();
-            EntityLocation location = archetype->AddEntityWith(entity, std::forward<Components>(components)...);
+            CommitPlacement(entity, archetype, archetype->AddEntityWith(entity, std::forward<Components>(components)...));
+        }
 
-            if (!location.IsValid()) ASTRA_UNLIKELY
-            {
+        // Spec s7.1, for a creation pack that names a type this registry declares Universal:
+        // the Table members that are NOT universal choose the archetype, decided at run time
+        // (`mask`), and the entity is placed there in ONE placement. No root hop and no
+        // per-member move, so no intermediate archetype is ever created (final review I1).
+        // The caller has registered every id in `mask`. This form default-constructs every
+        // column (the named-only create).
+        void AddEntityByMask(Entity entity, const ComponentMask& mask)
+        {
+            if (!entity.IsValid()) ASTRA_UNLIKELY
                 return;
-            }
+            if (Archetype* archetype = ArchetypeForMask(mask)) ASTRA_LIKELY
+                CommitPlacement(entity, archetype, archetype->AddEntity(entity));
+        }
 
-            EntityRecord* rec = m_records->GetOrCreateRecord(entity.GetID());
-            SetRecordLocation(rec, archetype, location);   // NEVER assign rec->version
+        // Batch twin: one batched placement of every entity. Precondition: every entity is
+        // valid (freshly created by the Registry).
+        void AddEntitiesByMask(std::span<const Entity> entities, const ComponentMask& mask)
+        {
+            if (entities.empty()) ASTRA_UNLIKELY
+                return;
+            if (Archetype* archetype = ArchetypeForMask(mask)) ASTRA_LIKELY
+                CommitPlacements(entities, archetype, archetype->AddEntities(entities));
+        }
+
+        // Value form: the slot is allocated unconstructed, then `construct(chunk, index)`
+        // must construct EVERY column of `mask` (the caller holds a value for each, and
+        // routes its universal members elsewhere).
+        template<typename Construct>
+        void AddEntityByMaskWith(Entity entity, const ComponentMask& mask, Construct&& construct)
+        {
+            if (!entity.IsValid()) ASTRA_UNLIKELY
+                return;
+            Archetype* archetype = ArchetypeForMask(mask);
+            if (!archetype) ASTRA_UNLIKELY
+                return;
+            const EntityLocation location = archetype->AllocateEntitySlot(entity);
+            if (location.IsValid()) ASTRA_LIKELY
+                construct(*archetype->GetChunks()[location.GetChunkIndex()], location.GetEntityIndex());
+            CommitPlacement(entity, archetype, location);
         }
 
         template<Component... Components>
@@ -163,14 +188,7 @@ namespace Astra
                 locations = archetype->AddEntitiesWith(entities, generator);
             }
 
-            // No table sizing here: the shared record table is owned and pre-sized
-            // by EntityManager (these entities were already Created), and segments
-            // are created on demand by GetOrCreateRecord.
-            for (size_t i = 0; i < locations.size(); ++i)
-            {
-                EntityRecord* rec = m_records->GetOrCreateRecord(entities[i].GetID());
-                SetRecordLocation(rec, archetype, locations[i]);   // NEVER assign rec->version
-            }
+            CommitPlacements(entities, archetype, locations);
         }
 
         template<Component... Components, std::invocable<size_t> Generator>
@@ -1298,6 +1316,38 @@ namespace Astra
             std::unique_ptr<Archetype> archetype;
             uint32_t creationGeneration = 0;  // Generation when this archetype was created
         };
+
+        // Records a fresh placement (create paths). Force-inlined so the typed AddEntity /
+        // AddEntityWith keep their pre-helper code.
+        ASTRA_FORCEINLINE void CommitPlacement(Entity entity, Archetype* archetype, EntityLocation location)
+        {
+            if (!location.IsValid()) ASTRA_UNLIKELY
+            {
+                return;
+            }
+
+            EntityRecord* rec = m_records->GetOrCreateRecord(entity.GetID());
+            SetRecordLocation(rec, archetype, location);   // NEVER assign rec->version
+        }
+
+        // Batch twin. No table sizing here: the shared record table is owned and pre-sized
+        // by EntityManager (these entities were already Created), and segments are created
+        // on demand by GetOrCreateRecord.
+        ASTRA_FORCEINLINE void CommitPlacements(std::span<const Entity> entities, Archetype* archetype, const std::vector<EntityLocation>& locations)
+        {
+            for (size_t i = 0; i < locations.size(); ++i)
+            {
+                EntityRecord* rec = m_records->GetOrCreateRecord(entities[i].GetID());
+                SetRecordLocation(rec, archetype, locations[i]);   // NEVER assign rec->version
+            }
+        }
+
+        // The archetype of a run-time Table mask: the root for the empty mask (the root is
+        // not always in the mask map), else find-or-create without edges.
+        Archetype* ArchetypeForMask(const ComponentMask& mask)
+        {
+            return mask.Any() ? GetOrCreateArchetypeByMask(mask) : m_rootArchetype;
+        }
 
         template<Component... Components>
         ASTRA_NODISCARD Archetype* GetOrCreateArchetype()

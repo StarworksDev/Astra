@@ -2830,12 +2830,51 @@ namespace Astra
                 return m_componentStorage->HasUniversals() && ((KindOfT<Ts>() == StorageKind::Universal) || ...);
         }
 
-        // One default-constructed (named, no value) member, by its runtime kind. Used for
-        // Sparse-trait members always, and for Table-trait members only on the rare path
-        // where a pack names a universal type.
+        // Effective kind of a creation-pack member. A Table-trait member reads no descriptor:
+        // Universal by the declaration mask, else Table, so it is placed exactly where the
+        // archetype mask (PlacedInArchetype) put it. A Sparse-trait member keeps KindOf, whose
+        // LIVE descriptor decides (a rebound module registration may say Table, RULINGS Task 36).
+        template<Component C>
+        ASTRA_NODISCARD StorageKind PackMemberKind(ComponentID id) const noexcept
+        {
+            if constexpr (StorageOfV<C> == Storage::Sparse)
+                return m_componentStorage->KindOf(id);
+            else
+                return IsUniversalId(id) ? StorageKind::Universal : StorageKind::Table;
+        }
+
+        // True when a Table-trait pack member is a column of the creation archetype: every
+        // registered one not declared universal here. One predicate for the mask and for the
+        // slot construction, so the two can never disagree.
+        ASTRA_NODISCARD bool PlacedInArchetype(ComponentID id) const noexcept
+        {
+            return id < MAX_COMPONENTS && !IsUniversalId(id);
+        }
+
+        // Spec s7.1, a pack that names a declared universal (final review I1): the archetype
+        // mask of its Table-trait members minus the universal ones, so the entity is placed
+        // ONCE ("GetOrCreateArchetype gets the Table subset only"). Registers every member,
+        // so the archetype built from the mask finds each descriptor.
+        template<Component... Ts>
+        ASTRA_NODISCARD ComponentMask CreationMask()
+        {
+            ComponentMask mask{};
+            ([&]
+            {
+                m_componentRegistry->RegisterComponent<Ts>();
+                const ComponentID id = TypeID<Ts>::Value();
+                if (PlacedInArchetype(id))
+                    mask.Set(id);
+            }(), ...);
+            return mask;
+        }
+
+        // One default-constructed (named, no value) Sparse-trait member, by its runtime kind.
+        // (Table-trait members are placed with the archetype, PlaceDefault.)
         template<Component C>
         void PlaceDefaultMember(Entity entity)
         {
+            static_assert(StorageOfV<C> == Storage::Sparse, "Table-trait members are placed with the archetype");
             m_componentRegistry->RegisterComponent<C>();   // KindOf needs the descriptor (Sparse trait)
             const ComponentID id = TypeID<C>::Value();
             if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
@@ -2843,9 +2882,9 @@ namespace Astra
             // Release: a Sparse member past the 32-slot cap is dropped here (Sparse() returns
             // nullptr). Debug asserts in AcquireSparseSlot; a creator has no return channel
             // for spec s3.2's Release refusal (ledgered deviation).
-            switch (m_componentStorage->KindOf(id))
+            switch (PackMemberKind<C>(id))
             {
-                case StorageKind::Table:
+                case StorageKind::Table:   // the live descriptor says Table (a rebound registration)
                     (void)m_archetypeManager->AddComponent<C>(entity);
                     break;
                 case StorageKind::Sparse:
@@ -2872,8 +2911,9 @@ namespace Astra
                 }
                 else
                 {
-                    m_archetypeManager->AddEntity<>(entity);        // root, then one member at a time
-                    (PlaceDefaultMember<Ts>(entity), ...);
+                    // ONE placement in the non-universal Table subset; a named universal is
+                    // built by ConstructUniversals (default + init).
+                    m_archetypeManager->AddEntityByMask(entity, CreationMask<Ts...>());
                 }
             }(std::type_identity<Detail::TypesWithStorage<Storage::Table, Components...>>{});
 
@@ -2894,11 +2934,9 @@ namespace Astra
                 }
                 else
                 {
-                    m_archetypeManager->AddEntities<>(entities);
-                    for (Entity e : entities)
-                    {
-                        (PlaceDefaultMember<Ts>(e), ...);
-                    }
+                    // ONE batched placement in the non-universal Table subset (the declared
+                    // universals are per registry, so every entity shares the mask).
+                    m_archetypeManager->AddEntitiesByMask(entities, CreationMask<Ts...>());
                 }
             }(std::type_identity<Detail::TypesWithStorage<Storage::Table, Components...>>{});
 
@@ -2914,10 +2952,12 @@ namespace Astra
             }(std::type_identity<Detail::TypesWithStorage<Storage::Sparse, Components...>>{});
         }
 
-        // One SUPPLIED member, by its runtime kind. An rvalue is moved straight from the
-        // caller's object; an lvalue is copied through a temporary, as ArchetypeChunk's
-        // ConstructComponentAt does. Universal members are recorded in `supplied`, so
-        // ConstructUniversals skips their default + init.
+        // One SUPPLIED member that lives outside the creation archetype, by its runtime kind.
+        // An rvalue is moved straight from the caller's object; an lvalue is copied through
+        // a temporary, as ArchetypeChunk's ConstructComponentAt does. Universal members are
+        // recorded in `supplied`, so ConstructUniversals skips their default + init. A
+        // Table-kind Table-trait member was already constructed in the slot (PlaceWith) and
+        // is left alone here, so its value is consumed exactly once.
         template<typename V>
         void PlaceValueMember(Entity entity, ComponentID* supplied, size_t& suppliedCount, V&& value)
         {
@@ -2940,10 +2980,13 @@ namespace Astra
                 }
             };
 
-            switch (m_componentStorage->KindOf(id))
+            switch (PackMemberKind<C>(id))
             {
                 case StorageKind::Table:
-                    (void)m_archetypeManager->AddComponent<C>(entity, std::forward<V>(value));
+                    // Only a Sparse-trait type whose live descriptor says Table (a rebound
+                    // registration) moves in here, like an add.
+                    if constexpr (StorageOfV<C> == Storage::Sparse)
+                        (void)m_archetypeManager->AddComponent<C>(entity, std::forward<V>(value));
                     break;
                 case StorageKind::Sparse:
                     if (const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity); rec && rec->chunk) ASTRA_LIKELY
@@ -2963,10 +3006,23 @@ namespace Astra
             }
         }
 
+        // A Table-trait member's value, constructed in the freshly allocated creation slot
+        // unless this registry declares the type universal (PlaceValueMember moves that one
+        // into its column).
+        template<typename V>
+        void ConstructPlacedValue(ArchetypeChunk& chunk, size_t index, V&& value) const
+        {
+            if (PlacedInArchetype(TypeID<std::decay_t<V>>::Value()))
+                chunk.ConstructComponentAt(index, std::forward<V>(value));
+        }
+
         // Places a value pack (spec s7.1). Table-trait members go to the archetype in ONE
-        // placement (today's AddEntityWith) unless one of them is declared universal. In
-        // that rare case: the root first, then member by member. Sparse-trait members go to
-        // their sets afterwards. The forwarding tuple carries every value exactly once.
+        // placement: today's AddEntityWith, or, when one of them is declared universal, the
+        // non-universal subset's archetype with each value constructed in the new slot and
+        // the universal values moved into their columns (final review I1). Sparse-trait
+        // members go to their sets afterwards. The forwarding tuple carries every value
+        // exactly once: each member is consumed either by ConstructPlacedValue or by
+        // PlaceValueMember, never by both (both test the same declaration mask).
         template<typename... Vs>
         void PlaceWith(Entity entity, ComponentID* supplied, size_t& suppliedCount, Vs&&... values)
         {
@@ -2987,7 +3043,11 @@ namespace Astra
                     }
                     else
                     {
-                        m_archetypeManager->AddEntity<>(entity);
+                        m_archetypeManager->AddEntityByMaskWith(entity, CreationMask<std::decay_t<std::tuple_element_t<I, Refs>>...>(),
+                            [&](ArchetypeChunk& chunk, size_t index)
+                            {
+                                (ConstructPlacedValue(chunk, index, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))), ...);
+                            });
                         (PlaceValueMember(entity, supplied, suppliedCount, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))), ...);
                     }
                 }
