@@ -39,14 +39,15 @@ namespace Astra::Detail
      * words. Tail bits are masked, so whole-word regions may be passed. Both lists empty:
      * the single run [0, count).
      *
-     * A caller's per-run body sits in ONE place (`while (c.Next(b, e)) body;`), so it is
-     * inlined into the caller and no out-of-line callback ever receives the caller's
-     * functor: the storage-path chunk walk relies on that so a user lambda's by-reference
-     * captures stay promotable in a plain view's ForEach (Task 42 fix 2).
+     * Pull form, so a walk can be suspended between entities: the storage-path chunk walk
+     * keeps one in its per-chunk state and steps it from an out-of-line helper that never
+     * receives the user's functor (View::NextStorageEntity, Task 42 fix 2).
      */
     class MatchingRunCursor
     {
     public:
+        MatchingRunCursor() noexcept = default;   // exhausted: Next() is false
+
         ASTRA_FORCEINLINE MatchingRunCursor(const uint64_t* const* exclude, size_t nExclude,
                           const uint64_t* const* require, size_t nRequire, size_t count) noexcept
             : m_exclude(exclude), m_require(require), m_nExclude(nExclude), m_nRequire(nRequire),
@@ -117,12 +118,12 @@ namespace Astra::Detail
         }
 
     private:
-        const uint64_t* const* m_exclude;
-        const uint64_t* const* m_require;
-        size_t   m_nExclude;
-        size_t   m_nRequire;
-        size_t   m_count;
-        size_t   m_numWords;
+        const uint64_t* const* m_exclude = nullptr;
+        const uint64_t* const* m_require = nullptr;
+        size_t   m_nExclude = 0;
+        size_t   m_nRequire = 0;
+        size_t   m_count = 0;
+        size_t   m_numWords = 0;
         size_t   m_word = 0;           // next word to load
         size_t   m_base = 0;           // first index of the current word
         uint64_t m_bits = 0;           // unconsumed match bits of the current word

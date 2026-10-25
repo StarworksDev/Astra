@@ -2606,38 +2606,73 @@ namespace Astra
             }
             std::tuple<typename YieldType<std::tuple_element_t<ReqIs, RequiredTypes>>::type...> y{
                 MakeStorageYield<ReqIs>(std::get<ReqIs>(req), std::get<ReqIs>(rp), e, i, now)... };
-            // Called directly, not through std::apply: an out-of-line apply helper would receive
-            // the user's functor (see VisitChunkStorage).
+            // Called directly, not through std::apply (an out-of-line apply helper would receive
+            // the user's functor; see VisitChunkStorage).
             func(e, std::get<ReqIs>(y)..., static_cast<std::tuple_element_t<OptIs, OptionalTypes>*>(std::get<OptIs>(op))...);
         }
 
-        // The storage-path chunk visit (shared by the serial and parallel walks).
+        // ---- The storage-path chunk visit (shared by the serial and parallel walks) ----
         //
-        // Force-inlined, with the run loop written HERE (MatchingRunCursor, one call site)
-        // rather than as a callback: no out-of-line function may receive `func`. A pure-Table
-        // view instantiates this as its cold `m_anyUniversal` branch, so if any callee took the
+        // Split so that NO out-of-line function ever receives the user's functor. A pure-Table
+        // view instantiates this as its cold `m_anyUniversal` branch; if a callee took the
         // user's lambda, the lambda's by-reference captures would escape for the WHOLE caller
         // and stay in memory in the hot Table loop too (Task 42 fix 2: a `[&counter]` ForEach
-        // lambda paid +13..17 % for exactly that -- BM_IterateTwoComponentsHalf).
-        template<bool Stamp, bool Par = false, typename Func, size_t... ReqIs, size_t... OptIs>
-        ASTRA_FORCEINLINE void VisitChunkStorage(Archetype* archetype, ArchetypeChunk* chunk, Func& func, Tick now, [[maybe_unused]] Tick since,
-                               std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
+        // lambda paid +13..17 % for exactly that, BM_IterateTwoComponentsHalf). So the
+        // per-chunk setup and the per-entity fetch + stamp are out of line and see only the
+        // walk state, and the inlined part is just the loop that yields and calls `func` --
+        // small, so it does not crowd the caller's inlining budget either (force-inlining the
+        // whole visit made MSVC stop inlining the hot loop of a five-type view).
+
+        template<typename Tup> struct FetchTupleOf;
+        template<typename... Ts> struct FetchTupleOf<std::tuple<Ts...>> { using type = std::tuple<Fetch<Ts>...>; };
+        template<typename Tup> struct ElementPtrsOf;
+        template<typename... Ts> struct ElementPtrsOf<std::tuple<Ts...>> { using type = std::tuple<std::remove_const_t<Ts>*...>; };
+
+        // Per-chunk walk state: the match words, the per-type fetchers, the run cursor and the
+        // unvisited rest [next, end) of the current run. Filled in place by BeginStorageChunk
+        // (the cursor points into `f`, so the state never moves).
+        struct StorageChunkWalk
+        {
+            ChunkFilter f;
+            typename FetchTupleOf<RequiredTypes>::type req;
+            typename FetchTupleOf<OptionalTypes>::type opt;
+            const Entity* entities = nullptr;
+            Detail::MatchingRunCursor runs;
+            size_t next = 0;
+            size_t end = 0;
+        };
+
+        // One visible entity, fetched and stamped, handed to the inlined loop.
+        struct StorageEntitySlot
+        {
+            Entity e{};
+            size_t i = 0;
+            typename ElementPtrsOf<RequiredTypes>::type rp{};
+            typename ElementPtrsOf<OptionalTypes>::type op{};
+        };
+
+        // Out of line, before the first entity: the whole-chunk rejects, the match words, the
+        // visit stamp and the fetchers. False when the chunk is not visited.
+        template<bool Stamp, bool Par, size_t... ReqIs, size_t... OptIs>
+        ASTRA_NOINLINE bool BeginStorageChunk(Archetype* archetype, ArchetypeChunk* chunk, [[maybe_unused]] Tick now,
+                                              [[maybe_unused]] Tick since, StorageChunkWalk& w,
+                                              std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
         {
             const size_t count = chunk->GetCount();
             if (count == 0) ASTRA_UNLIKELY
-                return;
+                return false;
             const ArchetypeColumnMeta& cm = archetype->GetColumnMeta();
             if constexpr (HasChangeFilter)
             {
                 // Chunk reject first: before the enabled reject and before the stamp -- a
                 // rejected chunk is not "visited".
                 if (!ChangeChunkPassesStorage<Par>(chunk, cm, since))
-                    return;
+                    return false;
             }
 
-            ChunkFilter f;
+            ChunkFilter& f = w.f;
             if (!BuildChunkFilter(archetype, chunk, count, f))
-                return;                                   // Tier 2: nothing in this chunk can match
+                return false;                             // Tier 2: nothing in this chunk can match
             if constexpr (HasChangeFilter)
             {
                 // Per-entity change tier, unioned into the exclude sets (not a reject: the
@@ -2658,18 +2693,62 @@ namespace Astra
             if constexpr (Stamp)
                 StampVisit<Par>(chunk, cm, now, reqSeq, optSeq);
 
-            std::tuple<Fetch<std::tuple_element_t<ReqIs, RequiredTypes>>...> req{
-                MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, m_stores)... };
-            std::tuple<Fetch<std::tuple_element_t<OptIs, OptionalTypes>>...> opt{
-                MakeFetch<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, m_stores)... };
-            const Entity* entities = chunk->GetEntities().data();
+            w.req = { MakeFetch<std::tuple_element_t<ReqIs, RequiredTypes>>(chunk, cm, m_stores)... };
+            w.opt = { MakeFetch<std::tuple_element_t<OptIs, OptionalTypes>>(chunk, cm, m_stores)... };
+            w.entities = chunk->GetEntities().data();
+            w.runs = Detail::MatchingRunCursor(f.exclude, f.nExclude, f.require, f.nRequire, count);
+            w.next = 0;
+            w.end = 0;
+            return true;
+        }
 
-            Detail::MatchingRunCursor runs(f.exclude, f.nExclude, f.require, f.nRequire, count);
-            size_t begin = 0, end = 0;
-            while (runs.Next(begin, end))
+        // Out of line, per entity: the next visible entity of the walk, fetched and stamped in
+        // InvokeStorageEntity's order. A required element missing HERE was removed by a
+        // structural change made inside this walk (the Debug guard reports it, s4.3, Task 25):
+        // the entity is skipped, never dereferenced. False when the chunk is exhausted.
+        template<bool Stamp, bool Par, size_t... ReqIs, size_t... OptIs>
+        ASTRA_NOINLINE bool NextStorageEntity(StorageChunkWalk& w, StorageEntitySlot& s, [[maybe_unused]] Tick now,
+                                              std::index_sequence<ReqIs...>, std::index_sequence<OptIs...>)
+        {
+            for (;;)
             {
-                for (size_t i = begin; i < end; ++i)
-                    InvokeStorageEntity<Stamp, Par>(entities[i], i, req, opt, func, now, reqSeq, optSeq);
+                if (w.next >= w.end)
+                {
+                    if (!w.runs.Next(w.next, w.end))
+                        return false;
+                    continue;
+                }
+                const size_t i = w.next++;
+                const Entity e = w.entities[i];
+                s.rp = typename ElementPtrsOf<RequiredTypes>::type{ std::get<ReqIs>(w.req).At(e, i)... };
+                if ((... || (std::get<ReqIs>(s.rp) == nullptr))) ASTRA_UNLIKELY
+                    continue;
+                s.op = typename ElementPtrsOf<OptionalTypes>::type{ std::get<OptIs>(w.opt).OptionalAt(e, i)... };
+                if constexpr (Stamp)
+                {
+                    (StampRequiredStore<std::tuple_element_t<ReqIs, RequiredTypes>, Par>(std::get<ReqIs>(w.req), e, now), ...);
+                    (StampOptionalStore<std::tuple_element_t<OptIs, OptionalTypes>, Par>(std::get<OptIs>(w.opt), std::get<OptIs>(s.op), e, i, now), ...);
+                }
+                s.e = e;
+                s.i = i;
+                return true;
+            }
+        }
+
+        // The inlined part: yield and call, nothing else.
+        template<bool Stamp, bool Par = false, typename Func, size_t... ReqIs, size_t... OptIs>
+        ASTRA_FORCEINLINE void VisitChunkStorage(Archetype* archetype, ArchetypeChunk* chunk, Func& func, Tick now, Tick since,
+                                                 std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
+        {
+            StorageChunkWalk w;
+            if (!BeginStorageChunk<Stamp, Par>(archetype, chunk, now, since, w, reqSeq, optSeq))
+                return;
+            StorageEntitySlot s;
+            while (NextStorageEntity<Stamp, Par>(w, s, now, reqSeq, optSeq))
+            {
+                std::tuple<typename YieldType<std::tuple_element_t<ReqIs, RequiredTypes>>::type...> y{
+                    MakeStorageYield<ReqIs>(std::get<ReqIs>(w.req), std::get<ReqIs>(s.rp), s.e, s.i, now)... };
+                func(s.e, std::get<ReqIs>(y)..., static_cast<std::tuple_element_t<OptIs, OptionalTypes>*>(std::get<OptIs>(s.op))...);
             }
         }
 

@@ -77,6 +77,10 @@ TEST(MatchingRuns, CursorPullsTheSameRunsAsTheCallbackWalk)
     std::vector<uint64_t> ex(1, 0b0010'0100ull);
     EXPECT_EQ(CollectCursor({ex}, {std::vector<uint64_t>(1, 0xFFull)}, 8), (Runs{{0, 2}, {3, 5}, {6, 8}}));
     EXPECT_EQ(CollectCursor({}, {std::vector<uint64_t>(1, ~0ull)}, 64), (Runs{{0, 64}}));   // open run closed at count
+
+    Astra::Detail::MatchingRunCursor idle;   // default-constructed: already exhausted
+    size_t b = 0, e = 0;
+    EXPECT_FALSE(idle.Next(b, e));
 }
 
 TEST(MatchingRuns, NoSetsYieldsOneWholeRun)
