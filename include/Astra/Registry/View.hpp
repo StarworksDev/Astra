@@ -1692,7 +1692,8 @@ namespace Astra
 
         void ResolveStores() { ResolveStoresInto(m_stores); }
 
-        // ---- Per-chunk word sets, fed to Detail::ForEachMatchingRun ----
+        // ---- Per-chunk word sets, fed to Detail::MatchingRunCursor (the storage walk) and, via
+        // ForEachMatchingRun, the pure-Table enableable Tier-3 walk ----
         // Holds word POINTERS only, copied before any callback runs. No SparseBlock* is
         // kept across a callback: a SetEnabled or sparse add made inside one may insert a
         // block into the chunk's block list (Task 15's lifetime rule).
@@ -2587,23 +2588,45 @@ namespace Astra
                 return *p;
         }
 
-        // One matching entity: fetch, yield, call. A required element missing HERE was
-        // removed by a structural change made inside this walk (the Debug guard reports
-        // it, s4.3, Task 25): the entity is skipped, never dereferenced.
-        template<bool Stamp, bool Par, typename ReqTuple, typename OptTuple, typename Func, size_t... ReqIs, size_t... OptIs>
-        ASTRA_FORCEINLINE void InvokeStorageEntity(Entity e, size_t i, ReqTuple& req, OptTuple& opt, Func& func,
-                                                   [[maybe_unused]] Tick now,
+        template<typename Tup> struct FetchTupleOf;
+        template<typename... Ts> struct FetchTupleOf<std::tuple<Ts...>> { using type = std::tuple<Fetch<Ts>...>; };
+        template<typename Tup> struct ElementPtrsOf;
+        template<typename... Ts> struct ElementPtrsOf<std::tuple<Ts...>> { using type = std::tuple<std::remove_const_t<Ts>*...>; };
+
+        // The per-entity fetch + stamp sequence, written ONCE (G3): At -> removed-element skip
+        // -> OptionalAt -> required stamps -> optional stamps. A required element missing HERE
+        // was removed by a structural change made inside this walk (the Debug guard reports it,
+        // s4.3, Task 25): the entity is skipped, never dereferenced, and false is returned. The
+        // order is load-bearing (Ruling B stamps, Task 25 skip, Task 28 Par stamps). It takes no
+        // functor on purpose: force-inlining a helper that receives the user's lambda is what
+        // blew MSVC's inlining budget (Task 42 fix 2), so each caller keeps its own yield + call.
+        template<bool Stamp, bool Par, typename ReqTuple, typename OptTuple, typename ReqPtrs, typename OptPtrs, size_t... ReqIs, size_t... OptIs>
+        ASTRA_FORCEINLINE bool FetchAndStampEntity(Entity e, size_t i, ReqTuple& req, OptTuple& opt, [[maybe_unused]] Tick now,
+                                                   ReqPtrs& rp, OptPtrs& op,
                                                    std::index_sequence<ReqIs...>, std::index_sequence<OptIs...>)
         {
-            std::tuple<std::remove_const_t<std::tuple_element_t<ReqIs, RequiredTypes>>*...> rp{ std::get<ReqIs>(req).At(e, i)... };
+            rp = ReqPtrs{ std::get<ReqIs>(req).At(e, i)... };
             if ((... || (std::get<ReqIs>(rp) == nullptr))) ASTRA_UNLIKELY
-                return;
-            std::tuple<std::remove_const_t<std::tuple_element_t<OptIs, OptionalTypes>>*...> op{ std::get<OptIs>(opt).OptionalAt(e, i)... };
+                return false;
+            op = OptPtrs{ std::get<OptIs>(opt).OptionalAt(e, i)... };
             if constexpr (Stamp)
             {
                 (StampRequiredStore<std::tuple_element_t<ReqIs, RequiredTypes>, Par>(std::get<ReqIs>(req), e, now), ...);
                 (StampOptionalStore<std::tuple_element_t<OptIs, OptionalTypes>, Par>(std::get<OptIs>(opt), std::get<OptIs>(op), e, i, now), ...);
             }
+            return true;
+        }
+
+        // One matching entity: fetch + stamp (FetchAndStampEntity), yield, call.
+        template<bool Stamp, bool Par, typename ReqTuple, typename OptTuple, typename Func, size_t... ReqIs, size_t... OptIs>
+        ASTRA_FORCEINLINE void InvokeStorageEntity(Entity e, size_t i, ReqTuple& req, OptTuple& opt, Func& func,
+                                                   [[maybe_unused]] Tick now,
+                                                   std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
+        {
+            typename ElementPtrsOf<RequiredTypes>::type rp{};
+            typename ElementPtrsOf<OptionalTypes>::type op{};
+            if (!FetchAndStampEntity<Stamp, Par>(e, i, req, opt, now, rp, op, reqSeq, optSeq))
+                return;
             std::tuple<typename YieldType<std::tuple_element_t<ReqIs, RequiredTypes>>::type...> y{
                 MakeStorageYield<ReqIs>(std::get<ReqIs>(req), std::get<ReqIs>(rp), e, i, now)... };
             // Called directly, not through std::apply (an out-of-line apply helper would receive
@@ -2622,11 +2645,6 @@ namespace Astra
         // walk state, and the inlined part is just the loop that yields and calls `func` --
         // small, so it does not crowd the caller's inlining budget either (force-inlining the
         // whole visit made MSVC stop inlining the hot loop of a five-type view).
-
-        template<typename Tup> struct FetchTupleOf;
-        template<typename... Ts> struct FetchTupleOf<std::tuple<Ts...>> { using type = std::tuple<Fetch<Ts>...>; };
-        template<typename Tup> struct ElementPtrsOf;
-        template<typename... Ts> struct ElementPtrsOf<std::tuple<Ts...>> { using type = std::tuple<std::remove_const_t<Ts>*...>; };
 
         // Per-chunk walk state: the match words, the per-type fetchers, the run cursor and the
         // unvisited rest [next, end) of the current run. Filled in place by BeginStorageChunk
@@ -2702,13 +2720,12 @@ namespace Astra
             return true;
         }
 
-        // Out of line, per entity: the next visible entity of the walk, fetched and stamped in
-        // InvokeStorageEntity's order. A required element missing HERE was removed by a
-        // structural change made inside this walk (the Debug guard reports it, s4.3, Task 25):
-        // the entity is skipped, never dereferenced. False when the chunk is exhausted.
+        // Out of line, per entity: the next visible entity of the walk, fetched and stamped by
+        // FetchAndStampEntity (the same sequence InvokeStorageEntity runs; a removed element is
+        // skipped there). False when the chunk is exhausted.
         template<bool Stamp, bool Par, size_t... ReqIs, size_t... OptIs>
         ASTRA_NOINLINE bool NextStorageEntity(StorageChunkWalk& w, StorageEntitySlot& s, [[maybe_unused]] Tick now,
-                                              std::index_sequence<ReqIs...>, std::index_sequence<OptIs...>)
+                                              std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq)
         {
             for (;;)
             {
@@ -2720,15 +2737,8 @@ namespace Astra
                 }
                 const size_t i = w.next++;
                 const Entity e = w.entities[i];
-                s.rp = typename ElementPtrsOf<RequiredTypes>::type{ std::get<ReqIs>(w.req).At(e, i)... };
-                if ((... || (std::get<ReqIs>(s.rp) == nullptr))) ASTRA_UNLIKELY
+                if (!FetchAndStampEntity<Stamp, Par>(e, i, w.req, w.opt, now, s.rp, s.op, reqSeq, optSeq))
                     continue;
-                s.op = typename ElementPtrsOf<OptionalTypes>::type{ std::get<OptIs>(w.opt).OptionalAt(e, i)... };
-                if constexpr (Stamp)
-                {
-                    (StampRequiredStore<std::tuple_element_t<ReqIs, RequiredTypes>, Par>(std::get<ReqIs>(w.req), e, now), ...);
-                    (StampOptionalStore<std::tuple_element_t<OptIs, OptionalTypes>, Par>(std::get<OptIs>(w.opt), std::get<OptIs>(s.op), e, i, now), ...);
-                }
                 s.e = e;
                 s.i = i;
                 return true;
