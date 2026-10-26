@@ -191,7 +191,6 @@ namespace Astra
                     walk.archetype = archetype;
                     walk.chunk = chunk;
                     walk.chunkCount = m_chunkEntityCount;
-                    walk.resume = 0;
                     if (!m_hooks->chunkMask(m_hooks->view, archetype, chunk, walk.words) || !SeekRun(0))
                     {
                         m_chunkEntityCount = 0;
@@ -247,43 +246,49 @@ namespace Astra
             }
 
             // Position on the first visible entity at or after `from` (hooks mode). Run
-            // mode: the whole run [i, end) with the chunk arrays; m_chunkEntityCount becomes
-            // the run end. Per-entity mode: one entity, with its element pointers; an entity
-            // whose element vanished mid-walk (reported by the Debug guard) is skipped. The
-            // seek resumes at HookWalk::resume there, because m_entityIndex stays 0.
+            // mode: the whole run [i, end) with the chunk arrays. Per-entity mode: one
+            // entity, with its element pointers; an entity whose element vanished mid-walk
+            // (reported by the Debug guard) is skipped. m_chunkEntityCount becomes the run end.
             ASTRA_FORCEINLINE bool SeekRun(size_t from) noexcept
             {
-                HookWalk& walk = *m_walk.p;
-                const size_t n = walk.chunkCount;
-                const size_t start = m_hooks->perEntity ? walk.resume : from;
-                for (size_t i = NextBit(start, true); i < n; i = NextBit(i + 1, true))
+                const size_t n = m_walk.p->chunkCount;
+                for (size_t i = NextBit(from, true); i < n; i = NextBit(i + 1, true))
                 {
+                    m_entityIndex = i;
                     if (!m_hooks->perEntity)
                     {
-                        m_entityIndex = i;
                         m_chunkEntityCount = NextBit(i, false);
                         return true;
                     }
                     void* ptrs[sizeof...(Components) == 0 ? 1 : sizeof...(Components)] = {};
-                    if (!m_hooks->resolve(m_hooks->view, walk.archetype, walk.chunk, i, ptrs))
+                    if (!m_hooks->resolve(m_hooks->view, m_walk.p->archetype, m_walk.p->chunk, i, ptrs))
                         continue;
-                    SetEntityPointers(ptrs, std::index_sequence_for<Components...>{});
-                    m_entities = walk.chunk->GetEntities().data() + i;
-                    m_entityIndex = 0;
-                    m_chunkEntityCount = 1;
-                    walk.resume = i + 1;
+                    SetEntityPointers(ptrs, i, std::index_sequence_for<Components...>{});
+                    m_chunkEntityCount = i + 1;
                     return true;
                 }
                 return false;
             }
 
-            // Per-entity mode (final review M8): each component "array" IS the element
-            // pointer and m_entities points at the entity's own slot, with m_entityIndex 0, so
-            // a dereference reads exactly the element; no pointer outside any object is formed.
+            // Per-entity mode: an element pointer is not a column base, but a dereference is
+            // array[m_entityIndex], so each array is re-based by the index (the element is
+            // read at exactly ptr, and the shifted pointer is never touched otherwise). The
+            // rebased value is formed through uintptr_t and points into no object, so the
+            // indexing relies on MSVC's flat pointer model (formally it is outside any object).
+            // Kept deliberately (final review M8): storing the element pointer instead
+            // (m_entities at the entity's slot, index 0) made MSVC spill a column base of the
+            // PURE-TABLE range-for loop, one extra stack load per entity in
+            // RangeForTwoComponents and RangeForTwoComponentsHalf (final-fix-report.md, disassembly).
             template<size_t... Is>
-            void SetEntityPointers([[maybe_unused]] void** ptrs, std::index_sequence<Is...>) noexcept
+            void SetEntityPointers([[maybe_unused]] void** ptrs, [[maybe_unused]] size_t index, std::index_sequence<Is...>) noexcept
             {
-                ((std::get<Is>(m_componentArrays) = static_cast<std::remove_const_t<Components>*>(ptrs[Is])), ...);
+                ((std::get<Is>(m_componentArrays) = RebasedArray<std::remove_const_t<Components>>(ptrs[Is], index)), ...);
+            }
+
+            template<typename T>
+            static T* RebasedArray(void* element, size_t index) noexcept
+            {
+                return reinterpret_cast<T*>(reinterpret_cast<std::uintptr_t>(element) - index * sizeof(T));
             }
 
             // Empty components have no storage (array pointer is nullptr);
@@ -341,7 +346,6 @@ namespace Astra
                 ArchetypeChunk* chunk = nullptr;
                 std::vector<uint64_t> words;   // the current chunk's match mask
                 size_t chunkCount = 0;         // the chunk's real entity count (m_chunkEntityCount is the run end)
-                size_t resume = 0;             // per-entity mode: the chunk index the next seek starts at
             };
             struct WalkPtr
             {
