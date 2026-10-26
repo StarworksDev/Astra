@@ -22,6 +22,10 @@ namespace StorageTraitTestDetail
     struct Plain        { int v; };
     struct SpecSparse   { int v; };
     struct SparseTag    { static constexpr auto AstraStorage = Astra::Storage::Sparse; };
+    // Wrongly typed declarations (final review M1). Reading their trait is a compile error,
+    // so they are probed through the static_assert's own predicates only.
+    struct WrongKind    { static constexpr auto AstraStorage = Astra::StorageKind::Sparse; int v; };
+    struct WrongInt     { static constexpr int AstraStorage = 1; int v; };
 }
 template<> struct Astra::StorageTraits<StorageTraitTestDetail::SpecSparse>
 {
@@ -53,6 +57,24 @@ TEST(StorageTrait, DetectionCoversBothSpellingsDefaultsAndConst)
     static_assert(StorageOfV<Astra::Test::PosS> == Storage::Sparse);
     static_assert(StorageOfV<Astra::Test::Position> == Storage::Table);
     static_assert(StorageKind::Table != StorageKind::Sparse && StorageKind::Sparse != StorageKind::Universal);
+    SUCCEED();
+}
+
+// Final review M1: a declaration that names AstraStorage with the wrong type is refused at
+// compile time instead of silently staying Table. StorageTraits static_asserts
+// !NamesAstraStorage<T> whenever DeclaresAstraStorage<T> is false, so these predicates are
+// exactly what fires: `Astra::StorageOfV<WrongKind>` (or WrongInt) does not compile (MSVC
+// C2338 "AstraStorage must be an Astra::Storage ...", checked by a probe TU recorded in the
+// final fix report).
+TEST(StorageTrait, AWronglyTypedDeclarationIsRefusedNotSilentlyTable)
+{
+    using namespace Astra::Detail;
+    using namespace StorageTraitTestDetail;
+    static_assert(NamesAstraStorage<WrongKind> && !DeclaresAstraStorage<WrongKind>);   // a StorageKind, not a Storage
+    static_assert(NamesAstraStorage<WrongInt> && !DeclaresAstraStorage<WrongInt>);     // an int does not convert to the scoped enum
+    static_assert(NamesAstraStorage<MemberSparse> && DeclaresAstraStorage<MemberSparse>);
+    static_assert(NamesAstraStorage<MemberTable> && DeclaresAstraStorage<MemberTable>);
+    static_assert(!NamesAstraStorage<Plain> && !NamesAstraStorage<int>);               // no member: the Table default, no error
     SUCCEED();
 }
 

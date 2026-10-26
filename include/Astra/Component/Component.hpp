@@ -150,15 +150,32 @@ namespace Astra
      */
     enum class Storage : uint8_t { Table, Sparse };
 
+    namespace Detail
+    {
+        // A type naming an AstraStorage member at all, and one whose member is a valid
+        // Astra::Storage. StorageTraits refuses the first without the second, so a wrongly
+        // typed declaration (an int, an Astra::StorageKind) can never silently stay Table
+        // (final review M1).
+        template<typename T>
+        concept NamesAstraStorage = requires { T::AstraStorage; };
+        template<typename T>
+        concept DeclaresAstraStorage = requires { { T::AstraStorage } -> std::convertible_to<Storage>; };
+    }
+
     template<typename T>
     struct StorageTraits
     {
         static constexpr Storage value = []() constexpr
         {
-            if constexpr (requires { { T::AstraStorage } -> std::convertible_to<Storage>; })
+            if constexpr (Detail::DeclaresAstraStorage<T>)
                 return static_cast<Storage>(T::AstraStorage);
             else
+            {
+                static_assert(!Detail::NamesAstraStorage<T>,
+                    "AstraStorage must be an Astra::Storage: `static constexpr auto AstraStorage = Astra::Storage::Sparse;`. "
+                    "(Universal is not a type trait: a Registry declares it with Registry::Config::AddUniversal.)");
                 return Storage::Table;
+            }
         }();
     };
 
