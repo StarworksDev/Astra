@@ -2202,3 +2202,41 @@ ns/op is defined per op:
 - **Iteration and lookup (Table stays ahead).** Dense iteration is a Table strength: `FilteredIter` at 99 % is 47.7 us (Table) vs 259 us (Sparse) at `0b5bd45` (fix-round-4 A/B above, median of 8 rounds; the 3-rep storage run at `94f4346` read 50.0 vs 405 us, before the inline Sparse visit), `SoleIter` at 99 % is 35.3 us vs 793 us (storage run; that hot loop is codegen-identical at `0b5bd45`). At 1 % the Table variants are still far ahead (0.41 us vs 7.6 us at `0b5bd45`) because they skip the non-holder archetype wholesale. Random `GetComponent` at 100K is 1.26 ms (Table) vs 2.74 ms (Sparse) vs 2.50 ms (Universal); at 1M, 67.5 / 109.5 / 103.8 ns per lookup.
 - **Universal.** A 48 B string-bearing Identity as Universal makes structural churn 18.2 % (10K) and 18.4 % (100K) faster than keeping it in the archetype (0.656 vs 0.801 ms; 6.68 vs 8.19 ms), and 24 % faster per entity in the hand-rolled harness (36.2 vs 47.7 ns).
 - **Table-only users.** Not shown to be regression-free: S4 part 1 is PENDING. In the interleaved 9-rep re-measure on a shared desk, the by-id and command-buffer paths read 4-9 % slower, `RangeForFiveComponents` 1-5 %, `CreateEntities` up to +7.7 % at 1M, `RemoveComponents/1000000` +3.5 %, `RangeForTwoComponentsHalf/1000000` +3.6 % and `SystemScheduler_Sequential/10000` +4.2 % against 975cdb7, with a stable sign (the full 20-row re-measured open list is in "What the numbers say"); `IterateTwoComponentsHalf` is resolved except a +2.7 % NOISY reading at 100K vs c2dcf2f. Iteration is NOT shown to be within noise: two `ParallelIterate*` rows are 3-round FAILs, and 23 flagged rows (most of them `ParallelIterate*`, `Iterate*`, `RangeFor*`) were never re-measured and are unjudged (listed above). Re-judge all of them in a clean-room window (`bench-clean.ps1`).
+
+### Final-review fix wave (2026-10-25, `a5e6b0f` -> `2a353d6`)
+
+The wave changed the Table create path (`CreateEntity<>()` runs the suspended-universal refill once; packs test "any universal?" by the declaration mask) and the range-for iterator (`noexcept` restored; the per-entity element-pointer change was tried and backed out, see below). One interleaved A/B of the touched rows, `BM_CreateEntities*` and `BM_RangeFor*` (21 rows), 8 rounds x 1 repetition, order rotated per round, `2a353d6` vs `a5e6b0f`, both built with the identical Release configuration (the base from a `git worktree` of `a5e6b0f`). No timed Universal-registry create benchmark exists (`IdentityChurn` creates outside the timed loop), so none was run; the I1 path is pinned by `StorageCreation.AUniversalInThePackStillPlacesTheTableMembersInOnePlacement`.
+
+**Load (sampled DURING every leg):** no `cl`/`link` in any leg; foreign CPU (total minus the benchmark's own share) mean 19-25 %, max 26-38 % per leg (the desk's background: other sessions, no build, no game). This is not a quiet window, and nothing was pinned on this hybrid (P/E-core) CPU.
+
+| row | a5e6b0f ns | 2a353d6 ns | base spread % | delta % |
+|---|---:|---:|---:|---:|
+| CreateEntities/10000 | 986,884 | 946,655 | 15.0 | -4.1 |
+| CreateEntities/100000 | 5,683,363 | 5,673,099 | 17.3 | -0.2 |
+| CreateEntities/1000000 | 55,366,991 | 57,003,820 | 9.8 | +3.0 |
+| CreateEntitiesBatch/10000 | 931,498 | 915,872 | 36.2 | -1.7 |
+| CreateEntitiesBatch/100000 | 5,112,077 | 5,125,561 | 19.1 | +0.3 |
+| CreateEntitiesBatch/1000000 | 57,761,173 | 55,790,620 | 17.2 | -3.4 |
+| RangeForFiveComponents/10000 | 96,316 | 111,036 | 5.4 | +15.3 |
+| RangeForFiveComponents/100000 | 985,874 | 1,133,872 | 3.4 | +15.0 |
+| RangeForFiveComponents/1000000 | 9,845,051 | 11,442,177 | 4.3 | +16.2 |
+| RangeForSingleComponent/10000 | 9,933 | 10,024 | 2.3 | +0.9 |
+| RangeForSingleComponent/100000 | 105,745 | 106,241 | 2.8 | +0.5 |
+| RangeForSingleComponent/1000000 | 1,311,118 | 1,357,579 | 20.2 | +3.5 |
+| RangeForThreeComponents/10000 | 44,545 | 38,431 | 4.7 | -13.7 |
+| RangeForThreeComponents/100000 | 469,140 | 401,018 | 3.7 | -14.5 |
+| RangeForThreeComponents/1000000 | 4,805,586 | 4,375,210 | 5.3 | -9.0 |
+| RangeForTwoComponents/10000 | 21,556 | 20,388 | 40.6 | -5.4 |
+| RangeForTwoComponents/100000 | 287,730 | 233,467 | 1.4 | -18.9 |
+| RangeForTwoComponents/1000000 | 3,475,947 | 3,192,331 | 13.7 | -8.2 |
+| RangeForTwoComponentsHalf/10000 | 11,849 | 11,839 | 2.7 | -0.1 |
+| RangeForTwoComponentsHalf/100000 | 123,446 | 120,691 | 4.2 | -2.2 |
+| RangeForTwoComponentsHalf/1000000 | 1,508,634 | 1,559,986 | 17.8 | +3.4 |
+
+**What it says, and what it does not.**
+- **Code, not timing, is the evidence here.** The innermost loop of every `BM_RangeFor*` benchmark in the `2a353d6` binary is instruction-identical to `a5e6b0f` (dumpbin of both Release exes; the loop compare is in the wave's evidence folder). The `RangeForFive` +15 % and the `RangeForThree`/`RangeForTwo` -9..-19 % therefore come from where the identical loops landed, not from what they execute: the Five loop now starts at 48 mod 64 and spans three 64 B lines (two at the base), and the absolute base numbers moved by up to 35 % between this run and an earlier one 20 minutes before (the first A/B of the wave, `4ed6a41`, read RangeForFive +1.9..2.3 % at a base spread of 38-51 %). Opposite-signed double-digit deltas across families with one shared loop shape are layout and scheduling, not a code-path cost. They are recorded, not judged.
+- **The backed-out change.** At `8cae21d` the per-entity range-for walk stored each element pointer and re-pointed `m_entities` (final review M8). The disassembly showed MSVC then spilled a column base of the PURE-TABLE loop: `RangeForTwoComponents` 12 -> 13 instructions with one stack load per entity (`mov rbx,[rbp+30h]`), `RangeForTwoComponentsHalf` 13 -> 14; an index-shift variant was worse (two loads). `2a353d6` keeps only the `noexcept` part and restores the rebased per-entity pointers, which brings every RangeFor loop back to the base instructions.
+- **Create.** `CreateEntities` now calls `CreateEntityInternal` directly (one suspended-universal check instead of two); `CreateEntitiesBatch` is instruction-identical to the base. The create deltas (-4.1..+3.0 %) are inside base spreads of 10-36 %.
+- **S4 part 1 stays PENDING.** This window cannot re-judge it (foreign CPU ~20 % in every leg, base spreads above 5 % on half the rows, layout swings of +-15 %). The open rows listed in the Verdict above are unchanged; they still need the clean-room window.
+
+**Follow-ups recorded by the final review, not built:** (a) an informational benchmark "Table-only workload in a registry that declares one Universal" (G4 and S4 measure only Universal-free registries, while every Arcane scene registry declares `Identity`); (b) if a clean-room re-judge still shows `RangeFor*` positive, a separate iterator type for hooked views, so the pure-Table range-for iterator drops `m_hooks`, `WalkPtr` and its non-trivial destructor (and the rebased per-entity pointers with it).
