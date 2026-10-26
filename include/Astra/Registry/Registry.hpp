@@ -3163,8 +3163,8 @@ namespace Astra
             // Storage policies (spec 2026-10-01 s4): rebuilt fresh beside the archetype manager,
             // from the CALLER's Config, so the loaded registry's universal set is the loading
             // build's (storage-agnostic load, s8.3), never the archive's. Must stay BEFORE
-            // m_archetypeManager->Deserialize. (Redundant with the ctor's store today; load-bearing
-            // from Task 9, when the tick source points into the rebuilt ArchetypeManager.)
+            // m_archetypeManager->Deserialize. Load-bearing: the stores' tick source must point
+            // into the rebuilt ArchetypeManager, not the constructor's one.
             registry->m_componentStorage = std::make_shared<ComponentStorage>(componentRegistry, config.universal);
             // The stores stamp from the archetype manager's counter. Both were just
             // rebuilt, so re-point them; a stale pointer would be a use-after-free.

@@ -215,8 +215,8 @@ TYPED_TEST(StorageParityQuery, ParallelForEachOnARealSchedulerVisitsEveryHolderO
 // today, so they are deliberately asserted for no kind.
 TYPED_TEST(StorageParityQuery, StructuralChangeDuringForEachTripsTheGuard)
 {
-#ifdef NDEBUG
-    GTEST_SKIP() << "the structural-mutation guard is a Debug-only ASTRA_ASSERT";
+#ifndef ASTRA_BUILD_DEBUG
+    GTEST_SKIP() << "the structural-mutation guard is compiled only under ASTRA_BUILD_DEBUG (View ForEach)";
 #else
     using V = TypeParam;
     using C = typename V::Comp;

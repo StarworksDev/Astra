@@ -254,11 +254,13 @@ namespace Astra
         };
 
     public:
-        // Sequential-walk cursor (View's storage path): remembers the last page index so a
-        // run of entities in one ASTRA_UNIVERSAL_PAGE_SLOTS page skips the index recompute.
-        // The page POINTER is re-read from the owning table on every call, so a callback that
-        // destroys entities (freeing an emptied page) or recycles ids onto a fresh page
-        // mid-walk is safe: the cursor never holds a pointer across a user callback.
+        // Sequential-walk cursor (View's storage path): GetCached records the page index of
+        // the last lookup in it. The index is recomputed on every call (a divide by the
+        // power-of-two ASTRA_UNIVERSAL_PAGE_SLOTS), so the cursor saves nothing today; it is
+        // kept as the walk's per-store state. The page POINTER is re-read from the owning
+        // table on every call, so a callback that destroys entities (freeing an emptied page)
+        // or recycles ids onto a fresh page mid-walk is safe: the cursor never holds a
+        // pointer across a user callback.
         struct Cursor
         {
             std::size_t index = ~std::size_t(0);

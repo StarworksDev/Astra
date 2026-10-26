@@ -638,7 +638,10 @@ namespace Astra
             return true;
         }
         
-        // Check if archetype matches this query
+        // Check if archetype matches this query, by the archetype MASK alone. Table-only:
+        // a Sparse or Universal member is in no archetype mask (spec 2026-10-01 s3.1), so a
+        // query naming one would reject every archetype here. Views match through
+        // View::MatchesArchetype, which takes those members out of the masks (s6.1).
         static bool Matches(const ComponentMask& archetypeMask)
         {
             // Must have all required AND all With AND all Changed/Added components

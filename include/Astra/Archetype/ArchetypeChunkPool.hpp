@@ -571,7 +571,7 @@ namespace Astra
             {
                 return static_cast<T*>(GetComponentPointer(TypeID<T>::Value(), index));
             }
-}
+        }
         
         template<Component T>
         ASTRA_FORCEINLINE auto GetComponentArray()

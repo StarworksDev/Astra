@@ -1657,7 +1657,6 @@ namespace Astra
         }
 
         // ================= Storage path (spec 2026-10-01 s6.3, s6.4) =================
-        // ================= Storage path (spec 2026-10-01 s6.3, s6.4) =================
         // Taken by every view naming a Sparse type, and by any view whose registry
         // declares one of its types Universal (UsesStoragePath). A pure-Table view in a
         // Universal-free registry instantiates it (the dispatcher names it) but never
@@ -1708,9 +1707,11 @@ namespace Astra
 
         // ---- Per-chunk word sets, fed to Detail::MatchingRunCursor (the storage walk) and, via
         // ForEachMatchingRun, the pure-Table enableable Tier-3 walk ----
-        // Holds word POINTERS only, copied before any callback runs. No SparseBlock* is
-        // kept across a callback: a SetEnabled or sparse add made inside one may insert a
-        // block into the chunk's block list (Task 15's lifetime rule).
+        // Holds word POINTERS into the chunk's blocks, copied before any callback runs, plus
+        // the filter's OWN scratch words (Any/OneOf group words, the per-entity change tier),
+        // which the pointers may name. No SparseBlock* is kept across a callback: a SetEnabled
+        // or sparse add made inside one may insert a block into the chunk's block list (Task
+        // 15's lifetime rule).
         static constexpr size_t NGroups     = std::tuple_size_v<AnyGroupTypes> + std::tuple_size_v<OneOfGroupTypes>;
         // Sum of the Any/OneOf group arities: a OneOf group whose archetype already holds one
         // member appends one exclude word set per Sparse member, so several groups sharing
