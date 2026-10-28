@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# Generate Linux gmake2 makefiles. Scaffold for the cross-platform burn-down
-# (g++/clang green + Linux CI), which is a follow-up. Requires a Linux premake5
-# on PATH (the vendored premake5.exe is Windows-only).
+# Generate the gmake makefiles only (scripts/build.sh generates AND builds).
+# Uses the pinned premake from scripts/fetch-premake.sh.
 set -euo pipefail
-premake5 gmake2
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$root"
+"$("$root/scripts/fetch-premake.sh")" gmake "$@"

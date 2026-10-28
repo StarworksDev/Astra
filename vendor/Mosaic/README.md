@@ -25,6 +25,9 @@ dependency arrow runs one way.
   (SwissTable / bloom acceleration).
 - **`Mosaic/Bits`**, **`Mosaic/FunctionRef`** -- generic bit intrinsics and a
   non-owning zero-alloc callable.
+- **`Mosaic/Result`**, **`Mosaic/AlignedStorage`** -- a value-or-error tagged union
+  (`Result<T, E>`, `Result<void, E>`) for exception-free error handling, and the
+  aligned two-type storage under it.
 
 Everything lives under `namespace Mosaic`; headers are included as
 `#include <Mosaic/Jobs/WorkScheduler.hpp>`.

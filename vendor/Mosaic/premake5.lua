@@ -4,6 +4,16 @@
 -- generates this). Static-CRT throughout -- there is no DLL boundary here; each
 -- consumer (Astra / Manifold2D / Arcane) builds Mosaic via its own project.
 
+newoption {
+    trigger = "sanitize",
+    value = "MODE",
+    description = "Build with a sanitizer (Linux/clang; used by the CI sanitizer lanes)",
+    allowed = {
+        { "address", "AddressSanitizer + UndefinedBehaviorSanitizer" },
+        { "thread",  "ThreadSanitizer" },
+    }
+}
+
 workspace "Mosaic"
     architecture "x64"
     configurations { "Debug", "Release", "Dist" }
@@ -17,14 +27,34 @@ workspace "Mosaic"
     IncludeDir["Catch2"] = "vendor/Catch2/src"
 
     -- The vendored Catch2 wrapper honors these globals (static CRT default).
-    THIRDPARTY_STATICRUNTIME    = "on"
+    -- A sanitizer build links the dynamic runtime everywhere (static
+    -- libstdc++ conflicts with the sanitizer runtimes' link ordering).
+    THIRDPARTY_STATICRUNTIME    = _OPTIONS["sanitize"] and "off" or "on"
     THIRDPARTY_PROJECT_LOCATION = "ide"
 
     filter "system:windows"
         systemversion "latest"
-    filter "system:linux"                    -- Part B scaffold (exercised later)
+    filter "system:linux"
         buildoptions { "-mavx2", "-ffp-contract=off", "-fno-fast-math", "-Wall", "-Wextra" }
         links { "pthread" }
+    -- Apple Silicon (arm64): the portable/NEON paths, no x86 flags; the same
+    -- determinism flags (Apple clang defaults to -ffp-contract=on). As
+    -- Manifold2D's premake5.lua.
+    filter "system:macosx"
+        architecture "ARM64"
+        buildoptions { "-ffp-contract=off", "-fno-fast-math", "-Wall", "-Wextra" }
+
+    -- Sanitizer lanes (opt-in via --sanitize; Linux/clang). Option-gated, so a
+    -- generation without --sanitize is byte-identical. Compile AND link need
+    -- the flags; the static runtime is off for the reason above.
+    filter { "options:sanitize=address" }
+        staticruntime "off"
+        buildoptions { "-fsanitize=address,undefined", "-fno-omit-frame-pointer", "-fno-sanitize-recover=all" }
+        linkoptions  { "-fsanitize=address,undefined" }
+    filter { "options:sanitize=thread" }
+        staticruntime "off"
+        buildoptions { "-fsanitize=thread" }
+        linkoptions  { "-fsanitize=thread" }
     filter {}
 
     group "Dependencies"
@@ -36,7 +66,7 @@ workspace "Mosaic"
         language "C++"
         cppdialect "C++23"
         location "ide"
-        staticruntime "on"
+        staticruntime(_OPTIONS["sanitize"] and "off" or "on")
         floatingpoint "Strict"               -- determinism (Simd/Wide) -- /fp:fast banned
         targetdir ("bin/" .. outputdir .. "/%{prj.name}")
         objdir    ("bin-int/" .. outputdir .. "/%{prj.name}")
@@ -60,7 +90,7 @@ workspace "Mosaic"
         language "C++"
         cppdialect "C++23"
         location "ide"
-        staticruntime "on"
+        staticruntime(_OPTIONS["sanitize"] and "off" or "on")
         floatingpoint "Strict"
         targetdir ("bin/" .. outputdir .. "/%{prj.name}")
         objdir    ("bin-int/" .. outputdir .. "/%{prj.name}")
