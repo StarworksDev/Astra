@@ -5,6 +5,7 @@ A high-performance, archetype-based Entity Component System (ECS) library for mo
 ## Features
 
 - **Archetype-based storage** - Entities with identical component sets grouped in contiguous 16KB chunks
+- **Storage policies** - Per-component Table / Sparse / Universal layouts behind one API: Sparse components never fragment archetypes, Universal ones never move
 - **SIMD acceleration** - Hardware-optimized operations (SSE2/SSE4.2/AVX2/NEON)
 - **Relationship graphs** - Hierarchical parent-child and bidirectional entity links
 - **Advanced queries** - Compile-time optimized queries with Optional, Not, Any, OneOf modifiers
@@ -100,6 +101,55 @@ This design ensures:
 - **SIMD-friendly** - Component arrays are naturally vectorizable
 - **Memory efficiency** - Minimal fragmentation with chunk allocation
 - **Fast iteration** - Linear memory access pattern
+
+### Storage Policies
+
+Every component uses one of three layouts. The public API is identical for all three -- `Add`/`Emplace`/`Remove`/`Get`/`Has`, `SetEnabled`, change detection, views and every query modifier, Relations filters, `CommandBuffer`, Save/Load -- and only performance differs. The single exception: a Universal component cannot be removed.
+
+| Layout | Declared by | Data lives in | Fragments archetypes? | Good for |
+|---|---|---|---|---|
+| **Table** (default) | nothing | archetype chunk columns | yes | hot components iterated together |
+| **Sparse** | the type: `static constexpr auto AstraStorage = Astra::Storage::Sparse;` | a per-registry sparse set; presence is mirrored into per-chunk bitsets | no | components that are toggled often, or held by few entities |
+| **Universal** | the registry: `config.AddUniversal<T>(init, user)` | a paged column indexed by entity slot | no | components every entity has but hot loops rarely read (names, GUIDs) |
+
+```cpp
+struct Burning { float dps = 0.0f; static constexpr auto AstraStorage = Astra::Storage::Sparse; };
+struct Identity
+{
+    std::uint64_t guid = 0;
+    std::string name;
+
+    template<class A> void Serialize(A& ar) { ar(guid)(name); }   // required for a non-trivially-copyable type
+};
+
+// Runs for every new entity that was NOT given an explicit Identity value.
+void MintGuid(Astra::Entity e, void* component, void* /*user*/)
+{
+    static_cast<Identity*>(component)->guid = 0x9E3779B97F4A7C15ull ^ e.GetValue();
+}
+
+Astra::Registry::Config config;
+config.AddUniversal<Identity>(&MintGuid);
+Astra::Registry registry(config);
+
+Astra::Entity e = registry.CreateEntity<Position>();   // Identity constructed, MintGuid ran
+registry.AddComponent(e, Burning{5.0f});               // no archetype move
+registry.CreateView<Position, Burning>().ForEach(      // Burning filters a 64-entity word at a time
+    [](Astra::Entity, Position& p, Burning& b) { /* ... */ });
+registry.RemoveComponent<Identity>(e);                 // refused: ASTRA_ASSERT in Debug, false in Release
+```
+
+Rules:
+- **Universality is per registry.** A registry that does not declare `T` universal uses `T`'s trait. Registries that share one `ComponentRegistry` do not affect each other.
+- **Keep Universal types engine-resident.** If the module that registered a Universal type unloads, the registry drops its column and "always present" is suspended for that type: no entity holds it until the type is registered again, and the next create then rebuilds the column for every live entity (default + `init`). Declare universals for types your engine or host owns, not for types a plugin can unload.
+- **Sparse slots.** A registry holds at most `ASTRA_MAX_SPARSE_COMPONENTS` (default 32) Sparse components. Past the cap, Debug asserts. In Release an add (`AddComponent`, `EmplaceComponent`, `AddComponentByID`) is refused and returns `false`, but a create (`CreateEntity<...>`, `CreateEntityWith`, `CreateEntities*`) has no way to report it: the entity is created and the Sparse member past the cap is dropped.
+- **The Debug iteration guard sees every Sparse membership change.** Inside a `ForEach`, adding or removing ANY Sparse component (even one the view does not name), or destroying an entity that holds one, trips the structural-mutation assert after the walk, exactly like a Table change that creates a new archetype. A Table add that moves a bystander into an archetype that already exists does not trip it. Defer such changes into a `CommandBuffer`.
+- **Tags.** Every tag may be enableable. Enableable Table tags use a bit-only column (a non-enableable tag still has no column); Sparse tags keep the bit in the store.
+- **Adding a present component** is a no-op, for every layout, and no signal fires. The typed `AddComponent`/`EmplaceComponent` return `true`; the by-id form (`AddComponentByID`) returns `false`. A Universal component is always present, so adding one is always this no-op.
+- **Archives load whatever the storage was when they were written** (format v6). Values move into the layout the loading registry assigns. A Universal component missing from an archive is default-constructed and then `init`-ed. v5 archives load as all-Table.
+- **Pointer validity** is unchanged: a component pointer is valid until the next structural change.
+- **Choose with data.** `Debug::Inspector` reports each component's layout, population, pages and per-chunk presence blocks. Attach a `Debug::ChurnTracker` to get a "looks sparse-shaped" advisory for Table components that are toggled or rare-and-fragmenting. Nothing is promoted automatically.
+- **Performance** numbers are in `bench-compare/RESULTS.md` ("Storage policies").
 
 ### Query System
 

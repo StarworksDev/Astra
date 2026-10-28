@@ -2,12 +2,16 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <span>
+#include <string>
 #include <tuple>
+#include <type_traits>
 #include <vector>
 
 #include "../Archetype/Archetype.hpp"
@@ -27,13 +31,19 @@
 #include "../Serialization/BinaryReader.hpp"
 #include "../Serialization/BinaryWriter.hpp"
 #include "../Serialization/SerializationError.hpp"
+#include "ComponentStorage.hpp"
+#include "ComponentStorageSerialization.hpp"
 #include "Query.hpp"
 #include "Relations.hpp"
 #include "RelationshipGraph.hpp"
+#include "StorageAccess.hpp"
+#include "StorageSplit.hpp"
 #include "View.hpp"
 
 namespace Astra
 {
+    class CommandBuffer;   // friend: its create executors use the private creation funnel
+
     class Registry
     {
     public:
@@ -47,40 +57,91 @@ namespace Astra
             // Hosts inject one shared instance (e.g. an enkiTS adapter) -- and in
             // multi-module (DLL) setups, the SAME instance into every module.
             std::shared_ptr<IWorkScheduler> workScheduler;
+
+            // Universal components (spec 2026-10-01 s3.2, D1): every entity of a registry built
+            // from this Config holds them, in a slot-indexed column rather than an archetype
+            // column. Retained in m_config, so it survives Clear(); Load builds the new registry
+            // with the caller's Config, so Load honours it too. No NSDMI here on purpose: the
+            // `const Config& = {}` default arguments below need Config free of NSDMIs on gcc/clang.
+            using UniversalInitFn = Astra::UniversalInitFn;
+            using UniversalSpec = Astra::UniversalSpec;
+            std::vector<UniversalSpec> universal;
+
+            // Declares T universal. `init` (optional) runs, with `user`, for each new entity that
+            // was NOT given a T value (spec s4.2). Re-declaring T replaces init/user (last wins).
+            // Registers nothing itself: the Registry registers T in ITS ComponentRegistry when
+            // it is constructed (UniversalSpec::registerComponent).
+            template<Component T>
+            Config& AddUniversal(UniversalInitFn init = nullptr, void* user = nullptr)
+            {
+                const ComponentID id = TypeID<T>::Value();
+                if (!ASTRA_ENSURE(id < MAX_COMPONENTS, "AddUniversal: the type has no valid ComponentID")) ASTRA_UNLIKELY
+                    return *this;
+                for (UniversalSpec& spec : universal)
+                {
+                    if (spec.id == id)
+                    {
+                        spec.init = init;
+                        spec.user = user;
+                        return *this;
+                    }
+                }
+                universal.push_back(UniversalSpec{id, init, user,
+                    +[](ComponentRegistry& registry) { registry.RegisterComponent<T>(); }});
+                return *this;
+            }
         };
         
         explicit Registry(const Config& config = {}) :
             m_entityManager(config.entityManagerConfig),
             m_componentRegistry(std::make_shared<ComponentRegistry>()),
             m_archetypeManager(std::make_shared<ArchetypeManager>(m_componentRegistry, config.chunkPoolConfig, &m_entityManager.GetRecordTable())),
+            m_componentStorage(std::make_shared<ComponentStorage>(m_componentRegistry, config.universal)),
             m_relationshipGraph(std::make_shared<RelationshipGraph>()),
             m_resourceStorage(m_componentRegistry, config.resourceStorageConfig),
             m_workScheduler(config.workScheduler),
             m_config(config),
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
-        {}
+        {
+            m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+            m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            m_hasUniversals = m_componentStorage->HasUniversals();
+            InstallStoreReleaseHook();
+        }
 
         Registry(const EntityManager::Config& entityConfig, const ArchetypeChunkPool::Config& chunkConfig) :
             m_entityManager(entityConfig),
             m_componentRegistry(std::make_shared<ComponentRegistry>()),
             m_archetypeManager(std::make_shared<ArchetypeManager>(m_componentRegistry, chunkConfig, &m_entityManager.GetRecordTable())),
+            m_componentStorage(std::make_shared<ComponentStorage>(m_componentRegistry, std::vector<UniversalSpec>{})),
             m_relationshipGraph(std::make_shared<RelationshipGraph>()),
             m_resourceStorage(m_componentRegistry),
             m_workScheduler(nullptr),
             m_config{entityConfig, chunkConfig, {}, nullptr},
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
-        {}
+        {
+            m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+            m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            m_hasUniversals = m_componentStorage->HasUniversals();
+            InstallStoreReleaseHook();
+        }
 
         Registry(std::shared_ptr<ComponentRegistry> componentRegistry, const Config& config = {}) :
             m_entityManager(config.entityManagerConfig),
             m_componentRegistry(std::move(componentRegistry)),
             m_archetypeManager(std::make_shared<ArchetypeManager>(m_componentRegistry, config.chunkPoolConfig, &m_entityManager.GetRecordTable())),
+            m_componentStorage(std::make_shared<ComponentStorage>(m_componentRegistry, config.universal)),
             m_relationshipGraph(std::make_shared<RelationshipGraph>()),
             m_resourceStorage(m_componentRegistry, config.resourceStorageConfig),
             m_workScheduler(config.workScheduler),
             m_config(config),
             m_instanceId(s_nextInstanceId.fetch_add(1, std::memory_order_relaxed))
-        {}
+        {
+            m_componentStorage->SetTickSource(m_archetypeManager->TickSource());
+            m_archetypeManager->SetComponentStorage(m_componentStorage.get());
+            m_hasUniversals = m_componentStorage->HasUniversals();
+            InstallStoreReleaseHook();
+        }
 
         // A Registry is a heavy, stateful container: copying is not supported (the old
         // (const Registry&, Config) ctor looked like a copy but silently produced an empty
@@ -89,59 +150,60 @@ namespace Astra
         Registry(const Registry&) = delete;
         Registry& operator=(const Registry&) = delete;
 
-        ~Registry() = default;
+        ~Registry()
+        {
+            // Unsubscribe before any member (the stores included) is destroyed.
+            if (m_componentRegistry && m_storeReleaseHook != 0)
+                m_componentRegistry->RemoveStoreReleaseHook(m_storeReleaseHook);
+        }
         
         template<Component... Components>
         Entity CreateEntity()
         {
-            Entity entity = m_entityManager.Create();
-            if (!entity.IsValid()) ASTRA_UNLIKELY
-                return Entity::Invalid();
-            
-            // Use AddEntity for default-constructed components
-            m_archetypeManager->AddEntity<Components...>(entity);
-            
-            m_signalManager.Emit<Events::EntityCreated>(entity);
-            
-            if constexpr (sizeof...(Components) > 0)
+            if constexpr (sizeof...(Components) == 0)
             {
-                if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
-                {
-                    // Get the entity location to retrieve components for signals
-                    auto* record = m_archetypeManager->GetEntityRecord(entity);
-                    if (record)
-                    {
-                        ((m_signalManager.Emit<Events::ComponentAdded>(entity, TypeID<Components>::Value(), record->archetype->GetComponent<Components>(record->location))), ...);
-                    }
-                }
+                // The funnel runs the suspended-universal refill itself (once; final review M2).
+                return CreateEntityInternal(m_entityManager.Create());
             }
-            
-            return entity;
+            else
+            {
+                RefillSuspendedUniversals();
+                Entity entity = m_entityManager.Create();
+                if (!entity.IsValid()) ASTRA_UNLIKELY
+                    return Entity::Invalid();
+
+                // Spec s7.1: Table members choose the archetype, Sparse members go to their
+                // sets, and a NAMED Universal member is left to ConstructUniversals (no
+                // value was passed, so default + init).
+                PlaceDefault<Components...>(entity);
+                ConstructUniversalsFor(entity, nullptr, 0);
+                m_signalManager.Emit<Events::EntityCreated>(entity);
+                EmitPackAdded<Components...>(entity);
+                EmitUniversalAdded(entity);
+                return entity;
+            }
         }
-        
+
         template<Component... Components>
         Entity CreateEntityWith(Components&&... components)
         {
+            static_assert(sizeof...(Components) > 0, "CreateEntityWith requires at least one component");
             AssertContextAffinity();
+            RefillSuspendedUniversals();
             Entity entity = m_entityManager.Create();
             if (!entity.IsValid()) ASTRA_UNLIKELY
                 return Entity::Invalid();
-            
-            // Use AddEntityWith for components with values
-            m_archetypeManager->AddEntityWith(entity, std::forward<Components>(components)...);
-            
+
+            // Universal members the caller supplied: moved in by PlaceWith, so they skip
+            // default + init (spec s4.2: an explicitly supplied value is never overwritten).
+            ComponentID supplied[sizeof...(Components)];
+            size_t suppliedCount = 0;
+            PlaceWith(entity, supplied, suppliedCount, std::forward<Components>(components)...);
+            ConstructUniversalsFor(entity, supplied, suppliedCount);
+
             m_signalManager.Emit<Events::EntityCreated>(entity);
-            
-            if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
-            {
-                // Get the entity location to retrieve components for signals
-                auto* record = m_archetypeManager->GetEntityRecord(entity);
-                if (record)
-                {
-                    ((m_signalManager.Emit<Events::ComponentAdded>(entity, TypeID<std::decay_t<Components>>::Value(), record->archetype->GetComponent<std::decay_t<Components>>(record->location))), ...);
-                }
-            }
-            
+            EmitPackAdded<std::decay_t<Components>...>(entity);
+            EmitUniversalAdded(entity);
             return entity;
         }
 
@@ -151,6 +213,7 @@ namespace Astra
             if (count == 0 || outEntities.size() < count)
                 return 0;
 
+            RefillSuspendedUniversals();
             size_t created = m_entityManager.CreateBatch(count, outEntities.begin());
             for (size_t i = created; i < count; ++i)
             {
@@ -159,32 +222,10 @@ namespace Astra
             if (created == 0) ASTRA_UNLIKELY
                 return 0;
 
-            // Use unified batch AddEntities - handles archetype selection internally
-            m_archetypeManager->AddEntities<Components...>(outEntities.subspan(0, created));
-
-            if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
-            {
-                for (size_t i = 0; i < created; ++i)
-                {
-                    m_signalManager.Emit<Events::EntityCreated>(outEntities[i]);
-                }
-            }
-
-            if constexpr (sizeof...(Components) > 0)
-            {
-                if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
-                {
-                    for (size_t i = 0; i < created; ++i)
-                    {
-                        auto* record = m_archetypeManager->GetEntityRecord(outEntities[i]);
-                        if (record)
-                        {
-                            ((m_signalManager.Emit<Events::ComponentAdded>(outEntities[i], TypeID<Components>::Value(), record->archetype->GetComponent<Components>(record->location))), ...);
-                        }
-                    }
-                }
-            }
-
+            const std::span<Entity> made = outEntities.subspan(0, created);
+            PlaceDefaultBatch<Components...>(made);
+            ConstructUniversalsForBatch(made);
+            EmitBatchCreated<Components...>(made);
             return created;
         }
 
@@ -194,6 +235,7 @@ namespace Astra
             if (count == 0 || outEntities.size() < count)
                 return 0;
 
+            RefillSuspendedUniversals();
             size_t created = m_entityManager.CreateBatch(count, outEntities.begin());
             for (size_t i = created; i < count; ++i)
             {
@@ -202,28 +244,30 @@ namespace Astra
             if (created == 0) ASTRA_UNLIKELY
                 return 0;
 
-            m_archetypeManager->AddEntitiesWith<Components...>(outEntities.subspan(0, created), std::forward<Generator>(generator));
-
-            if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
+            const std::span<Entity> made = outEntities.subspan(0, created);
+            constexpr bool allTableTrait = ((StorageOfV<Components> == Storage::Table) && ...);
+            if (allTableTrait && !AnyUniversal<Components...>()) ASTRA_LIKELY
             {
-                for (size_t i = 0; i < created; ++i)
-                {
-                    m_signalManager.Emit<Events::EntityCreated>(outEntities[i]);
-                }
+                // Today's batched chunk-run path, unchanged (G4).
+                m_archetypeManager->AddEntitiesWith<Components...>(made, std::forward<Generator>(generator));
+                ConstructUniversalsForBatch(made);
             }
-
-            if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
+            else
             {
+                // Mixed storage: one entity at a time, calling the generator exactly once
+                // per index, in order (the Archetype::AddEntitiesWith contract).
                 for (size_t i = 0; i < created; ++i)
                 {
-                    auto* record = m_archetypeManager->GetEntityRecord(outEntities[i]);
-                    if (record)
+                    ComponentID supplied[sizeof...(Components) > 0 ? sizeof...(Components) : 1]{};
+                    size_t suppliedCount = 0;
+                    std::apply([&](auto&&... values)
                     {
-                        ((m_signalManager.Emit<Events::ComponentAdded>(outEntities[i], TypeID<Components>::Value(), record->archetype->GetComponent<Components>(record->location))), ...);
-                    }
+                        PlaceWith(made[i], supplied, suppliedCount, std::forward<decltype(values)>(values)...);
+                    }, generator(i));
+                    ConstructUniversalsFor(made[i], supplied, suppliedCount);
                 }
             }
-
+            EmitBatchCreated<Components...>(made);
             return created;
         }
 
@@ -241,6 +285,17 @@ namespace Astra
             if (m_signalManager.IsSignalEnabled(Signal::EntityDestroyed)) ASTRA_UNLIKELY
             {
                 m_signalManager.Emit<Events::EntityDestroyed>(entity);
+            }
+
+            // Spec s7.3: storage teardown after EntityDestroyed (handlers can still read
+            // every component) and before the archetype swap-remove. Per-component
+            // ComponentRemoved is NOT emitted on destroy (today's behaviour).
+            if (m_componentStorage->HasAnyStore()) ASTRA_UNLIKELY
+            {
+                ASTRA_ASSERT(rec->chunk, "DestroyEntity: located record without a chunk");
+                if (rec->chunk
+                    && m_componentStorage->OnEntityDestroyed(entity, *rec->chunk, rec->location.GetEntityIndex()))
+                    m_archetypeManager->BumpSparseStructuralCounter();   // a sparse holder's membership changed
             }
 
             m_archetypeManager->RemoveEntity(entity, rec);
@@ -295,6 +350,21 @@ namespace Astra
                 }
             }
                 
+            // Walk every doomed entity BEFORE any swap-remove; locations are stable until
+            // RemoveEntities. The counter bumps only if a doomed entity HELD a sparse member.
+            if (m_componentStorage->HasAnyStore()) ASTRA_UNLIKELY
+            {
+                bool sparseMembershipChanged = false;
+                for (Entity entity : validEntities)
+                {
+                    const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+                    if (rec && rec->chunk)
+                        sparseMembershipChanged |= m_componentStorage->OnEntityDestroyed(entity, *rec->chunk, rec->location.GetEntityIndex());
+                }
+                if (sparseMembershipChanged)
+                    m_archetypeManager->BumpSparseStructuralCounter();
+            }
+
             m_archetypeManager->RemoveEntities(validEntities);
             
             for (Entity entity : validEntities)
@@ -340,6 +410,35 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return false;
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
+                return UniversalAddAnswer(entity, TypeID<T>::Value());   // always present: today's present-component rule, no signal (s3.3, s12.2)
+
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                {
+                    const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+                    if (!rec || !rec->chunk) ASTRA_UNLIKELY
+                        return false;
+                    const ComponentID id = TypeID<T>::Value();
+                    if (const SparseSet* set = m_componentStorage->FindSparse(id); set && set->Contains(entity))
+                        return true;                       // present: no-op, no signal (Table parity, s3.3)
+                    void* element = nullptr;
+                    if constexpr (std::is_empty_v<T>)
+                    {
+                        element = SparseAttach(entity, *rec, id, nullptr);
+                    }
+                    else
+                    {
+                        T value(component);
+                        element = SparseAttach(entity, *rec, id, &value);
+                    }
+                    if (!element) ASTRA_UNLIKELY
+                        return false;                      // sparse-slot cap refused it
+                    m_signalManager.Emit<Events::ComponentAdded>(entity, id, SparseTypedPtr<T>(element));
+                    return true;
+                }
+            }
 
             T* newComponent = m_archetypeManager->AddComponent<T>(entity, component);
 
@@ -357,6 +456,35 @@ namespace Astra
             // See AddComponent (IM-24): stale/invalid handle -> graceful false, no abort.
             if (!m_entityManager.IsValid(entity))
                 return false;
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
+                return UniversalAddAnswer(entity, TypeID<T>::Value());   // always present: see AddComponent
+
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                {
+                    const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+                    if (!rec || !rec->chunk) ASTRA_UNLIKELY
+                        return false;
+                    const ComponentID id = TypeID<T>::Value();
+                    if (const SparseSet* set = m_componentStorage->FindSparse(id); set && set->Contains(entity))
+                        return true;                       // present: no-op, no signal (Table parity, s3.3)
+                    void* element = nullptr;
+                    if constexpr (std::is_empty_v<T>)
+                    {
+                        element = SparseAttach(entity, *rec, id, nullptr);
+                    }
+                    else
+                    {
+                        T value(std::forward<Args>(args)...);
+                        element = SparseAttach(entity, *rec, id, &value);
+                    }
+                    if (!element) ASTRA_UNLIKELY
+                        return false;                      // sparse-slot cap refused it
+                    m_signalManager.Emit<Events::ComponentAdded>(entity, id, SparseTypedPtr<T>(element));
+                    return true;
+                }
+            }
 
             T* component = m_archetypeManager->AddComponent<T>(entity, std::forward<Args>(args)...);
 
@@ -371,6 +499,30 @@ namespace Astra
         bool RemoveComponent(Entity entity)
         {
             AssertContextAffinity();
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
+                return UniversalRemoveAnswer(entity, TypeID<T>::Value());
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                {
+                    const ComponentID id = TypeID<T>::Value();
+                    const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+                    SparseSet* set = m_componentStorage->FindSparse(id);   // non-creating (G2)
+                    if (!rec || !rec->chunk || !set || !set->Contains(entity))
+                        return false;                      // stale handle or absent
+                    if (m_signalManager.IsSignalEnabled(Signal::ComponentRemoved)) ASTRA_UNLIKELY
+                    {
+                        // BEFORE the erase, as for Table: the pointer is valid only for
+                        // the handler's duration.
+                        m_signalManager.Emit<Events::ComponentRemoved>(entity, id, SparseTypedPtr<T>(set->Get(entity)));
+                        // A handler may have moved or destroyed the entity: re-validate.
+                        rec = m_archetypeManager->GetEntityRecord(entity);
+                        if (!rec || !rec->chunk || !set->Contains(entity))
+                            return false;
+                    }
+                    return SparseDetach(entity, *rec, id);
+                }
+            }
             if (m_signalManager.IsSignalEnabled(Signal::ComponentRemoved)) ASTRA_UNLIKELY
             {
                 // Cold arm: the signal needs the PRE-removal pointer. The validated
@@ -396,6 +548,8 @@ namespace Astra
         {
             if (entities.empty())
                 return;
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
+                return;        // present on every entity: a no-op, no signal
 
             SmallVector<Entity, 256> validEntities;
             validEntities.reserve(entities.size());
@@ -413,6 +567,16 @@ namespace Astra
             validEntities.erase(std::unique(validEntities.begin(), validEntities.end()), validEntities.end());
             if (validEntities.empty())
                 return;
+
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                {
+                    SparseBatchAdd<T>(std::span<const Entity>(validEntities.data(), validEntities.size()),
+                                      [&component] { return T(component); });
+                    return;
+                }
+            }
 
             m_archetypeManager->AddComponents<T>(validEntities, component);
             
@@ -436,6 +600,8 @@ namespace Astra
         {
             if (entities.empty())
                 return;
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
+                return;        // present on every entity: a no-op, no signal
             
             // Filter out invalid entities
             SmallVector<Entity, 256> validEntities;
@@ -455,6 +621,19 @@ namespace Astra
 
             if (validEntities.empty())
                 return;
+
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                {
+                    // One value from `args`, copied to each entity (as the Table batch does);
+                    // so, like it, this needs a copyable T.
+                    const T prototype(std::forward<Args>(args)...);
+                    SparseBatchAdd<T>(std::span<const Entity>(validEntities.data(), validEntities.size()),
+                                      [&prototype] { return T(prototype); });
+                    return;
+                }
+            }
 
             // Batch add components
             m_archetypeManager->AddComponents<T>(validEntities, std::forward<Args>(args)...);
@@ -478,7 +657,14 @@ namespace Astra
         {
             if (entities.empty())
                 return 0;
-            
+            if (IsUniversalT<T>()) ASTRA_UNLIKELY
+                return RefuseUniversalRemoveBatch(entities, TypeID<T>::Value());
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+            {
+                if (ResolveKind<T>() == StorageKind::Sparse)
+                    return SparseBatchRemove<T>(entities);
+            }
+
             // Filter out invalid entities
             SmallVector<Entity, 256> validEntities;
             validEntities.reserve(entities.size());
@@ -535,6 +721,18 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return nullptr;
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+            {
+                // A mutable fetch is a write (spec s3.3), as for a chunk column. A tag has
+                // no value to stamp.
+                T* component = StoreGet<T>(entity);
+                if constexpr (!std::is_empty_v<T>)
+                {
+                    if (component) ASTRA_LIKELY
+                        (void)MarkStoreWritten(entity, TypeID<T>::Value());
+                }
+                return component;
+            }
             return m_archetypeManager->GetComponentMut<T>(entity);
         }
 
@@ -544,6 +742,8 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return nullptr;
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreGet<T>(entity);
             return m_archetypeManager->GetComponent<T>(entity);
         }
 
@@ -553,6 +753,8 @@ namespace Astra
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity))
                 return false;
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreLookup(entity, TypeID<T>::Value()) != nullptr;
             return m_archetypeManager->HasComponent<T>(entity);
         }
 
@@ -564,7 +766,7 @@ namespace Astra
         {
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity)) return false;
-            return m_archetypeManager->MarkWritten(entity, TypeID<T>::Value());
+            return MarkWrittenRouted(entity, TypeID<T>::Value());
         }
 
         // Type-erased twin of Modified<T>: for hash/descriptor-driven writers (an
@@ -577,7 +779,7 @@ namespace Astra
         {
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity)) return false;
-            return m_archetypeManager->MarkWritten(entity, id);
+            return MarkWrittenRouted(entity, id);
         }
 
         // Per-entity change query OUTSIDE a view (spec 2026-09-11 Arcane adoption
@@ -590,12 +792,14 @@ namespace Astra
         ASTRA_NODISCARD bool IsChanged(Entity entity, Tick since) const
         {
             AssertContextAffinity();
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreTickNewer(entity, TypeID<T>::Value(), since, /*added=*/false);
             const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
             if (!rec || !rec->chunk) return false;
             const ComponentID id = TypeID<T>::Value();
             if (id >= MAX_COMPONENTS) return false;
             const int col = rec->archetype->GetColumnMeta().idToColumn[id];
-            if (col < 0) return false;
+            if (col < 0 || rec->archetype->GetColumnMeta().columns[col].stride == 0) return false;   // absent, or a tag (no value)
             if (const EntityTicks* t = rec->chunk->GetTicks(col))
                 return IsNewer(t[rec->location.GetEntityIndex()].changed, since);
             return IsNewer(rec->chunk->GetColumnVersion(col), since);
@@ -608,12 +812,14 @@ namespace Astra
         ASTRA_NODISCARD bool IsAdded(Entity entity, Tick since) const
         {
             AssertContextAffinity();
+            if (RoutesToStore<T>()) ASTRA_UNLIKELY
+                return StoreTickNewer(entity, TypeID<T>::Value(), since, /*added=*/true);
             const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
             if (!rec || !rec->chunk) return false;
             const ComponentID id = TypeID<T>::Value();
             if (id >= MAX_COMPONENTS) return false;
             const int col = rec->archetype->GetColumnMeta().idToColumn[id];
-            if (col < 0) return false;
+            if (col < 0 || rec->archetype->GetColumnMeta().columns[col].stride == 0) return false;   // absent, or a tag (no value)
             if (const EntityTicks* t = rec->chunk->GetTicks(col))
                 return IsNewer(t[rec->location.GetEntityIndex()].added, since);
             return IsNewer(rec->chunk->GetColumnVersion(col), since);
@@ -628,11 +834,12 @@ namespace Astra
         {
             AssertContextAffinity();
             if (!m_entityManager.IsValid(entity)) return false;
-            T* current = m_archetypeManager->GetComponent<T>(entity);   // non-stamping fetch
+            T* current = RoutesToStore<T>() ? StoreGet<T>(entity)                       // non-stamping fetch,
+                                            : m_archetypeManager->GetComponent<T>(entity);   // either storage
             if (!current) return false;
             if (*current == value) return false;
             *current = value;
-            m_archetypeManager->MarkWritten(entity, TypeID<T>::Value());
+            (void)MarkWrittenRouted(entity, TypeID<T>::Value());
             return true;
         }
 
@@ -678,6 +885,12 @@ namespace Astra
             auto* rec = const_cast<EntityRecord*>(m_archetypeManager->GetEntityRecord(entity));
             if (!rec || !rec->chunk) ASTRA_UNLIKELY
                 return false;
+            // A registry with no store never reads a descriptor kind (one bool check).
+            if (m_componentStorage->HasAnyStore())
+            {
+                if (const StorageKind kind = EnableKindOf(componentId); kind != StorageKind::Table) ASTRA_UNLIKELY
+                    return SetEnabledInStore(entity, *rec, componentId, kind, enable);
+            }
             if (!rec->archetype->GetMask().Test(componentId)) ASTRA_UNLIKELY
                 return false;   // component absent
             const int col = rec->archetype->GetColumnMeta().idToColumn[componentId];
@@ -696,7 +909,11 @@ namespace Astra
                 const Signal flag = enable ? Signal::ComponentEnabled : Signal::ComponentDisabled;
                 if (m_signalManager.IsSignalEnabled(flag)) ASTRA_UNLIKELY
                 {
-                    void* comp = chunk->GetComponentPointer(componentId, idx);
+                    // A present tag's payload is EmptyComponentSentinel() on every by-ID path
+                    // (Component.hpp); an enableable tag's bit-only column base is never handed out.
+                    void* comp = rec->archetype->GetColumnMeta().columns[col].stride == 0
+                        ? EmptyComponentSentinel()
+                        : chunk->GetComponentPointer(componentId, idx);
                     if (enable) m_signalManager.Emit<Events::ComponentEnabled>(entity, componentId, comp);
                     else        m_signalManager.Emit<Events::ComponentDisabled>(entity, componentId, comp);
                 }
@@ -712,6 +929,19 @@ namespace Astra
             const auto* rec = m_archetypeManager->GetEntityRecord(entity);
             if (!rec || !rec->chunk) ASTRA_UNLIKELY
                 return false;
+            if (m_componentStorage->HasAnyStore())
+            {
+                if (const StorageKind kind = EnableKindOf(componentId); kind != StorageKind::Table) ASTRA_UNLIKELY
+                {
+                    if (kind == StorageKind::Sparse)
+                    {
+                        const SparseSet* set = m_componentStorage->FindSparse(componentId);   // a read never creates a store
+                        return set && set->Contains(entity) && !set->IsDisabled(entity);
+                    }
+                    const UniversalColumn* column = m_componentStorage->FindUniversal(componentId);
+                    return column && column->IsLive(entity) && !column->IsDisabled(entity);   // non-enableable: IsDisabled is false
+                }
+            }
             if (!rec->archetype->GetMask().Test(componentId)) ASTRA_UNLIKELY
                 return false;   // absent => not enabled (behavior table)
             const int col = rec->archetype->GetColumnMeta().idToColumn[componentId];
@@ -735,6 +965,11 @@ namespace Astra
          */
         bool AddComponentByID(Entity entity, ComponentID componentId, const void* data, size_t dataSize)
         {
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return false;  // present on every entity: the by-id Table rule for a present component
+            if (IsSparseId(componentId)) ASTRA_UNLIKELY
+                return SparseAddByID(entity, componentId, data, dataSize, /*emit*/ true);
+
             bool result = m_archetypeManager->AddComponentByID(entity, componentId, data, dataSize);
 
             if (result && m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
@@ -782,6 +1017,16 @@ namespace Astra
          */
         size_t AddComponentsByID(std::span<Entity> entities, ComponentID componentId, const void* data, size_t dataSize)
         {
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return 0;
+            if (IsSparseId(componentId)) ASTRA_UNLIKELY
+            {
+                size_t added = 0;
+                for (Entity e : entities)
+                    added += SparseAddByID(e, componentId, data, dataSize, /*emit*/ false) ? 1u : 0u;
+                return added;
+            }
+
             return m_archetypeManager->AddComponentsByID(entities, componentId, data, dataSize);
         }
 
@@ -794,6 +1039,11 @@ namespace Astra
          */
         bool RemoveComponentByID(Entity entity, ComponentID componentId)
         {
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return UniversalRemoveAnswer(entity, componentId);
+            if (IsSparseId(componentId)) ASTRA_UNLIKELY
+                return SparseRemoveByID(entity, componentId, /*emit*/ true);
+
             // Get component pointer before removal for signal emission
             void* componentPtr = nullptr;
             if (m_signalManager.IsSignalEnabled(Signal::ComponentRemoved))
@@ -841,6 +1091,16 @@ namespace Astra
          */
         size_t RemoveComponentsByID(std::span<Entity> entities, ComponentID componentId)
         {
+            if (IsUniversalId(componentId)) ASTRA_UNLIKELY
+                return RefuseUniversalRemoveBatch(entities, componentId);
+            if (IsSparseId(componentId)) ASTRA_UNLIKELY
+            {
+                size_t removed = 0;
+                for (Entity e : entities)
+                    removed += SparseRemoveByID(e, componentId, /*emit*/ false) ? 1u : 0u;
+                return removed;
+            }
+
             return m_archetypeManager->RemoveComponentsByID(entities, componentId);
         }
 
@@ -876,7 +1136,11 @@ namespace Astra
             // Presence is the archetype mask, not the chunk array (which is null for a
             // size==0 tag). This makes Get(...) != nullptr agree with Has(...).
             if (!record->archetype->GetMask().Test(componentId))
-                return nullptr;                     // entity does not have the component
+            {
+                // Not in the mask: a Sparse/Universal member lives in its store (s3.3).
+                bool present = false;
+                return StoredElementByID(entity, componentId, present);
+            }
 
             if (desc->size == 0)
                 return EmptyComponentSentinel();     // present tag: no data
@@ -924,7 +1188,11 @@ namespace Astra
             if (!record)
                 return false;
 
-            return record->archetype->GetMask().Test(componentId);
+            if (record->archetype->GetMask().Test(componentId))
+                return true;
+            bool present = false;
+            (void)StoredElementByID(entity, componentId, present);
+            return present;
         }
 
         /**
@@ -951,6 +1219,13 @@ namespace Astra
             m_componentRegistry->ForEachComponent([&](ComponentID id, const ComponentDescriptor& desc)
             {
                 if (mask.Test(id))
+                {
+                    result.push_back(&desc);
+                    return;
+                }
+                bool present = false;
+                (void)StoredElementByID(entity, id, present);
+                if (present)
                     result.push_back(&desc);
             });
 
@@ -994,7 +1269,15 @@ namespace Astra
             m_componentRegistry->ForEachComponent([&](ComponentID id, const ComponentDescriptor& desc)
             {
                 if (!mask.Test(id))
+                {
+                    // A Sparse/Universal member lives in its store (s3.3).
+                    bool present = false;
+                    void* stored = StoredElementByID(entity, id, present);
+                    if (!present)
+                        return;
+                    result.push_back(ComponentInfo{ &desc, desc.meta, desc.size > 0 ? stored : nullptr });   // a tag has no data
                     return;
+                }
 
                 ComponentInfo info;
                 info.descriptor = &desc;
@@ -1280,7 +1563,11 @@ namespace Astra
         
         void Clear()
         {
-            m_archetypeManager->Clear();   // in place -- keeps cached Views/Relations valid
+            const bool hadStores = m_componentStorage->HasAnyStore();
+            m_componentStorage->Clear();   // destroy every store element first, in place; slot assignments + universal declarations survive (spec s7.3)
+            m_archetypeManager->Clear();   // in place -- keeps cached Views/Relations valid; chunks free their presence blocks
+            if (hadStores) ASTRA_UNLIKELY
+                m_archetypeManager->BumpSparseStructuralCounter();
             m_relationshipGraph->Clear();
             m_entityManager.Clear();
         }
@@ -1313,6 +1600,11 @@ namespace Astra
         ASTRA_NODISCARD std::shared_ptr<ComponentRegistry> ShareComponentRegistry() const noexcept { return m_componentRegistry; }
         ASTRA_NODISCARD ArchetypeManager* GetArchetypeManager() noexcept { return m_archetypeManager.get(); }
         ASTRA_NODISCARD const ArchetypeManager* GetArchetypeManager() const noexcept { return m_archetypeManager.get(); }
+
+        // Storage policies (spec 2026-10-01 s4): component kinds, sparse slots, and the
+        // sparse / universal stores of THIS registry.
+        ASTRA_NODISCARD ComponentStorage* GetComponentStorage() noexcept { return m_componentStorage.get(); }
+        ASTRA_NODISCARD const ComponentStorage* GetComponentStorage() const noexcept { return m_componentStorage.get(); }
 
         // Change-detection time (spec 2026-09-10 §3.1): forwarded from the owning
         // ArchetypeManager so views (which hold the manager) and the registry agree.
@@ -1391,6 +1683,151 @@ namespace Astra
         // Overload instead of a default argument: gcc/clang reject a default argument
         // that needs DefragmentationOptions' NSDMIs before the enclosing class is complete.
         DefragmentationResult Defragment() { return Defragment(DefragmentationOptions{}); }
+
+        // Storage policies (spec s5.2): exhaustive check of
+        //   P1 presence -- chunk present bit <=> sparse-set membership, both directions;
+        //   P2 counts   -- presentCount/disabledCount == popcount of their words;
+        //   P3 mirror   -- chunk disabled bit <=> the store's disabled flag
+        //                  (enableable Sparse and Universal);
+        // plus the tail rule (no bit at a chunk slot >= count). Returns "" when all
+        // hold, else one line per violation (first 32). Every config (ledgered deviation
+        // from the spec's "Debug-only", G9). Non-creating (G2): never builds a store or
+        // takes a slot. O(entities x sparse slots): tests and the invariant fuzzer only.
+        ASTRA_NODISCARD std::string ValidateStorageInvariants() const
+        {
+            std::string out;
+            size_t violations = 0;
+            auto fail = [&](const char* what, Entity e, uint16_t slot, size_t index)
+            {
+                if (++violations > 32) return;
+                out += what;
+                out += " (entity ";
+                out += e.IsValid() ? std::to_string(e.GetID()) + "v" + std::to_string(e.GetVersion()) : std::string("-");
+                out += ", slot " + std::to_string(slot) + ", index " + std::to_string(index) + ")\n";
+            };
+            const ComponentStorage& storage = *m_componentStorage;
+
+            // Chunk side: every block, every bit.
+            for (Archetype* arch : m_archetypeManager->GetArchetypes())
+            {
+                for (const auto& chunkPtr : arch->GetChunks())
+                {
+                    const ArchetypeChunk& chunk = *chunkPtr;
+                    const size_t count = chunk.GetCount();
+                    const size_t capacity = chunk.GetCapacity();
+                    const size_t words = (capacity + 63) / 64;
+                    for (const ArchetypeChunk::SparseBlock& b : chunk.GetSparseBlocks())
+                    {
+                        const ComponentID id = storage.ComponentOfSlot(b.slot);
+                        const StorageKind kind = id < MAX_COMPONENTS ? storage.KindOf(id) : StorageKind::Table;
+                        uint32_t presentPop = 0, disabledPop = 0;
+                        for (size_t w = 0; w < words; ++w)
+                        {
+                            if (b.present)  presentPop  += static_cast<uint32_t>(std::popcount(b.present[w]));
+                            if (b.disabled) disabledPop += static_cast<uint32_t>(std::popcount(b.disabled[w]));
+                        }
+                        if (presentPop != b.presentCount)   fail("P2 presentCount != popcount(present)", Entity::Invalid(), b.slot, 0);
+                        if (disabledPop != b.disabledCount) fail("P2 disabledCount != popcount(disabled)", Entity::Invalid(), b.slot, 0);
+                        if (kind == StorageKind::Table)     fail("presence block for a slot with no Sparse/Universal component", Entity::Invalid(), b.slot, 0);
+                        if (kind == StorageKind::Universal && b.present) fail("present words on a Universal mirror block", Entity::Invalid(), b.slot, 0);
+
+                        const SparseSet* set = kind == StorageKind::Sparse ? storage.FindSparse(id) : nullptr;
+                        const UniversalColumn* col = kind == StorageKind::Universal ? storage.FindUniversal(id) : nullptr;
+                        for (size_t i = 0; i < capacity; ++i)
+                        {
+                            const bool p = chunk.IsSparsePresent(b.slot, i);
+                            const bool d = chunk.IsSparseDisabled(b.slot, i);
+                            if (i >= count)
+                            {
+                                if (p || d) fail("bit set at a chunk slot >= count", Entity::Invalid(), b.slot, i);
+                                continue;
+                            }
+                            const Entity e = chunk.GetEntity(i);
+                            if (kind == StorageKind::Sparse)
+                            {
+                                const bool member = set && set->Contains(e);
+                                if (p != member) fail("P1 presence bit != sparse membership", e, b.slot, i);
+                                if (d && !p)     fail("P3 disabled bit on a non-member", e, b.slot, i);
+                                if (member && d != set->IsDisabled(e)) fail("P3 disabled mirror != sparse disabled flag", e, b.slot, i);
+                            }
+                            else if (kind == StorageKind::Universal)
+                            {
+                                if (col && d != col->IsDisabled(e)) fail("P3 disabled mirror != universal disabled flag", e, b.slot, i);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Store side: every member is a live, located entity whose bits agree.
+            for (uint16_t slot = 0; slot < ASTRA_MAX_SPARSE_COMPONENTS; ++slot)
+            {
+                const ComponentID id = storage.ComponentOfSlot(slot);
+                if (id >= MAX_COMPONENTS) continue;                 // unassigned slot
+                const StorageKind kind = storage.KindOf(id);
+                if (kind == StorageKind::Sparse)
+                {
+                    const SparseSet* set = storage.FindSparse(id);
+                    if (!set) continue;
+                    const bool enableable = set->Descriptor().isEnableable;
+                    const Entity* members = set->Entities();
+                    for (size_t k = 0; k < set->Size(); ++k)
+                    {
+                        const Entity e = members[k];
+                        const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+                        if (!rec || !rec->chunk)
+                        {
+                            fail("P1 sparse member is not a live, located entity", e, slot, k);
+                            continue;
+                        }
+                        const size_t i = rec->location.GetEntityIndex();
+                        if (!rec->chunk->IsSparsePresent(slot, i)) fail("P1 sparse member without its presence bit", e, slot, i);
+                        if (enableable && set->IsDisabled(e) != rec->chunk->IsSparseDisabled(slot, i))
+                            fail("P3 sparse disabled flag without its mirror bit", e, slot, i);
+                    }
+                }
+                else if (kind == StorageKind::Universal)
+                {
+                    const UniversalColumn* col = storage.FindUniversal(id);
+                    if (!col) continue;
+                    col->ForEachLive([&](Entity e, const void*)
+                    {
+                        const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+                        if (!rec || !rec->chunk)
+                        {
+                            fail("universal slot live for a dead entity", e, slot, 0);
+                            return;
+                        }
+                        const size_t i = rec->location.GetEntityIndex();
+                        if (col->IsDisabled(e) != rec->chunk->IsSparseDisabled(slot, i))
+                            fail("P3 universal disabled flag without its mirror bit", e, slot, i);
+                    });
+                }
+            }
+
+            // Universal side, spec-driven: an enableable Universal whose id never received a
+            // sparse slot is invisible to both loops above, yet a disabled flag on it still
+            // violates P3 (no slot means no mirror bit can exist). Find* only.
+            for (const UniversalSpec& spec : storage.UniversalSpecs())
+            {
+                const UniversalColumn* col = storage.FindUniversal(spec.id);
+                if (!col || !col->Descriptor().isEnableable) continue;
+                const int slot = storage.SparseSlotOf(spec.id);
+                col->ForEachLive([&](Entity e, const void*)
+                {
+                    if (!col->IsDisabled(e)) return;
+                    const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+                    if (slot < 0)
+                        fail("P3 universal disabled flag with no sparse slot (no mirror)", e, 0, rec && rec->chunk ? rec->location.GetEntityIndex() : 0);
+                    else if (rec && rec->chunk && !rec->chunk->IsSparseDisabled(static_cast<uint16_t>(slot), rec->location.GetEntityIndex()))
+                        fail("P3 universal disabled flag without its mirror bit", e, static_cast<uint16_t>(slot), rec->location.GetEntityIndex());
+                });
+            }
+
+            if (violations > 32)
+                out += "... " + std::to_string(violations - 32) + " more violation(s)\n";
+            return out;
+        }
 
         DefragmentationResult Defragment(const DefragmentationOptions& options)
         {
@@ -1745,6 +2182,7 @@ namespace Astra
             // Serialize components
             m_entityManager.Serialize(writer);
             m_archetypeManager->Serialize(writer);
+            m_componentStorage->Serialize(writer);   // format v6 ComponentStorage block (s8.1)
             m_relationshipGraph->Serialize(writer);
             m_resourceStorage.Serialize(writer);   // format v2 resource block
 
@@ -1779,6 +2217,7 @@ namespace Astra
             // Serialize components
             m_entityManager.Serialize(writer);
             m_archetypeManager->Serialize(writer);
+            m_componentStorage->Serialize(writer);   // format v6 ComponentStorage block (s8.1)
             m_relationshipGraph->Serialize(writer);
             m_resourceStorage.Serialize(writer);   // format v2 resource block
 
@@ -1837,6 +2276,854 @@ namespace Astra
         }
 
     private:
+        friend class CommandBuffer;   // ExecuteCreateEntity/ExecuteCreateEntities -> CreateEntityInternal
+
+        // ---- Storage routing (spec 2026-10-01 s3.3) ----
+        // A component's effective kind in THIS registry. Out-of-range ids (a refused
+        // registration) are reported as Table, so the archetype path refuses them as it
+        // does today.
+        template<Component T>
+        ASTRA_NODISCARD StorageKind KindOfT() const noexcept
+        {
+            const ComponentID id = TypeID<T>::Value();
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return StorageKind::Table;
+            return m_componentStorage->KindOf(id);
+        }
+
+        // True when T's value lives in a ComponentStorage store rather than a chunk column.
+        // A Sparse-trait T always routes to a store: its set, or its universal column when
+        // this registry declares it universal (decided at compile time). A Table-trait T
+        // routes to a store only when declared universal: a bool load plus a mask test, and
+        // no descriptor read, in a registry with no universal (G4).
+        template<Component T>
+        ASTRA_NODISCARD bool RoutesToStore() const noexcept
+        {
+            if constexpr (StorageOfV<T> == Storage::Sparse)
+                return true;
+            else
+                return m_hasUniversals && m_componentStorage->IsDeclaredUniversal(TypeID<T>::Value());
+        }
+
+        // D2's single exception (spec 2026-10-01 s3.3, s12.3): a universal component is
+        // present on every entity and cannot be removed. Debug: ASTRA_ASSERT. Release:
+        // false. Never a signal. Callers check the handle FIRST, so a stale handle is a
+        // quiet miss, never a refusal.
+        static bool RefuseUniversalRemove() noexcept
+        {
+            ASTRA_ASSERT(false, "RemoveComponent on a Universal component is refused: it is present on every entity (spec 2026-10-01 s3.3)");
+            return false;
+        }
+
+        // The single-entity form for a declared Universal id. An entity that holds it is
+        // refused (RefuseUniversalRemove). One whose slot is not live (the type is SUSPENDED
+        // after a module unload, spec s4.4) does not hold it: a quiet false, consistent with
+        // HasComponent == false, nothing to refuse. A stale handle is a quiet miss too.
+        bool UniversalRemoveAnswer(Entity entity, ComponentID id) const noexcept
+        {
+            if (!HoldsLiveUniversal(entity, id))
+                return false;
+            return RefuseUniversalRemove();
+        }
+
+        // Batch form: one refusal per call if any entity holds the component, by the same
+        // test as the single form (final review M3): a batch of only stale handles, or one
+        // made while the type is suspended, misses quietly. Returns 0, the removed count. (A
+        // CommandBuffer batch remove executes per entity, so it refuses once per holder.)
+        size_t RefuseUniversalRemoveBatch(std::span<Entity> entities, ComponentID id) const noexcept
+        {
+            for (Entity entity : entities)
+            {
+                if (HoldsLiveUniversal(entity, id))
+                {
+                    (void)RefuseUniversalRemove();
+                    break;
+                }
+            }
+            return 0;
+        }
+
+        // A live handle whose slot of the declared Universal `id` is live (false while the
+        // type is suspended after a module unload, spec s4.4).
+        ASTRA_NODISCARD bool HoldsLiveUniversal(Entity entity, ComponentID id) const noexcept
+        {
+            return m_entityManager.IsValid(entity) && StoreLookup(entity, id) != nullptr;
+        }
+
+        // True when `id` is declared Universal in this registry: a bool load plus a mask
+        // test, and no descriptor read, so Table add/remove never pay for KindOf (false in
+        // a registry with no universal).
+        ASTRA_NODISCARD bool IsUniversalId(ComponentID id) const noexcept
+        {
+            return m_hasUniversals && m_componentStorage->IsDeclaredUniversal(id);
+        }
+
+        // IsUniversalId(TypeID<T>::Value()) with the id resolved only when this registry
+        // has a universal at all: the TypeID lookup is an out-of-line call, and a typed
+        // Table add/remove must not pay it for a check that cannot succeed.
+        template<Component T>
+        ASTRA_NODISCARD bool IsUniversalT() const noexcept
+        {
+            return m_hasUniversals && m_componentStorage->IsDeclaredUniversal(TypeID<T>::Value());
+        }
+
+        // Kind of `id` for SetEnabled/IsEnabled, with no descriptor read: Universal by the
+        // declared mask, Sparse iff the id owns a slot (a Sparse id with no slot has no set,
+        // and the Table mask test answers the same false/false), else Table.
+        ASTRA_NODISCARD StorageKind EnableKindOf(ComponentID id) const noexcept
+        {
+            if (IsUniversalId(id)) return StorageKind::Universal;
+            return m_componentStorage->SparseSlotOf(id) >= 0 ? StorageKind::Sparse : StorageKind::Table;
+        }
+
+        // Storage policies (spec s7.2): SetEnabled for a Sparse or Universal id. The STORE
+        // flag is the truth; on a genuine change the chunk's disabled bit for the
+        // component's slot is updated as the P3 mirror. An enableable Universal component
+        // acquires its slot on its first disable and gets present == nullptr mirror blocks.
+        // Contract = the Table body's: true iff the live entity holds an enableable
+        // component, whether or not the state changed; signals fire on a genuine change
+        // only. Absent components create no set and take no slot (RULINGS G2).
+        bool SetEnabledInStore(Entity entity, const EntityRecord& rec, ComponentID id, StorageKind kind, bool enable)
+        {
+            const ComponentDescriptor* desc = m_componentRegistry->GetComponentDescriptor(id);
+            if (!desc || !desc->isEnableable) ASTRA_UNLIKELY
+                return false;                                      // not enableable: nothing to toggle
+            int slot = m_componentStorage->SparseSlotOf(id);
+            bool changed = false;
+            void* element = nullptr;
+            if (kind == StorageKind::Sparse)
+            {
+                SparseSet* set = m_componentStorage->FindSparse(id);
+                if (!set || !set->Contains(entity))
+                    return false;                                  // absent
+                changed = set->SetDisabled(entity, !enable);       // SET == DISABLED
+                element = desc->size == 0 ? EmptyComponentSentinel() : set->Get(entity);
+            }
+            else
+            {
+                UniversalColumn* column = m_componentStorage->FindUniversal(id);
+                if (!column || !column->IsLive(entity))
+                    return false;                                  // stale or never constructed
+                if (!enable && slot < 0) ASTRA_UNLIKELY
+                {
+                    slot = m_componentStorage->AcquireSparseSlot(id);
+                    if (slot < 0) ASTRA_UNLIKELY
+                        return false;                              // slot cap exhausted (AcquireSparseSlot asserts)
+                }
+                changed = column->SetDisabled(entity, !enable);
+                element = desc->size == 0 ? EmptyComponentSentinel() : column->Get(entity);
+            }
+            if (changed)
+            {
+                ASTRA_ASSERT(slot >= 0, "SetEnabledInStore: a genuine change implies an assigned sparse slot");
+                rec.chunk->SetSparseDisabled(static_cast<uint16_t>(slot), rec.location.GetEntityIndex(), !enable);
+                const Signal flag = enable ? Signal::ComponentEnabled : Signal::ComponentDisabled;
+                if (m_signalManager.IsSignalEnabled(flag)) ASTRA_UNLIKELY
+                {
+                    if (enable) m_signalManager.Emit<Events::ComponentEnabled>(entity, id, element);
+                    else        m_signalManager.Emit<Events::ComponentDisabled>(entity, id, element);
+                }
+            }
+            return true;
+        }
+
+        // Write-side stamp routed by kind: Table -> the chunk column (today's
+        // ArchetypeManager::MarkWritten); store kinds -> the store. Same false paths
+        // everywhere: invalid/stale handle, absent component, tag. A registry with no
+        // store never reads a descriptor kind (one bool check).
+        bool MarkWrittenRouted(Entity entity, ComponentID id)
+        {
+            if (m_componentStorage->HasAnyStore() && id < MAX_COMPONENTS
+                && m_componentStorage->KindOf(id) != StorageKind::Table) ASTRA_UNLIKELY
+                return MarkStoreWritten(entity, id);
+            return m_archetypeManager->MarkWritten(entity, id);
+        }
+
+        bool MarkStoreWritten(Entity entity, ComponentID id)
+        {
+            if (!m_entityManager.IsValid(entity)) ASTRA_UNLIKELY
+                return false;
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Universal:
+                {
+                    UniversalColumn* column = m_componentStorage->FindUniversal(id);
+                    return column && column->MarkWritten(entity, CurrentTick());
+                }
+                case StorageKind::Sparse:
+                {
+                    // A write to a present Sparse element (spec s3.3): the element's `changed`
+                    // tick when tracked (inside MarkWritten), plus the component's coarse
+                    // version. Tag, absent or stale: false.
+                    SparseSet* set = m_componentStorage->FindSparse(id);
+                    return set && Detail::StampSparseWrite(*m_componentStorage, *set, id, entity, CurrentTick());
+                }
+                default:
+                    return false;
+            }
+        }
+
+        // IsChanged/IsAdded for a store kind. Never stamps. Tracked: the slot's exact
+        // tick; untracked: the page version (page-coarse); tag, stale or absent: false.
+        ASTRA_NODISCARD bool StoreTickNewer(Entity entity, ComponentID id, Tick since, bool added) const
+        {
+            if (id >= MAX_COMPONENTS || !m_entityManager.IsValid(entity)) ASTRA_UNLIKELY
+                return false;
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Universal:
+                {
+                    const UniversalColumn* column = m_componentStorage->FindUniversal(id);
+                    if (!column || column->Descriptor().size == 0 || !column->IsLive(entity)) ASTRA_UNLIKELY
+                        return false;
+                    return IsNewer(added ? column->AddedTick(entity) : column->ChangedTick(entity), since);
+                }
+                case StorageKind::Sparse:
+                {
+                    // Tracked: the element's exact ticks. Untracked: the component's coarse
+                    // version, so every member answers alike (IsAdded == IsChanged). Tag,
+                    // absent or stale: false.
+                    const SparseSet* set = m_componentStorage->FindSparse(id);
+                    if (!set || set->Descriptor().size == 0 || !set->Contains(entity)) ASTRA_UNLIKELY
+                        return false;
+                    if (const EntityTicks* t = set->Ticks(entity))
+                        return IsNewer(added ? t->added : t->changed, since);
+                    return IsNewer(m_componentStorage->CoarseVersion(id), since);
+                }
+                default:
+                    return false;
+            }
+        }
+
+        // Non-stamping, type-erased store lookup: the element pointer (or
+        // EmptyComponentSentinel() for a present tag), or nullptr when absent or stale.
+        ASTRA_NODISCARD void* StoreLookup(Entity entity, ComponentID id) const noexcept
+        {
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return nullptr;
+            switch (m_componentStorage->KindOf(id))
+            {
+                case StorageKind::Universal:
+                {
+                    UniversalColumn* column = m_componentStorage->FindUniversal(id);
+                    return column ? column->Get(entity) : nullptr;
+                }
+                case StorageKind::Sparse:
+                {
+                    SparseSet* set = m_componentStorage->FindSparse(id);
+                    return set ? set->Get(entity) : nullptr;
+                }
+                default:
+                    return nullptr;
+            }
+        }
+
+        // The ONE per-type instance a store-kind tag hands out as its typed payload (the
+        // convention ArchetypeChunk::GetComponent<T> uses for a column-less tag). StoreGet
+        // and SparseTypedPtr both return it, so a Sparse tag's ComponentAdded/Removed
+        // payload equals GetComponent<Tag>(e) on every path.
+        template<Component T>
+        ASTRA_NODISCARD static T* StoreTagInstance() noexcept
+        {
+            return Detail::StoreTagInstance<T>();   // shared with Relations' GetInStorage
+        }
+
+        // Storage-aware membership and element of one component id (spec s3.3, reflection
+        // row). Sparse/Universal members are in no archetype mask, so every reflection API
+        // asks the store when the mask misses. Sets `present`; returns the data pointer, or
+        // EmptyComponentSentinel() for a present tag. A Table id (or an absent/stale
+        // handle): nullptr, present == false. Delegates to StoreLookup (non-creating, G2).
+        ASTRA_NODISCARD void* StoredElementByID(Entity entity, ComponentID id, bool& present) const noexcept
+        {
+            void* p = StoreLookup(entity, id);
+            present = p != nullptr;
+            return p;
+        }
+
+        // Typed twin of StoreLookup. A present tag yields the shared per-type instance.
+        template<Component T>
+        ASTRA_NODISCARD T* StoreGet(Entity entity) const noexcept
+        {
+            void* p = StoreLookup(entity, TypeID<T>::Value());
+            if (!p)
+                return nullptr;
+            if constexpr (std::is_empty_v<T>)
+                return StoreTagInstance<T>();
+            else
+                return static_cast<T*>(p);
+        }
+
+        // ---- Storage policies: the Sparse funnel (spec s7.2) ----
+
+        // Effective kind of a Sparse-TRAIT type in this registry: Sparse, or Universal
+        // when the Config declares it. Only called inside
+        // `if constexpr (StorageOfV<T> == Storage::Sparse)`, so Table hot paths never pay
+        // the registration + lookup. KindOf reads T's descriptor, hence the registration.
+        template<Component T>
+        ASTRA_NODISCARD StorageKind ResolveKind() const
+        {
+            m_componentRegistry->RegisterComponent<T>();
+            return KindOfT<T>();
+        }
+
+        // The typed signal payload for a Sparse element: the element itself, or (for a
+        // tag) the shared per-type instance (spec s7.4).
+        template<Component T>
+        ASTRA_NODISCARD static T* SparseTypedPtr(void* element) noexcept
+        {
+            if constexpr (std::is_empty_v<T>)
+            {
+                (void)element;
+                return StoreTagInstance<T>();
+            }
+            else
+            {
+                return static_cast<T*>(element);
+            }
+        }
+
+        // The ONE place a Sparse membership is created. Inserts `entity` into `id`'s set
+        // (moving from `src`, or default-constructing when src == nullptr; always nullptr
+        // for a tag), sets the presence bit at the entity's chunk slot (P1) and bumps the
+        // sparse structural counter. Preconditions: `entity` is the LIVE handle and `rec`
+        // its validated record; not yet a member. Returns the element pointer
+        // (EmptyComponentSentinel() for a tag), or nullptr when the
+        // ASTRA_MAX_SPARSE_COMPONENTS cap refuses the component (AcquireSparseSlot asserts
+        // in Debug; Release refuses, spec s3.2).
+        void* SparseAttach(Entity entity, const EntityRecord& rec, ComponentID id, void* src)
+        {
+            SparseSet* set = m_componentStorage->Sparse(id);   // acquires the slot on first use
+            if (!set) ASTRA_UNLIKELY
+                return nullptr;
+            const int slot = m_componentStorage->SparseSlotOf(id);
+            ASTRA_ASSERT(slot >= 0 && !set->Contains(entity), "SparseAttach: no slot, or entity is already a member");
+            void* element = src ? set->InsertMove(entity, src) : set->Insert(entity);
+            rec.chunk->SetSparsePresent(static_cast<uint16_t>(slot), rec.location.GetEntityIndex(), true);
+            m_archetypeManager->BumpSparseStructuralCounter();
+            // A tracked element's {added, changed} are stamped by the set on insert; an
+            // untracked one is born into the component's coarse version.
+            m_componentStorage->StampCoarse(id, CurrentTick());
+            return set->Descriptor().size == 0 ? EmptyComponentSentinel() : element;
+        }
+
+        // Erases `entity` from `id`'s set and clears its presence bit (which also clears
+        // its disabled mirror bit). ComponentRemoved is the caller's and fires BEFORE
+        // this. Non-creating (G2). Returns false when `entity` is not a member.
+        bool SparseDetach(Entity entity, const EntityRecord& rec, ComponentID id)
+        {
+            const int slot = m_componentStorage->SparseSlotOf(id);
+            SparseSet* set = m_componentStorage->FindSparse(id);
+            if (slot < 0 || !set || !set->Erase(entity)) ASTRA_UNLIKELY
+                return false;
+            rec.chunk->SetSparsePresent(static_cast<uint16_t>(slot), rec.location.GetEntityIndex(), false);
+            m_archetypeManager->BumpSparseStructuralCounter();
+            return true;
+        }
+
+        // True when `id` is a Sparse component in this registry (a Universal declaration
+        // wins, so a Sparse-trait type declared Universal is not). Runtime twin of
+        // ResolveKind<T>() == Sparse for the type-erased paths.
+        ASTRA_NODISCARD bool IsSparseId(ComponentID id) const noexcept
+        {
+            // A Table-only registry (no Sparse-trait descriptor ever installed) answers
+            // without a descriptor read: Sparse can only come from the trait, and a
+            // Universal declaration wins over it anyway.
+            return m_componentRegistry->MaySpawnSparse() && m_componentStorage->KindOf(id) == StorageKind::Sparse;
+        }
+
+        // Overwrites a default-constructed element with the type-erased source through
+        // the descriptor's shared construction ladder (also MoveAndAddByID's).
+        static void AssignErased(const ComponentDescriptor& desc, void* dst, const void* src)
+        {
+            if (!desc.is_trivially_copyable)
+                desc.Destruct(dst);
+            desc.ConstructFromErased(dst, src);
+        }
+
+        // By-id Sparse add with ArchetypeManager::AddComponentByID contract: false for
+        // an unknown id, a size mismatch, a stale handle, an id the entity already holds,
+        // or a slot-cap refusal. `emit` gates ComponentAdded (the batch form never emits).
+        bool SparseAddByID(Entity entity, ComponentID id, const void* data, size_t dataSize, bool emit)
+        {
+            const ComponentDescriptor* desc = m_componentRegistry->GetComponentDescriptor(id);
+            if (!desc) ASTRA_UNLIKELY
+                return false;
+            if (dataSize != desc->size && desc->size > 0) ASTRA_UNLIKELY
+                return false;
+            if (!m_entityManager.IsValid(entity)) ASTRA_UNLIKELY
+                return false;                              // SparseSet::Insert takes only a LIVE handle
+            const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+            if (!rec || !rec->chunk) ASTRA_UNLIKELY
+                return false;
+            if (const SparseSet* set = m_componentStorage->FindSparse(id); set && set->Contains(entity))
+                return false;
+            void* element = SparseAttach(entity, *rec, id, nullptr);   // default-constructed
+            if (!element) ASTRA_UNLIKELY
+                return false;
+            if (desc->size > 0 && data)
+                AssignErased(*desc, element, data);
+            if (emit && m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
+                m_signalManager.Emit<Events::ComponentAdded>(entity, id, element);
+            return true;
+        }
+
+        // By-id Sparse remove: ComponentRemoved (when `emit`) BEFORE the erase, with the
+        // element pointer (the sentinel for a tag); false when stale or absent.
+        // Non-creating (G2).
+        bool SparseRemoveByID(Entity entity, ComponentID id, bool emit)
+        {
+            const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity);
+            SparseSet* set = m_componentStorage->FindSparse(id);
+            if (!rec || !rec->chunk || !set || !set->Contains(entity))
+                return false;
+            if (emit && m_signalManager.IsSignalEnabled(Signal::ComponentRemoved)) ASTRA_UNLIKELY
+            {
+                void* element = set->Descriptor().size == 0 ? EmptyComponentSentinel() : set->Get(entity);
+                m_signalManager.Emit<Events::ComponentRemoved>(entity, id, element);
+                rec = m_archetypeManager->GetEntityRecord(entity);   // a handler may have moved/destroyed it
+                if (!rec || !rec->chunk || !set->Contains(entity))
+                    return false;
+            }
+            return SparseDetach(entity, *rec, id);
+        }
+
+        // Typed batch add over de-duplicated live entities. Absent -> attach a fresh value
+        // from make(); present -> untouched. Then ComponentAdded for every entity HOLDING
+        // T: the exact post-pass rule of Registry::AddComponents for Table. A slot-cap
+        // refusal is dropped in Release (AcquireSparseSlot asserts in Debug; the batch
+        // add is void).
+        template<Component T, typename MakeFn>
+        void SparseBatchAdd(std::span<const Entity> entities, MakeFn&& make)
+        {
+            const ComponentID id = TypeID<T>::Value();
+            for (Entity e : entities)
+            {
+                const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+                if (!rec || !rec->chunk) ASTRA_UNLIKELY
+                    continue;
+                if (const SparseSet* set = m_componentStorage->FindSparse(id); set && set->Contains(e))
+                    continue;
+                if constexpr (std::is_empty_v<T>)
+                {
+                    (void)make;
+                    SparseAttach(e, *rec, id, nullptr);
+                }
+                else
+                {
+                    T value = make();
+                    SparseAttach(e, *rec, id, &value);
+                }
+            }
+            if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
+            {
+                SparseSet* set = m_componentStorage->FindSparse(id);
+                if (!set)
+                    return;
+                for (Entity e : entities)
+                    if (set->Contains(e))
+                        m_signalManager.Emit<Events::ComponentAdded>(e, id, SparseTypedPtr<T>(set->Get(e)));
+            }
+        }
+
+        // Typed batch remove, mirroring Registry::RemoveComponents for Table:
+        // ComponentRemoved fires per occurrence BEFORE anything is erased (a duplicated
+        // entity double-signals, the documented Table quirk); erasure runs once per
+        // de-duplicated member. Returns the number removed. Non-creating (G2).
+        template<Component T>
+        size_t SparseBatchRemove(std::span<Entity> entities)
+        {
+            const ComponentID id = TypeID<T>::Value();
+            SparseSet* set = m_componentStorage->FindSparse(id);
+            if (!set) ASTRA_UNLIKELY
+                return 0;
+            const bool emit = m_signalManager.IsSignalEnabled(Signal::ComponentRemoved);
+            SmallVector<Entity, 256> members;
+            members.reserve(entities.size());
+            for (Entity e : entities)
+            {
+                if (!m_entityManager.IsValid(e) || !set->Contains(e))
+                    continue;
+                if (emit) ASTRA_UNLIKELY
+                    m_signalManager.Emit<Events::ComponentRemoved>(e, id, SparseTypedPtr<T>(set->Get(e)));
+                members.push_back(e);
+            }
+            std::sort(members.begin(), members.end());
+            members.erase(std::unique(members.begin(), members.end()), members.end());
+            size_t removed = 0;
+            for (Entity e : members)
+                if (const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e); rec && rec->chunk)
+                    removed += SparseDetach(e, *rec, id) ? 1u : 0u;
+            return removed;
+        }
+
+        // ---- Creation funnel (spec 2026-10-01 s4.2, s7.1) ----
+        // Universal construction for a freshly placed entity (steps 1-2). `supplied` lists
+        // the universal ids whose value the caller already moved in; those skip default
+        // and init. Costs one branch in a registry with no universal.
+        // The guard is inline (a Registry bool, no call, no shared_ptr hop): every single-entity
+        // create runs it, and a Universal-free registry must not pay a function call for it.
+        ASTRA_FORCEINLINE void ConstructUniversalsFor(Entity entity, const ComponentID* supplied, size_t suppliedCount)
+        {
+            if (m_hasUniversals) ASTRA_UNLIKELY
+                m_componentStorage->ConstructUniversals(entity, supplied, suppliedCount);
+        }
+
+        // Step 3: ComponentAdded once for every universal of `entity`, after EntityCreated
+        // and after the pack's own ComponentAdded. Supplied or not, a universal is "added"
+        // at create (s3.3 signals row). By-id payload: a present tag yields
+        // EmptyComponentSentinel().
+        ASTRA_FORCEINLINE void EmitUniversalAdded(Entity entity)
+        {
+            if (!m_hasUniversals) ASTRA_LIKELY
+                return;
+            EmitUniversalAddedSlow(entity);
+        }
+
+        ASTRA_NOINLINE void EmitUniversalAddedSlow(Entity entity)
+        {
+            if (!m_signalManager.IsSignalEnabled(Signal::ComponentAdded)) ASTRA_LIKELY
+                return;
+            for (const UniversalSpec& spec : m_componentStorage->UniversalSpecs())
+            {
+                UniversalColumn* column = m_componentStorage->FindUniversal(spec.id);
+                if (!column)
+                    continue;
+                if (void* component = column->Get(entity))
+                    m_signalManager.Emit<Events::ComponentAdded>(entity, spec.id, component);
+            }
+        }
+
+        // Batch twins of the two helpers above: the guard is tested once, then the loop runs.
+        void ConstructUniversalsForBatch(std::span<const Entity> made)
+        {
+            if (m_hasUniversals) ASTRA_UNLIKELY
+            {
+                for (const Entity entity : made)
+                    m_componentStorage->ConstructUniversals(entity, nullptr, 0);
+            }
+        }
+
+        void EmitUniversalAddedBatch(std::span<const Entity> made)
+        {
+            if (!m_hasUniversals) ASTRA_LIKELY
+                return;
+            if (!m_signalManager.IsSignalEnabled(Signal::ComponentAdded)) ASTRA_LIKELY
+                return;
+            for (const Entity entity : made)
+                EmitUniversalAdded(entity);
+        }
+
+        // THE single-entity creation funnel. Every create path without a component pack
+        // ends here, including the CommandBuffer executors, so universal construction and
+        // init cannot be skipped. `preallocated` is a live id that has no location yet.
+        Entity CreateEntityInternal(Entity preallocated)
+        {
+            if (!preallocated.IsValid()) ASTRA_UNLIKELY
+                return Entity::Invalid();
+            RefillSuspendedUniversals();
+            m_archetypeManager->AddEntity(preallocated);   // root archetype
+            ConstructUniversalsFor(preallocated, nullptr, 0);
+            m_signalManager.Emit<Events::EntityCreated>(preallocated);
+            EmitUniversalAdded(preallocated);
+            return preallocated;
+        }
+
+        // True if any of Ts is declared universal in this registry: the Registry-local bool,
+        // then one declaration-mask test per member, no descriptor read (final review M7).
+        // Table-trait members take today's typed placement only when this is false.
+        template<Component... Ts>
+        ASTRA_NODISCARD bool AnyUniversal() const noexcept
+        {
+            if constexpr (sizeof...(Ts) == 0)
+                return false;
+            else
+                return m_hasUniversals && (m_componentStorage->IsDeclaredUniversal(TypeID<Ts>::Value()) || ...);
+        }
+
+        // Effective kind of a creation-pack member. A Table-trait member reads no descriptor:
+        // Universal by the declaration mask, else Table, so it is placed exactly where the
+        // archetype mask (PlacedInArchetype) put it. A Sparse-trait member keeps KindOf, whose
+        // LIVE descriptor decides (a rebound module registration may say Table, RULINGS Task 36).
+        template<Component C>
+        ASTRA_NODISCARD StorageKind PackMemberKind(ComponentID id) const noexcept
+        {
+            if constexpr (StorageOfV<C> == Storage::Sparse)
+                return m_componentStorage->KindOf(id);
+            else
+                return IsUniversalId(id) ? StorageKind::Universal : StorageKind::Table;
+        }
+
+        // True when a Table-trait pack member is a column of the creation archetype: every
+        // registered one not declared universal here. One predicate for the mask and for the
+        // slot construction, so the two can never disagree.
+        ASTRA_NODISCARD bool PlacedInArchetype(ComponentID id) const noexcept
+        {
+            return id < MAX_COMPONENTS && !IsUniversalId(id);
+        }
+
+        // Spec s7.1, a pack that names a declared universal (final review I1): the archetype
+        // mask of its Table-trait members minus the universal ones, so the entity is placed
+        // ONCE ("GetOrCreateArchetype gets the Table subset only"). Registers every member,
+        // so the archetype built from the mask finds each descriptor.
+        template<Component... Ts>
+        ASTRA_NODISCARD ComponentMask CreationMask()
+        {
+            ComponentMask mask{};
+            ([&]
+            {
+                m_componentRegistry->RegisterComponent<Ts>();
+                const ComponentID id = TypeID<Ts>::Value();
+                if (PlacedInArchetype(id))
+                    mask.Set(id);
+            }(), ...);
+            return mask;
+        }
+
+        // One default-constructed (named, no value) Sparse-trait member, by its runtime kind.
+        // (Table-trait members are placed with the archetype, PlaceDefault.)
+        template<Component C>
+        void PlaceDefaultMember(Entity entity)
+        {
+            static_assert(StorageOfV<C> == Storage::Sparse, "Table-trait members are placed with the archetype");
+            m_componentRegistry->RegisterComponent<C>();   // KindOf needs the descriptor (Sparse trait)
+            const ComponentID id = TypeID<C>::Value();
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return;
+            // Release: a Sparse member past the 32-slot cap is dropped here (Sparse() returns
+            // nullptr). Debug asserts in AcquireSparseSlot; a creator has no return channel
+            // for spec s3.2's Release refusal (ledgered deviation).
+            switch (PackMemberKind<C>(id))
+            {
+                case StorageKind::Table:   // the live descriptor says Table (a rebound registration)
+                    (void)m_archetypeManager->AddComponent<C>(entity);
+                    break;
+                case StorageKind::Sparse:
+                    if (const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity); rec && rec->chunk) ASTRA_LIKELY
+                    {
+                        const SparseSet* set = m_componentStorage->FindSparse(id);
+                        if (!set || !set->Contains(entity)) ASTRA_LIKELY
+                            (void)SparseAttach(entity, *rec, id, nullptr);
+                    }
+                    break;
+                case StorageKind::Universal:
+                    break;   // ConstructUniversals builds it: named only, so default + init
+            }
+        }
+
+        template<Component... Components>
+        void PlaceDefault(Entity entity)
+        {
+            [&]<typename... Ts>(std::type_identity<std::tuple<Ts...>>)
+            {
+                if (!AnyUniversal<Ts...>()) ASTRA_LIKELY
+                {
+                    m_archetypeManager->AddEntity<Ts...>(entity);   // today's path
+                }
+                else
+                {
+                    // ONE placement in the non-universal Table subset; a named universal is
+                    // built by ConstructUniversals (default + init).
+                    m_archetypeManager->AddEntityByMask(entity, CreationMask<Ts...>());
+                }
+            }(std::type_identity<Detail::TypesWithStorage<Storage::Table, Components...>>{});
+
+            [&]<typename... Ss>(std::type_identity<std::tuple<Ss...>>)
+            {
+                (PlaceDefaultMember<Ss>(entity), ...);
+            }(std::type_identity<Detail::TypesWithStorage<Storage::Sparse, Components...>>{});
+        }
+
+        template<Component... Components>
+        void PlaceDefaultBatch(std::span<Entity> entities)
+        {
+            [&]<typename... Ts>(std::type_identity<std::tuple<Ts...>>)
+            {
+                if (!AnyUniversal<Ts...>()) ASTRA_LIKELY
+                {
+                    m_archetypeManager->AddEntities<Ts...>(entities);   // today's batched path
+                }
+                else
+                {
+                    // ONE batched placement in the non-universal Table subset (the declared
+                    // universals are per registry, so every entity shares the mask).
+                    m_archetypeManager->AddEntitiesByMask(entities, CreationMask<Ts...>());
+                }
+            }(std::type_identity<Detail::TypesWithStorage<Storage::Table, Components...>>{});
+
+            [&]<typename... Ss>(std::type_identity<std::tuple<Ss...>>)
+            {
+                if constexpr (sizeof...(Ss) > 0)
+                {
+                    for (Entity e : entities)
+                    {
+                        (PlaceDefaultMember<Ss>(e), ...);
+                    }
+                }
+            }(std::type_identity<Detail::TypesWithStorage<Storage::Sparse, Components...>>{});
+        }
+
+        // One SUPPLIED member that lives outside the creation archetype, by its runtime kind.
+        // An rvalue is moved straight from the caller's object; an lvalue is copied through
+        // a temporary, as ArchetypeChunk's ConstructComponentAt does. Universal members are
+        // recorded in `supplied`, so ConstructUniversals skips their default + init. A
+        // Table-kind Table-trait member was already constructed in the slot (PlaceWith) and
+        // is left alone here, so its value is consumed exactly once.
+        template<typename V>
+        void PlaceValueMember(Entity entity, ComponentID* supplied, size_t& suppliedCount, V&& value)
+        {
+            using C = std::decay_t<V>;
+            m_componentRegistry->RegisterComponent<C>();
+            const ComponentID id = TypeID<C>::Value();
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return;
+
+            const auto moveInto = [&](auto&& sink)
+            {
+                if constexpr (std::is_rvalue_reference_v<V&&> && !std::is_const_v<std::remove_reference_t<V>>)
+                {
+                    (void)sink(static_cast<void*>(std::addressof(value)));
+                }
+                else
+                {
+                    C temp(value);
+                    (void)sink(static_cast<void*>(std::addressof(temp)));
+                }
+            };
+
+            switch (PackMemberKind<C>(id))
+            {
+                case StorageKind::Table:
+                    // Only a Sparse-trait type whose live descriptor says Table (a rebound
+                    // registration) moves in here, like an add.
+                    if constexpr (StorageOfV<C> == Storage::Sparse)
+                        (void)m_archetypeManager->AddComponent<C>(entity, std::forward<V>(value));
+                    break;
+                case StorageKind::Sparse:
+                    if (const EntityRecord* rec = m_archetypeManager->GetEntityRecord(entity); rec && rec->chunk) ASTRA_LIKELY
+                    {
+                        const SparseSet* set = m_componentStorage->FindSparse(id);
+                        if (!set || !set->Contains(entity)) ASTRA_LIKELY
+                            moveInto([&](void* src) { return SparseAttach(entity, *rec, id, src); });
+                    }
+                    break;
+                case StorageKind::Universal:
+                    if (UniversalColumn* column = m_componentStorage->Universal(id); column && !column->IsLive(entity)) ASTRA_LIKELY
+                    {
+                        moveInto([&](void* src) { return column->ConstructMove(entity, src); });
+                        supplied[suppliedCount++] = id;
+                    }
+                    break;
+            }
+        }
+
+        // A Table-trait member's value, constructed in the freshly allocated creation slot
+        // unless this registry declares the type universal (PlaceValueMember moves that one
+        // into its column).
+        template<typename V>
+        void ConstructPlacedValue(ArchetypeChunk& chunk, size_t index, V&& value) const
+        {
+            if (PlacedInArchetype(TypeID<std::decay_t<V>>::Value()))
+                chunk.ConstructComponentAt(index, std::forward<V>(value));
+        }
+
+        // Places a value pack (spec s7.1). Table-trait members go to the archetype in ONE
+        // placement: today's AddEntityWith, or, when one of them is declared universal, the
+        // non-universal subset's archetype with each value constructed in the new slot and
+        // the universal values moved into their columns (final review I1). Sparse-trait
+        // members go to their sets afterwards. The forwarding tuple carries every value
+        // exactly once: each member is consumed either by ConstructPlacedValue or by
+        // PlaceValueMember, never by both (both test the same declaration mask).
+        template<typename... Vs>
+        void PlaceWith(Entity entity, ComponentID* supplied, size_t& suppliedCount, Vs&&... values)
+        {
+            auto refs = std::forward_as_tuple(std::forward<Vs>(values)...);
+            using Refs = decltype(refs);
+
+            [&]<std::size_t... I>(std::index_sequence<I...>)
+            {
+                if constexpr (sizeof...(I) == 0)
+                {
+                    m_archetypeManager->AddEntity<>(entity);
+                }
+                else
+                {
+                    if (!AnyUniversal<std::decay_t<std::tuple_element_t<I, Refs>>...>()) ASTRA_LIKELY
+                    {
+                        m_archetypeManager->AddEntityWith(entity, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))...);
+                    }
+                    else
+                    {
+                        m_archetypeManager->AddEntityByMaskWith(entity, CreationMask<std::decay_t<std::tuple_element_t<I, Refs>>...>(),
+                            [&](ArchetypeChunk& chunk, size_t index)
+                            {
+                                (ConstructPlacedValue(chunk, index, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))), ...);
+                            });
+                        (PlaceValueMember(entity, supplied, suppliedCount, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))), ...);
+                    }
+                }
+            }(Detail::StorageIndexSeq<Storage::Table, Vs...>{});
+
+            [&]<std::size_t... I>(std::index_sequence<I...>)
+            {
+                (PlaceValueMember(entity, supplied, suppliedCount, std::forward<std::tuple_element_t<I, Refs>>(std::get<I>(refs))), ...);
+            }(Detail::StorageIndexSeq<Storage::Sparse, Vs...>{});
+        }
+
+        // ComponentAdded for one pack member, by its effective kind (PackMemberKind: no
+        // descriptor read for a Table-trait member, final review M7). Table: the chunk slot,
+        // today's payload; Sparse: the set element, or the per-type static for a tag.
+        // Universal members are skipped here because EmitUniversalAdded covers each
+        // universal exactly once.
+        template<Component C>
+        void EmitAddedFor(Entity entity)
+        {
+            const ComponentID id = TypeID<C>::Value();
+            if (id >= MAX_COMPONENTS) ASTRA_UNLIKELY
+                return;
+            switch (PackMemberKind<C>(id))
+            {
+                case StorageKind::Table:
+                    if (const EntityRecord* record = m_archetypeManager->GetEntityRecord(entity))
+                        m_signalManager.Emit<Events::ComponentAdded>(entity, id, record->archetype->GetComponent<C>(record->location));
+                    break;
+                case StorageKind::Sparse:
+                    if (C* component = StoreGet<C>(entity))
+                        m_signalManager.Emit<Events::ComponentAdded>(entity, id, component);
+                    break;
+                case StorageKind::Universal:
+                    break;
+            }
+        }
+
+        template<Component... Components>
+        void EmitPackAdded(Entity entity)
+        {
+            if constexpr (sizeof...(Components) > 0)
+            {
+                if (!m_signalManager.IsSignalEnabled(Signal::ComponentAdded)) ASTRA_LIKELY
+                    return;
+                (EmitAddedFor<Components>(entity), ...);
+            }
+        }
+
+        // Batch twin of the single-entity tail: every EntityCreated first, then the pack's
+        // ComponentAdded for every entity, then the universals' (today's batch order).
+        template<Component... Components>
+        void EmitBatchCreated(std::span<Entity> made)
+        {
+            if (m_signalManager.IsSignalEnabled(Signal::EntityCreated))
+            {
+                for (Entity e : made)
+                    m_signalManager.Emit<Events::EntityCreated>(e);
+            }
+            if (m_signalManager.IsSignalEnabled(Signal::ComponentAdded))
+            {
+                for (Entity e : made)
+                    EmitPackAdded<Components...>(e);
+            }
+            EmitUniversalAddedBatch(made);   // today's batch order: the pack's ComponentAdded for every entity, then the universals'
+        }
+
         /**
          * Internal helper to load registry from reader
          */
@@ -1873,9 +3160,32 @@ namespace Astra
             // Create new ArchetypeManager pointing at the (now version-restored)
             // shared record table, then deserialize archetype/location into it.
             registry->m_archetypeManager = std::make_shared<ArchetypeManager>(componentRegistry, config.chunkPoolConfig, &registry->m_entityManager.GetRecordTable());
-            if (!registry->m_archetypeManager->Deserialize(reader))
+            // Storage policies (spec 2026-10-01 s4): rebuilt fresh beside the archetype manager,
+            // from the CALLER's Config, so the loaded registry's universal set is the loading
+            // build's (storage-agnostic load, s8.3), never the archive's. Must stay BEFORE
+            // m_archetypeManager->Deserialize. Load-bearing: the stores' tick source must point
+            // into the rebuilt ArchetypeManager, not the constructor's one.
+            registry->m_componentStorage = std::make_shared<ComponentStorage>(componentRegistry, config.universal);
+            // The stores stamp from the archetype manager's counter. Both were just
+            // rebuilt, so re-point them; a stale pointer would be a use-after-free.
+            registry->m_componentStorage->SetTickSource(registry->m_archetypeManager->TickSource());
+            registry->m_archetypeManager->SetComponentStorage(registry->m_componentStorage.get());
+            registry->m_hasUniversals = registry->m_componentStorage->HasUniversals();
+            const StorageLoadHooks hooks{registry.get(), &LoadHookIsDiverted, &LoadHookAcquire, &LoadHookSetDisabled};
+            if (!registry->m_archetypeManager->Deserialize(reader, &hooks))
             {
                 return Result<std::unique_ptr<Registry>, SerializationError>::Err(SerializationError::CorruptedData);
+            }
+
+            // Format v6 (s8.1): the ComponentStorage block sits between the
+            // archetype records and the relationship graph. v5 and older have none.
+            if (reader.GetVersion() >= 6)
+            {
+                SerializationError blockError = SerializationError::CorruptedData;
+                if (!registry->m_componentStorage->Deserialize(reader, *registry, &blockError))
+                {
+                    return Result<std::unique_ptr<Registry>, SerializationError>::Err(blockError);
+                }
             }
             
             // Deserialize RelationshipGraph
@@ -1901,13 +3211,242 @@ namespace Astra
             {
                 return Result<std::unique_ptr<Registry>, SerializationError>::Err(*checksumResult.GetError());
             }
-            
+
+            // s8.3 fix-ups: universal defaults + init, then the chunk presence
+            // mirror derived from the stores.
+            if (!registry->FinishStorageLoad())
+            {
+                return Result<std::unique_ptr<Registry>, SerializationError>::Err(SerializationError::CorruptedData);
+            }
+
             return Result<std::unique_ptr<Registry>, SerializationError>::Ok(std::move(registry));
         }
         
+        // StorageLoadHooks for LoadInternal (s8.3). ctx is the registry being
+        // loaded; its EntityManager is already restored, so entity ids from the
+        // archive are validated before any store is touched. The hooks read
+        // m_componentStorage at call time, so they always reach the current store.
+        static bool LoadHookIsDiverted(void* ctx, ComponentID id)
+        {
+            return static_cast<Registry*>(ctx)->m_componentStorage->KindOf(id) != StorageKind::Table;
+        }
+        static void* LoadHookAcquire(void* ctx, const ComponentDescriptor& desc, Entity e)
+        {
+            auto* self = static_cast<Registry*>(ctx);
+            if (!self->IsValid(e))
+                return nullptr;
+            return Detail::AcquireLoadTarget(*self->m_componentStorage, desc, e);
+        }
+        static void LoadHookSetDisabled(void* ctx, ComponentID id, Entity e)
+        {
+            Detail::SetLoadedDisabled(*static_cast<Registry*>(ctx)->m_componentStorage, id, e);
+        }
+
+        // A typed add of a Universal id is a present-component no-op: true, no signal, no
+        // store write. It stays truthful after a module unload (spec s4.4): once the column
+        // is dropped "always present" is SUSPENDED for the type, an entity whose slot is not
+        // live does not hold it, and an add must neither lie (true) nor revive the slot, so
+        // it answers false. Once the type is registered again, the next create rebuilds
+        // the column and fills it for EVERY live entity (RefillSuspendedUniversals), so
+        // "always present" holds again and no column is ever partially live.
+        ASTRA_NODISCARD bool UniversalAddAnswer(Entity entity, ComponentID id) const noexcept
+        {
+            return StoreLookup(entity, id) != nullptr;
+        }
+
+        // s4.4: every Registry, including one built by Load, which goes through
+        // these constructors, subscribes once to its ComponentRegistry's
+        // store-release hooks. Registry is non-copyable and non-movable, so `this`
+        // stays valid for the subscription's whole life.
+        // s4.4 "until it is registered again": a Universal released at module unload is
+        // remembered here. At the head of every creation funnel, once such a type's
+        // descriptor is registered again, ONE FillMissingUniversals() walk rebuilds the
+        // column for every live entity (default + init, the same fill Load runs), so a
+        // column is never partially live and Has/Get/views all agree. Runs before the new
+        // entity exists, so the new entity takes the ordinary construct path. One branch
+        // while nothing is suspended; a type that stays unregistered costs nothing here.
+        ASTRA_FORCEINLINE void RefillSuspendedUniversals()
+        {
+            if (m_suspendedUniversals.empty()) ASTRA_LIKELY
+                return;
+            RefillSuspendedUniversalsSlow();
+        }
+
+        ASTRA_NOINLINE void RefillSuspendedUniversalsSlow()
+        {
+            bool reregistered = false;
+            for (size_t i = m_suspendedUniversals.size(); i-- > 0;)
+            {
+                if (m_componentRegistry->GetComponentDescriptor(m_suspendedUniversals[i]) != nullptr)
+                {
+                    m_suspendedUniversals.erase(m_suspendedUniversals.begin() + static_cast<std::ptrdiff_t>(i));
+                    reregistered = true;
+                }
+            }
+            if (reregistered)
+                FillMissingUniversals();
+        }
+
+        void InstallStoreReleaseHook()
+        {
+            if (m_componentRegistry)
+                m_storeReleaseHook = m_componentRegistry->AddStoreReleaseHook(this, &Registry::OnStoreRelease);
+        }
+
+        static void OnStoreRelease(void* ctx, ComponentID id, const ComponentDescriptor& departing)
+        {
+            static_cast<Registry*>(ctx)->ReleaseStoredComponent(id, departing);
+        }
+
+        // A module entry is departing (spec s4.4, R4). If this registry's store for
+        // `id` was built from that entry's descriptor, matched by its destructor
+        // (the code that is about to be unmapped), then:
+        //   1. destroy every element and drop the store, freeing the slot;
+        //   2. release the slot's presence block in every chunk, BEFORE anything can
+        //      acquire the slot again, so no block outlives its slot (P1 holds for the
+        //      former holders and a reused slot starts clean).
+        // A store built from a different module's entry (a shadowed or overriding
+        // registration) is left alone. Runs host-serialized, like registration, on the
+        // registry's own context.
+        // Edge: the stores are probed by id, NOT through KindOf. KindOf reads the LIVE
+        // descriptor, so a purged shadowed Sparse entry whose live override says Table
+        // would otherwise be skipped and keep a dangling destructor.
+        // Universal: its spec stays declared, so the type is SUSPENDED afterwards (see
+        // UniversalAddAnswer; Has/Get answer absent, Remove is a quiet false, views skip
+        // it) until RefillSuspendedUniversals rebuilds and fills the column.
+        void ReleaseStoredComponent(ComponentID id, const ComponentDescriptor& departing)
+        {
+            ComponentStorage& storage = *m_componentStorage;
+            bool holdsDeparting = false;
+            bool wasUniversal = false;
+            if (const SparseSet* set = storage.FindSparse(id))          // never create a store here
+                holdsDeparting = set->Descriptor().destruct == departing.destruct;
+            else if (const UniversalColumn* column = storage.FindUniversal(id))
+                holdsDeparting = wasUniversal = column->Descriptor().destruct == departing.destruct;
+            if (!holdsDeparting)
+                return;
+            if (wasUniversal && std::find(m_suspendedUniversals.begin(), m_suspendedUniversals.end(), id) == m_suspendedUniversals.end())
+                m_suspendedUniversals.push_back(id);   // refilled when it is registered again
+
+            const int slot = storage.SparseSlotOf(id);   // Sparse, or an enableable Universal's mirror slot
+            storage.ReleaseComponent(id);
+            if (slot < 0)
+                return;
+            m_archetypeManager->BumpSparseStructuralCounter();   // membership changed for every former holder
+            for (Archetype* archetype : m_archetypeManager->GetArchetypes())
+                for (const auto& chunk : archetype->GetChunks())
+                    if (chunk) chunk->ReleaseSparseBlock(static_cast<uint16_t>(slot));
+        }
+
+        // Post-load storage fix-ups (spec s8.2/s8.3), run once the checksum verifies.
+        // The staged Table-now columns land first (one batched move per (source,
+        // destination) pair), so universals and presence see the final archetypes.
+        bool FinishStorageLoad()
+        {
+            if (!m_archetypeManager->ApplyMigratedTableComponents(m_componentStorage->PendingTableMigrations()))
+                return false;
+            FillMissingUniversals();
+            return DeriveStoragePresence();
+        }
+
+        // s8.3 bullet 3 + s4.2 order: an entity the archive restored without a declared
+        // Universal component gets default construction, then the registry's init
+        // (Arcane: a fresh GUID). Explicitly archived values are never re-initialised:
+        // they are passed as `supplied`, exactly like a caller-supplied value at creation,
+        // so this is ConstructUniversals' two passes (construct every missing universal,
+        // then run the inits) over the declared, deduplicated specs.
+        void FillMissingUniversals()
+        {
+            const std::vector<UniversalSpec>& specs = m_componentStorage->UniversalSpecs();
+            if (specs.empty())
+                return;
+            std::vector<ComponentID> live;
+            live.reserve(specs.size());
+            for (Archetype* archetype : m_archetypeManager->GetArchetypes())
+            {
+                for (const auto& chunk : archetype->GetChunks())
+                {
+                    if (!chunk) continue;
+                    const auto& entities = chunk->GetEntities();
+                    for (size_t i = 0; i < chunk->GetCount(); ++i)
+                    {
+                        const Entity e = entities[i];
+                        live.clear();
+                        for (const UniversalSpec& spec : specs)
+                        {
+                            const UniversalColumn* column = m_componentStorage->FindUniversal(spec.id);
+                            if (column && column->IsLive(e))
+                                live.push_back(spec.id);
+                        }
+                        if (live.size() != specs.size())
+                            m_componentStorage->ConstructUniversals(e, live.data(), live.size());
+                    }
+                }
+            }
+        }
+
+        // Chunk presence blocks are never serialized (s8.2): rebuild P1 (present
+        // bits) and P3 (disabled mirror) from the stores, now that every entity is
+        // located. A stored entity without a location is a corrupt archive. A loaded
+        // Sparse component's coarse version is stamped at the current tick (Table's
+        // loaded columns stamp their column version on load; RULINGS Task 32).
+        bool DeriveStoragePresence()
+        {
+            ComponentStorage& storage = *m_componentStorage;
+            for (size_t raw = 0; raw < MAX_COMPONENTS; ++raw)
+            {
+                const auto id = static_cast<ComponentID>(raw);
+                const StorageKind kind = storage.KindOf(id);
+                if (kind == StorageKind::Sparse)
+                {
+                    const int slot = storage.SparseSlotOf(id);
+                    SparseSet* set = storage.FindSparse(id);
+                    if (slot < 0 || !set || set->Size() == 0) continue;
+                    const Entity* dense = set->Entities();
+                    for (size_t d = 0; d < set->Size(); ++d)
+                    {
+                        const EntityRecord* rec = m_archetypeManager->GetEntityRecord(dense[d]);
+                        if (!rec || !rec->chunk)
+                            return false;
+                        const size_t index = rec->location.GetEntityIndex();
+                        rec->chunk->SetSparsePresent(static_cast<uint16_t>(slot), index, true);
+                        if (set->IsDisabled(dense[d]))
+                            rec->chunk->SetSparseDisabled(static_cast<uint16_t>(slot), index, true);
+                    }
+                    storage.StampCoarse(id, CurrentTick());
+                }
+                else if (kind == StorageKind::Universal)
+                {
+                    UniversalColumn* column = storage.FindUniversal(id);
+                    if (!column || !column->Descriptor().isEnableable) continue;
+                    bool ok = true;
+                    column->ForEachLive([&](Entity e, const void*)
+                    {
+                        if (!ok || !column->IsDisabled(e)) return;
+                        const int slot = storage.AcquireSparseSlot(id);   // s5.1: an enableable universal mirrors through a slot
+                        const EntityRecord* rec = m_archetypeManager->GetEntityRecord(e);
+                        if (slot < 0 || !rec || !rec->chunk) { ok = false; return; }
+                        rec->chunk->SetSparseDisabled(static_cast<uint16_t>(slot), rec->location.GetEntityIndex(), true);
+                    });
+                    if (!ok)
+                        return false;
+                }
+            }
+            return true;
+        }
+
         EntityManager m_entityManager;
         std::shared_ptr<ComponentRegistry> m_componentRegistry;
         std::shared_ptr<ArchetypeManager> m_archetypeManager;
+        // Storage policies (spec 2026-10-01 s4): built in every ctor from Config::universal,
+        // cleared in place by Clear(), rebuilt fresh by LoadInternal. Declared right after
+        // m_archetypeManager: every ctor initializes it in that order.
+        std::shared_ptr<ComponentStorage> m_componentStorage;
+        // HasUniversals() of m_componentStorage, cached on the Registry itself: the typed
+        // Get/Has/Add/Remove routing tests it on EVERY call, and the storage's own answer is
+        // a shared_ptr hop plus two vector-pointer loads. The set of universals is fixed at
+        // ComponentStorage construction (ctor / LoadInternal), the only writers of this flag.
+        bool m_hasUniversals = false;
         std::shared_ptr<RelationshipGraph> m_relationshipGraph;
         SignalManager m_signalManager;
         ResourceStorage m_resourceStorage;
@@ -1917,6 +3456,125 @@ namespace Astra
         std::shared_ptr<IWorkScheduler> m_workScheduler;  // null = sequential inline fallback
         Config m_config;   // retained so Clear()/Load() preserve pool + storage policy
         inline static std::atomic<std::uint64_t> s_nextInstanceId{1};   // 0 is never assigned
+        uint64_t m_storeReleaseHook = 0;   // ComponentRegistry store-release subscription (s4.4)
+        std::vector<ComponentID> m_suspendedUniversals;   // unloaded Universal types awaiting re-registration (s4.4)
         std::uint64_t m_instanceId;   // last member: initialized last in every ctor
     };
+
+    namespace Detail
+    {
+        // One stored component's payload (spec s8.2), read into whatever storage the
+        // LOADING registry assigns (s8.3). Entities are untrusted: each must be live
+        // in the registry being loaded, ascending and unique. The archive's flags decide
+        // the stream layout, never this build's descriptor (IM-9): values the loading
+        // build cannot decode (it registers a tag) are refused.
+        inline bool ReadStoredPayload(BinaryReader& r, ComponentStorage& storage, const Registry& registry,
+                                      const ComponentDescriptor& desc, uint8_t flags, uint32_t count)
+        {
+            const bool hasValues = (flags & StorageFormat::FLAG_HAS_VALUES) != 0;
+            if (hasValues && (desc.size == 0 || !desc.deserializeVersioned))
+                return false;
+            if (r.CountExceedsRemaining(count, sizeof(Entity)))
+                return false;
+            std::vector<Entity> entities(count);
+            for (Entity& e : entities) r(e);
+            if (r.HasError())
+                return false;
+            for (size_t i = 0; i < entities.size(); ++i)
+            {
+                if (!registry.IsValid(entities[i]))
+                    return false;
+                if (i > 0 && entities[i].GetID() <= entities[i - 1].GetID())
+                    return false;
+            }
+
+            const bool hasDisabled = (flags & StorageFormat::FLAG_HAS_DISABLED) != 0;
+            if (storage.KindOf(desc.id) == StorageKind::Table)
+            {
+                // s8.3 bullet 2: archived Sparse/Universal, Table here. Stage the values
+                // (and disabled bits); FinishStorageLoad moves them into their archetypes.
+                StagedTableColumn staged(desc, entities.size());
+                const bool ok = StorageFormat::ReadElementRun(r, entities.size(), desc, hasValues, hasDisabled,
+                    [&](size_t i) { staged.EntityAt(i) = entities[i]; return staged.At(i); },
+                    [&](size_t i) { staged.SetDisabled(i, true); });
+                if (!ok)
+                    return false;
+                storage.PendingTableMigrations().push_back(std::move(staged));
+                return true;
+            }
+            return StorageFormat::ReadElementRun(r, entities.size(), desc, hasValues, hasDisabled,
+                [&](size_t i) { return AcquireLoadTarget(storage, desc, entities[i]); },
+                [&](size_t i) { SetLoadedDisabled(storage, desc.id, entities[i]); });
+        }
+    }
+
+    // Format v6 block reader (spec s8.2, s8.3). Defined after Registry is complete:
+    // it validates every entity against the registry being loaded. A refused block may
+    // leave partially inserted elements behind; Load discards the whole registry then.
+    inline bool ComponentStorage::Deserialize(BinaryReader& r, Registry& registry, SerializationError* error)
+    {
+        const auto refuse = [&](SerializationError why)
+        {
+            if (error)
+                *error = why;
+            return false;
+        };
+        const auto corrupt = [&]
+        {
+            return refuse(r.HasError() ? r.GetError() : SerializationError::CorruptedData);
+        };
+
+        uint32_t stored = 0;
+        r(stored);
+        if (r.HasError() || r.CountExceedsRemaining(stored, StorageFormat::BLOCK_HEADER_BYTES))
+            return corrupt();
+        const ComponentRegistry* components = registry.GetComponentRegistry();
+        if (!components)
+            return corrupt();
+
+        uint64_t previousHash = 0;
+        for (uint32_t b = 0; b < stored; ++b)
+        {
+            uint64_t hash = 0;
+            uint32_t version = 0;   // informational: per-element versions drive migration
+            uint8_t kind = 0;
+            uint8_t flags = 0;
+            uint32_t count = 0;
+            r(hash)(version)(kind)(flags)(count);
+            if (r.HasError())
+                return corrupt();
+            if (b > 0 && hash <= previousHash)
+                return corrupt();   // sorted, unique (s8.2)
+            previousHash = hash;
+            if (kind != StorageFormat::KIND_SPARSE && kind != StorageFormat::KIND_UNIVERSAL)
+                return corrupt();
+            if ((flags & ~StorageFormat::FLAG_MASK) != 0 || count == 0)
+                return corrupt();   // the writer never emits unknown flags or empty blocks
+
+            const ComponentDescriptor* desc = components->GetComponentDescriptorByHash(hash);
+            if (!desc)
+                return refuse(SerializationError::UnknownComponent);   // unregistered in the loading build
+
+            // Same gate as the writer: LZ4 archives frame each component's payload.
+            std::vector<uint8_t> inflated;
+            std::optional<BinaryReader> sub;
+            BinaryReader* in = &r;
+            if (r.GetCompressionMode() == CompressionMode::LZ4)
+            {
+                auto block = r.ReadCompressedBlock();
+                if (block.IsErr())
+                    return refuse(*block.GetError());
+                inflated = std::move(*block.GetValue());
+                sub.emplace(std::span<const std::byte>(reinterpret_cast<const std::byte*>(inflated.data()), inflated.size()));
+                sub->SetChecksumEnabled(false);
+                in = &*sub;
+            }
+
+            if (!Detail::ReadStoredPayload(*in, *this, registry, *desc, flags, count))
+                return corrupt();
+            if (in != &r && in->GetRemaining() != 0)
+                return corrupt();   // a framed block must be consumed exactly
+        }
+        return r.HasError() ? corrupt() : true;
+    }
 }

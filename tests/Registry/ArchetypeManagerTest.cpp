@@ -1103,3 +1103,80 @@ TEST_F(ArchetypeManagerTest, DescriptorTrivialDestructibilityFlags)
     static_assert(std::is_trivially_destructible_v<Position>);
     static_assert(!std::is_trivially_destructible_v<Tracked>);
 }
+
+// S4 fix round (Task 42): the *WithID forms the Relations Table traversals call with an id
+// resolved once per object must answer exactly as the typed forms (present, absent, stale,
+// out-of-range id) and stamp exactly the same column.
+TEST_F(ArchetypeManagerTest, WithIDFormsMatchTheTypedForms)
+{
+    using namespace Astra::Test;
+    const Astra::ComponentID posId = Astra::TypeID<Position>::Value();
+    const Astra::ComponentID velId = Astra::TypeID<Velocity>::Value();
+    Astra::Entity e = testEntities[0];
+    manager->AddEntity(e);
+    manager->AddComponent<Position>(e, 1.f, 2.f, 3.f);
+
+    // Present: same pointer, presence true.
+    ASSERT_NE(manager->GetComponent<Position>(e), nullptr);
+    EXPECT_EQ(manager->GetComponentWithID<Position>(e, posId), manager->GetComponent<Position>(e));
+    EXPECT_TRUE(manager->HasComponentWithID(e, posId));
+
+    // Absent component: nullptr / false on both forms.
+    EXPECT_EQ(manager->GetComponentWithID<Velocity>(e, velId), nullptr);
+    EXPECT_EQ(manager->GetComponentMutWithID<Velocity>(e, velId), nullptr);
+    EXPECT_FALSE(manager->HasComponentWithID(e, velId));
+
+    // An id past the ceiling is refused, not read out of bounds.
+    EXPECT_EQ(manager->GetComponentWithID<Position>(e, static_cast<Astra::ComponentID>(Astra::MAX_COMPONENTS)), nullptr);
+    EXPECT_EQ(manager->GetComponentMutWithID<Position>(e, static_cast<Astra::ComponentID>(Astra::MAX_COMPONENTS)), nullptr);
+
+    // The mutable form returns the same pointer and stamps the column with the current tick.
+    const Astra::Tick now = manager->AdvanceTick();
+    Position* p = manager->GetComponentMutWithID<Position>(e, posId);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(p, manager->GetComponent<Position>(e));
+    const Astra::EntityRecord* rec = manager->GetEntityRecord(e);
+    ASSERT_NE(rec, nullptr);
+    const int col = rec->archetype->GetColumnMeta().idToColumn[posId];
+    ASSERT_GE(col, 0);
+    EXPECT_EQ(rec->chunk->GetColumnVersion(col), now);
+
+    // Task 42 fix 2 (re-review M4): a change-tracked T also gets the entity's `changed` tick.
+    componentRegistry->RegisterComponents<TrackedPos, Player, EnTag>();
+    const Astra::ComponentID trackedId = Astra::TypeID<TrackedPos>::Value();
+    manager->AddComponent<TrackedPos>(e, 4.f, 5.f, 6.f);
+    const Astra::Tick trackedNow = manager->AdvanceTick();
+    TrackedPos* tp = manager->GetComponentMutWithID<TrackedPos>(e, trackedId);
+    ASSERT_NE(tp, nullptr);
+    EXPECT_EQ(tp->x, 4.f);
+    rec = manager->GetEntityRecord(e);
+    const int tcol = rec->archetype->GetColumnMeta().idToColumn[trackedId];
+    ASSERT_GE(tcol, 0);
+    ASSERT_NE(rec->chunk->GetTicks(tcol), nullptr);
+    EXPECT_EQ(rec->chunk->GetTicks(tcol)[rec->location.GetEntityIndex()].changed, trackedNow);
+    EXPECT_EQ(rec->chunk->GetColumnVersion(tcol), trackedNow);
+
+    // Tag forms: a present tag yields the typed form's static instance and stamps nothing
+    // (an enableable tag's bit-only column keeps its version); an absent tag misses.
+    const Astra::ComponentID playerId = Astra::TypeID<Player>::Value();
+    const Astra::ComponentID enTagId = Astra::TypeID<EnTag>::Value();
+    EXPECT_EQ(manager->GetComponentMutWithID<Player>(e, playerId), nullptr);
+    manager->AddComponent<Player>(e);
+    manager->AddComponent<EnTag>(e);
+    rec = manager->GetEntityRecord(e);
+    const int enCol = rec->archetype->GetColumnMeta().idToColumn[enTagId];
+    ASSERT_GE(enCol, 0);   // the enableable tag's bit-only column
+    const Astra::Tick enBefore = rec->chunk->GetColumnVersion(enCol);
+    manager->AdvanceTick();
+    EXPECT_NE(manager->GetComponentMutWithID<Player>(e, playerId), nullptr);
+    EXPECT_EQ(manager->GetComponentMutWithID<Player>(e, playerId), manager->GetComponent<Player>(e));
+    EXPECT_NE(manager->GetComponentMutWithID<EnTag>(e, enTagId), nullptr);
+    EXPECT_EQ(manager->GetComponentMutWithID<EnTag>(e, enTagId), manager->GetComponent<EnTag>(e));
+    EXPECT_EQ(rec->chunk->GetColumnVersion(enCol), enBefore);
+
+    // Stale handle: every form misses.
+    manager->RemoveEntity(e);
+    EXPECT_EQ(manager->GetComponentWithID<Position>(e, posId), nullptr);
+    EXPECT_EQ(manager->GetComponentMutWithID<Position>(e, posId), nullptr);
+    EXPECT_FALSE(manager->HasComponentWithID(e, posId));
+}

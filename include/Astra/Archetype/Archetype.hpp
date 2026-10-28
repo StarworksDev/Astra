@@ -33,6 +33,7 @@
 #include "../Entity/Entity.hpp"
 #include "../Serialization/BinaryReader.hpp"
 #include "../Serialization/BinaryWriter.hpp"
+#include "../Serialization/StorageMigration.hpp"
 #include "ArchetypeChunkPool.hpp"
 #include "EntityLocation.hpp"
 
@@ -62,7 +63,7 @@ namespace Astra
         ~Archetype() = default;
 
     private:
-        // Builds m_columnMeta from m_componentDescriptors: excludes tags (desc.size == 0) from
+        // Builds m_columnMeta from m_componentDescriptors: excludes NON-enableable tags (desc.size == 0) from
         // columns, sorts columns ascending by id (required by the merge-join used for
         // cross-archetype moves), maps id -> column index, and flags the archetype complex if
         // any column is not trivially copyable. Called once, from Initialize(), immediately
@@ -72,7 +73,11 @@ namespace Astra
             m_columnMeta = ArchetypeColumnMeta{};   // resets idToColumn to -1, columnCount/isComplex to 0/false
             for (const ComponentDescriptor& desc : m_componentDescriptors)
             {
-                if (desc.size == 0) continue;       // tag: no storage column (idToColumn stays -1)
+                // A non-enableable tag has no column (idToColumn stays -1). An ENABLEABLE tag
+                // gets a BIT-ONLY column (spec 2026-10-01 s3.2): stride 0, no data region, a
+                // disabled-word region like any enableable column -- so SetEnabledByID, every
+                // view filter and every bit carry work unchanged through idToColumn.
+                if (desc.size == 0 && !desc.isEnableable) continue;
                 const uint16_t col = m_columnMeta.columnCount++;
                 m_columnMeta.columns[col] = { desc.id, static_cast<uint32_t>(desc.size), &desc };
                 if (!desc.is_trivially_copyable) m_columnMeta.isComplex = true;
@@ -171,6 +176,8 @@ namespace Astra
             size_t offset = 0;
             for (uint16_t c = 0; c < m_columnMeta.columnCount; ++c)
             {
+                if (m_columnMeta.columns[c].stride == 0)
+                    continue;   // bit-only column (enableable tag): no data, no alignment -- mirrors InitializeColumns
                 offset = (offset + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1);
                 offset += static_cast<size_t>(m_columnMeta.columns[c].stride) * cap;
             }
@@ -325,9 +332,11 @@ namespace Astra
                 : 0;
 
             // Change-detection version region (ArchetypeChunk::InitializeColumns):
-            // 8-byte align slack + one Tick per storage column. Folded into the
-            // overhead so ComputeCapacityForBytes' estimate stays a guaranteed fit.
-            alignmentOverhead += 8 + nonEmptyComponents * sizeof(Tick);
+            // 8-byte align slack + one Tick per COLUMN -- an enableable tag's bit-only
+            // column included (columnCount equals nonEmptyComponents unless one is
+            // present, so every other archetype's layout is byte-identical). Folded into
+            // the overhead so ComputeCapacityForBytes' estimate stays a guaranteed fit.
+            alignmentOverhead += 8 + static_cast<size_t>(m_columnMeta.columnCount) * sizeof(Tick);
 
             m_perEntitySize = perEntitySize;
             m_alignmentOverhead = alignmentOverhead;
@@ -769,6 +778,12 @@ namespace Astra
                 }
                 ++a;
             }
+
+            // Sparse presence carry (storage policies, spec s5.3). Presence follows the
+            // entity whatever the column sets are; the source bits are cleared by the
+            // caller's swap-remove of the source.
+            if (srcChunk->HasSparseBlocks()) ASTRA_UNLIKELY
+                dstChunk->CarrySparseBits(*srcChunk, srcEntityIndex, dstEntityIndex);
         }
 
         template<Component T>
@@ -956,14 +971,14 @@ namespace Astra
                     writer(entities[i]);
                 }
                 
-                // Write component arrays (SOA layout)
+                // Write component arrays (SOA layout). One block per COLUMN: every data
+                // component, and every enableable tag's bit-only column (zero data bytes +
+                // its disabled section, spec 2026-10-01 s3.2). A non-enableable tag has no
+                // column and writes nothing -- byte-identical to the earlier format.
                 for (const auto& desc : m_componentDescriptors)
                 {
-                    void* componentArray = chunk->GetComponentArrayByID(desc.id);
-                    if (!componentArray) continue;
+                    if (m_columnMeta.idToColumn[desc.id] < 0) continue;
 
-                    // (componentArray null / tag columns already skipped by the
-                    //  `if (!componentArray) continue;` above)
                     if (writer.GetCompressionMode() == CompressionMode::LZ4)
                     {
                         // Per-column block (orthogonal to versioning): serialize the
@@ -993,7 +1008,7 @@ namespace Astra
             }
         }
         
-        static Result<std::unique_ptr<Archetype>, SerializationError> Deserialize(BinaryReader& reader, const std::vector<ComponentDescriptor>& registryDescriptors, ArchetypeChunkPool* componentPool = nullptr, const Tick* tickSource = nullptr)
+        static Result<std::unique_ptr<Archetype>, SerializationError> Deserialize(BinaryReader& reader, const std::vector<ComponentDescriptor>& registryDescriptors, ArchetypeChunkPool* componentPool = nullptr, const Tick* tickSource = nullptr, const StorageLoadHooks* hooks = nullptr)
         {
             using ResultType = Result<std::unique_ptr<Archetype>, SerializationError>;
 
@@ -1054,12 +1069,22 @@ namespace Astra
             std::vector<ComponentDescriptor> descriptors;
             descriptors.reserve(descriptorCount);
 
-            // IM-9: per-descriptor "archive carries a disabled-bit section for this
-            // column" flags, kept in lockstep with `descriptors` (both are pushed
-            // together only when the hash resolves). Drives section CONSUMPTION on the
-            // chunk-read path below so it depends on the archive, not the local build.
-            std::vector<uint8_t> diskHasDisabledSection;
-            diskHasDisabledSection.reserve(descriptorCount);
+            // Every ARCHIVED descriptor, in disk order (the column order chunks were
+            // written in). `descriptors` above keeps only the ones this registry stores
+            // in tables; a diverted one (s8.3: Table in the archive, Sparse/Universal
+            // here) is read straight into ComponentStorage. hasDisabledSection is the
+            // IM-9 disk flag; diskSize > 0 || hasDisabledSection says whether the
+            // archive wrote a column for it at all (tags without bits never did). Both
+            // drive stream CONSUMPTION, so it depends on the archive, not the local build.
+            struct ArchivedColumn
+            {
+                ComponentDescriptor desc;
+                uint64_t diskSize;
+                bool hasDisabledSection;
+                bool diverted;
+            };
+            std::vector<ArchivedColumn> archived;
+            archived.reserve(descriptorCount);
 
             for (uint32_t i = 0; i < descriptorCount; ++i)
             {
@@ -1087,8 +1112,10 @@ namespace Astra
 
                 if (it != registryDescriptors.end())
                 {
-                    descriptors.push_back(*it);
-                    diskHasDisabledSection.push_back(hasDisabledSection);
+                    const bool diverted = hooks && hooks->IsDiverted(it->id);
+                    archived.push_back(ArchivedColumn{*it, size, hasDisabledSection != 0, diverted});
+                    if (!diverted)
+                        descriptors.push_back(*it);
                 }
                 else
                 {
@@ -1119,7 +1146,9 @@ namespace Astra
             // ids), so it must equal the descriptor count regardless of process. A
             // mismatch means the mask half and the descriptor half of the record
             // disagree -> corrupt/crafted input.
-            if (mask.Count() != descriptors.size())
+            // s8.3: the disk mask counts every ARCHIVED component (run-independent,
+            // archive-internal); the rebuilt localMask counts only the Table ones.
+            if (mask.Count() != archived.size())
             {
                 return ResultType::Err(SerializationError::CorruptedData);
             }
@@ -1256,14 +1285,52 @@ namespace Astra
                     return ResultType::Err(reader.GetError());
                 }
 
-                // Read component arrays (SOA layout). Indexed (not range-for) so each
-                // descriptor's disk has-disabled-section flag can be looked up by the
-                // same ordinal (IM-9).
-                for (size_t di = 0; di < descriptors.size(); ++di)
+                // Read component arrays (SOA layout), one archived column at a time, in
+                // disk order. Each carries its own disk has-disabled-section flag (IM-9).
+                for (const ArchivedColumn& column : archived)
                 {
-                    const ComponentDescriptor& desc = descriptors[di];
-                    void* componentArray = chunk->GetComponentArrayByID(desc.id);
-                    if (!componentArray) continue;
+                    const ComponentDescriptor& desc = column.desc;
+
+                    if (column.diverted)
+                    {
+                        // s8.3: Table in the archive, Sparse/Universal here. Consume the
+                        // column exactly as DeserializeColumn would, but into the store.
+                        // A column block exists iff the archive wrote one; a tag the
+                        // archive wrote nothing for reads zero bytes in DivertColumn.
+                        const bool diskHasColumn = column.diskSize > 0 || column.hasDisabledSection;
+                        bool ok = false;
+                        if (diskHasColumn && reader.GetVersion() >= 5 && reader.GetCompressionMode() == CompressionMode::LZ4)
+                        {
+                            auto blk = reader.ReadCompressedBlock();
+                            if (blk.IsErr())
+                                return ResultType::Err(SerializationError::CorruptedData);
+                            const auto& bytes = *blk.GetValue();   // std::vector<uint8_t>
+                            BinaryReader sub(std::span<const std::byte>(
+                                reinterpret_cast<const std::byte*>(bytes.data()), bytes.size()));
+                            sub.SetChecksumEnabled(false);
+                            ok = DivertColumn(sub, chunk, desc, chunkEntityCount,
+                                              column.diskSize > 0, column.hasDisabledSection, *hooks);
+                        }
+                        else
+                        {
+                            ok = DivertColumn(reader, chunk, desc, chunkEntityCount,
+                                              column.diskSize > 0, column.hasDisabledSection, *hooks);
+                        }
+                        if (!ok)
+                            return ResultType::Err(reader.HasError() ? reader.GetError() : SerializationError::CorruptedData);
+                        continue;
+                    }
+
+                    // A block follows iff the WRITER had a column: every data component, and a
+                    // tag only when the writer stored it as an enableable bit-only column --
+                    // which the archive records as the has-disabled-section flag (IM-9). Keyed
+                    // on the ARCHIVE, never on this build's column, so a tag whose
+                    // enableability differs between builds keeps the stream in sync.
+                    const bool archiveHasColumn = column.diskSize > 0 || column.hasDisabledSection;
+                    if (!archiveHasColumn) continue;
+                    // IM-9: the archive holds values this build's (empty) type cannot hold.
+                    if (column.diskSize > 0 && desc.size == 0)
+                        return ResultType::Err(SerializationError::CorruptedData);
 
                     // Mirror of the write path (Serialize above): LZ4 archives wrap
                     // each column in a compressed block, so read+decompress it into a
@@ -1288,13 +1355,13 @@ namespace Astra
                         sub.SetChecksumEnabled(false);
                         colResult = DeserializeColumn(sub, chunk, archetype.get(), desc,
                                                       static_cast<size_t>(chunkEntityCount),
-                                                      diskHasDisabledSection[di]);
+                                                      column.diskSize > 0, column.hasDisabledSection);
                     }
                     else
                     {
                         colResult = DeserializeColumn(reader, chunk, archetype.get(), desc,
                                                       static_cast<size_t>(chunkEntityCount),
-                                                      diskHasDisabledSection[di]);
+                                                      column.diskSize > 0, column.hasDisabledSection);
                     }
                     if (colResult.IsErr())
                         return colResult;
@@ -1443,6 +1510,15 @@ namespace Astra
                     for (uint16_t c = 0; c < m_columnMeta.columnCount; ++c)
                         dst->FoldColumnVersion(c, src->GetColumnVersion(c));
 
+                    // Sparse presence carry (storage policies, spec s5.3): a block is
+                    // re-created in the fresh chunk only for a slot some moved entity
+                    // holds, so compaction also drops emptied blocks.
+                    if (src->HasSparseBlocks()) ASTRA_UNLIKELY
+                    {
+                        for (size_t k = 0; k < run; ++k)
+                            dst->CarrySparseBits(*src, srcIndex + k, dstIndex + k);
+                    }
+
                     dst->SetCount(dst->GetCount() + run);
                     srcIndex += run;
                     dstIndex += run;
@@ -1533,9 +1609,9 @@ namespace Astra
         // followed by the column's disabled-bit section iff it is enableable.
         // Extracted verbatim from Serialize()'s per-column loop body (Task 2 of
         // the LZ4 per-column compression plan, NO behavior change) so Task 3's
-        // compressed-column path can reuse it. Caller guarantees
-        // chunk->GetComponentArrayByID(desc.id) is non-null (null/tag columns
-        // are skipped before calling).
+        // compressed-column path can reuse it. Caller guarantees desc has a column
+        // here (idToColumn >= 0): a data column, or an enableable tag's bit-only
+        // column, which writes ZERO data bytes and then its disabled section.
         void SerializeColumn(BinaryWriter& w, ArchetypeChunk* chunk, const ComponentDescriptor& desc, size_t chunkEntityCount) const
         {
             void* componentArray = chunk->GetComponentArrayByID(desc.id);
@@ -1553,7 +1629,8 @@ namespace Astra
             // chunkEntityCount elements -- a stream desync with no other trip.
             ASTRA_ASSERT(desc.serializeVersioned || desc.serialize,
                 "SerializeColumn: component descriptor has no serialize hook");
-            if (desc.serializeVersioned || desc.serialize)
+            // desc.size == 0: an enableable tag's bit-only column -- no data, zero bytes.
+            if (desc.size != 0 && (desc.serializeVersioned || desc.serialize))
             {
                 // For custom serialization, we can't compress the whole array
                 // as each component is serialized individually
@@ -1583,9 +1660,8 @@ namespace Astra
             // is unchanged by this feature (beyond the version-constant bump).
             if (desc.isEnableable)
             {
-                // Tag components (desc.size == 0) never reach here -- their
-                // componentArray is null and the caller's null-skip already
-                // skipped them -- so this ordinal is always a real storage column.
+                // An enableable tag reaches here through its bit-only column
+                // (zero data bytes above); every admitted desc has idToColumn >= 0.
                 const int col = m_columnMeta.idToColumn[desc.id];
                 w(chunk->GetDisabledCount(col));
 
@@ -1605,19 +1681,39 @@ namespace Astra
             }
         }
 
+        // s8.3: one chunk-column archived as Table whose component the loading
+        // registry keeps in ComponentStorage. Values are deserialized over the
+        // store's element for each of the chunk's entities; the column's disabled
+        // section (IM-9 disk flag) becomes the store's per-element flag. Consumes
+        // the stream exactly as DeserializeColumn does (the shared element-run reader
+        // is also the v6 block reader's body). diskHasData is the ARCHIVE's value
+        // size: data archived for a type that is a tag here is refused, never skipped.
+        static bool DivertColumn(BinaryReader& r, ArchetypeChunk* chunk, const ComponentDescriptor& desc,
+                                 size_t chunkEntityCount, bool diskHasData, bool hasDisabledSection,
+                                 const StorageLoadHooks& hooks)
+        {
+            const auto& entities = chunk->GetEntities();
+            return StorageFormat::ReadElementRun(r, chunkEntityCount, desc, diskHasData, hasDisabledSection,
+                [&](size_t i) { return hooks.acquire(hooks.ctx, desc, entities[i]); },
+                [&](size_t i) { hooks.setDisabled(hooks.ctx, desc.id, entities[i]); });
+        }
+
         // Reads one component column's per-chunk data (custom deserialize,
         // versioned or plain, or a compressed trivially-copyable block) into
         // the chunk's component array, then (iff hasDisabledSection) reads,
         // validates, and applies the column's disabled-bit section. Extracted
         // verbatim from Deserialize()'s per-column loop body (Task 2 of the LZ4
         // per-column compression plan, NO behavior change) so Task 3's
-        // compressed-column path can reuse it. Caller guarantees
-        // chunk->GetComponentArrayByID(desc.id) is non-null (null/tag columns
-        // are skipped before calling); hasDisabledSection is the per-descriptor
-        // disk flag (diskHasDisabledSection[di], IM-9), not this build's
+        // compressed-column path can reuse it. Called iff the ARCHIVE holds a block
+        // for desc (diskHasData || hasDisabledSection, the archive's own flags). For a tag that
+        // block is zero data bytes plus the section; diskHasData (ArchivedColumn::diskSize > 0)
+        // gates the value loop; when THIS build has no column for the tag (not
+        // enableable here) the section is consumed, validated and dropped below.
+        // hasDisabledSection is the per-descriptor
+        // disk flag (ArchivedColumn::hasDisabledSection, IM-9), not this build's
         // desc.isEnableable. Static (like Deserialize itself): archetype is
         // passed explicitly rather than accessed via `this`.
-        static Result<std::unique_ptr<Archetype>, SerializationError> DeserializeColumn(BinaryReader& r, ArchetypeChunk* chunk, Archetype* archetype, const ComponentDescriptor& desc, size_t chunkEntityCount, bool hasDisabledSection)
+        static Result<std::unique_ptr<Archetype>, SerializationError> DeserializeColumn(BinaryReader& r, ArchetypeChunk* chunk, Archetype* archetype, const ComponentDescriptor& desc, size_t chunkEntityCount, bool diskHasData, bool hasDisabledSection)
         {
             using ResultType = Result<std::unique_ptr<Archetype>, SerializationError>;
 
@@ -1631,7 +1727,10 @@ namespace Astra
             // silently read zero bytes for chunkEntityCount elements -> stream desync.
             ASTRA_ASSERT(desc.deserializeVersioned || desc.deserialize,
                 "DeserializeColumn: component descriptor has no deserialize hook");
-            if (desc.deserializeVersioned || desc.deserialize)
+            // !diskHasData: the ARCHIVE's block carries no values (a tag's bit-only column) --
+            // read none, whatever this build's descriptor says. A tag archived as enableable
+            // and loaded as a data type keeps AddEntity's default-constructed values.
+            if (diskHasData && desc.size != 0 && (desc.deserializeVersioned || desc.deserialize))
             {
                 // For custom deserialization, components are not compressed
                 // as they were serialized individually
@@ -1899,14 +1998,9 @@ namespace Astra
             // This is the intersection of source and destination masks
             ComponentMask componentsToMove = srcArchetype.GetMask() & GetMask();
 
-            // If there are no components to move (e.g., moving from root archetype),
-            // we're done - entities are already allocated
-            if (componentsToMove.None())
-            {
-                return dstLocations;
-            }
-
-            // Batch move components for each chunk pair
+            // Per chunk pair: carry sparse presence (spec s5.3) -- ALWAYS, because
+            // presence follows the entity even when no column is shared (a batch
+            // leaving the root archetype) -- then move the shared columns.
             for (auto& [key, batch] : batches)
             {
                 // Validate chunk indices
@@ -1918,6 +2012,15 @@ namespace Astra
 
                 auto& srcChunk = srcArchetype.m_chunks[batch.srcChunkIndex];
                 auto& dstChunk = m_chunks[batch.dstChunkIndex];
+
+                if (srcChunk->HasSparseBlocks()) ASTRA_UNLIKELY
+                {
+                    for (size_t i = 0; i < batch.srcIndices.size(); ++i)
+                        dstChunk->CarrySparseBits(*srcChunk, batch.srcIndices[i], batch.dstIndices[i]);
+                }
+
+                if (componentsToMove.None())
+                    continue;   // e.g. moving from the root archetype: no column to move
 
                 dstChunk->BatchMoveComponentsFrom(batch.dstIndices, *srcChunk, batch.srcIndices, componentsToMove);
             }
@@ -2121,80 +2224,6 @@ namespace Astra
             return EntityLocation::Create(chunkIndex, entityIndex);
         }
         
-        std::vector<std::pair<Entity, EntityLocation>> MoveEntitiesBetweenChunks(size_t srcChunkIndex, size_t destChunkIndex, size_t count)
-        {
-            std::vector<std::pair<Entity, EntityLocation>> movedEntities;
-            movedEntities.reserve(count);
-            
-            auto& srcChunk = m_chunks[srcChunkIndex];
-            auto& destChunk = m_chunks[destChunkIndex];
-            
-            // Get the last 'count' entities from source chunk
-            size_t srcCount = srcChunk->GetCount();
-            size_t destCount = destChunk->GetCount();
-            
-            for (size_t i = 0; i < count; ++i)
-            {
-                size_t srcEntityIndex = srcCount - i - 1;
-                size_t destEntityIndex = destCount + i;
-                
-                // Get entity from source chunk
-                Entity entity = srcChunk->GetEntity(srcEntityIndex);
-                
-                // Add entity to destination chunk's entity vector
-                destChunk->GetEntities().push_back(entity);
-                
-                EntityLocation destEntityLocation = EntityLocation::Create(destChunkIndex, destEntityIndex);
-                movedEntities.emplace_back(entity, destEntityLocation);
-                
-                // Move components column by column. Both chunks belong to this
-                // archetype, so they share m_columnMeta (identical column layout).
-                // destEntityIndex is transiently >= destChunk's count here (the count
-                // is bumped after the loop), so resolve the base directly and index it
-                // rather than going through GetComponentPointer's count-bounded assert.
-                for (uint16_t c = 0; c < m_columnMeta.columnCount; ++c)
-                {
-                    const ComponentID id = m_columnMeta.columns[c].id;
-                    const uint32_t stride = m_columnMeta.columns[c].stride;
-                    const ComponentDescriptor& desc = *m_columnMeta.columns[c].descriptor;
-
-                    void* srcPtr = static_cast<std::byte*>(srcChunk->GetComponentArrayByID(id)) + srcEntityIndex * stride;
-                    void* destPtr = static_cast<std::byte*>(destChunk->GetComponentArrayByID(id)) + destEntityIndex * stride;
-
-                    // Use move constructor to transfer component data
-                    desc.MoveConstruct(destPtr, srcPtr);
-                    desc.Destruct(srcPtr);
-
-                    // Disabled-bit carry (Task 2): same archetype => same column ordinal
-                    // on both chunks. dst slot is freshly counted (born enabled); the
-                    // src bit is cleared right after via the pop below shrinking count.
-                    // NOTE: this method currently has no live callers (referenced only
-                    // in a comment); the carry is here so every entity-relocation path
-                    // is uniformly covered if it is ever revived.
-                    if (desc.isEnableable) ASTRA_UNLIKELY
-                    {
-                        destChunk->SetDisabled(c, destEntityIndex, srcChunk->IsDisabled(c, srcEntityIndex));
-                        srcChunk->SetDisabled(c, srcEntityIndex, false);
-                    }
-
-                    // Tick carry (Task 6): same archetype => same ordinal on both chunks.
-                    if (desc.isChangeTracked) ASTRA_UNLIKELY
-                        destChunk->CopyTicks(c, destEntityIndex, *srcChunk, c, srcEntityIndex);
-
-                    destChunk->FoldColumnVersion(c, srcChunk->GetColumnVersion(c));
-                }
-
-                // Remove entity from source chunk's entity vector
-                srcChunk->GetEntities().pop_back();
-            }
-            
-            // Update chunk counts
-            srcChunk->SetCount(srcCount - count);
-            destChunk->SetCount(destCount + count);
-            
-            return movedEntities;
-        }
-
         ComponentMask m_mask;
         size_t m_componentCount;  // Cached component count for fast access
         std::vector<ComponentDescriptor> m_componentDescriptors;

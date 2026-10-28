@@ -386,6 +386,27 @@ namespace Astra::Test
     };
     static_assert(Component<TrackedPos> && Component<TrackedVel>);
 
+    // Storage-policies suite (spec 2026-10-01 s3.2, s9.1): Position's Sparse twin --
+    // same fields, ctor and equality; only the storage trait differs. ONE TypeID
+    // (budget): every storage test that needs a Sparse data type reuses it.
+    struct PosS
+    {
+        static constexpr auto AstraStorage = Astra::Storage::Sparse;
+        float x = 0.0f, y = 0.0f, z = 0.0f;
+        PosS() = default;
+        PosS(float x_, float y_, float z_) : x(x_), y(y_), z(z_) {}
+        bool operator==(const PosS&) const = default;
+    };
+    static_assert(Component<PosS>);
+
+    // Enableable Table tag (spec 2026-10-01 s3.2, second bullet): an empty type that opts
+    // into AstraEnableable gets a BIT-ONLY archetype column. ONE TypeID (budget).
+    struct EnTag
+    {
+        static constexpr bool AstraEnableable = true;
+    };
+    static_assert(Component<EnTag> && std::is_empty_v<EnTag>);
+
     // Helper type traits for testing
     template<typename T>
     struct ComponentTraits
