@@ -2517,7 +2517,7 @@ namespace Astra
                                           std::index_sequence<ReqIs...> reqSeq, std::index_sequence<OptIs...> optSeq) const
         {
             StampChunkStorage<Par>(chunk, cm, now, reqSeq, optSeq);
-            ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
+            [[maybe_unused]] ComponentStorage* storage = m_archetypeManager->GetComponentStorage();
             (StampSparseCoarse<std::tuple_element_t<ReqIs, RequiredTypes>, false, Par>(chunk, storage, now), ...);
             (StampSparseCoarse<std::tuple_element_t<OptIs, OptionalTypes>, true, Par>(chunk, storage, now), ...);
         }
@@ -2622,7 +2622,7 @@ namespace Astra
                                                    std::index_sequence<ReqIs...>, std::index_sequence<OptIs...>)
         {
             rp = ReqPtrs{ std::get<ReqIs>(req).At(e, i)... };
-            if ((... || (std::get<ReqIs>(rp) == nullptr))) ASTRA_UNLIKELY
+            if ((... || !std::get<ReqIs>(rp))) ASTRA_UNLIKELY
                 return false;
             op = OptPtrs{ std::get<OptIs>(opt).OptionalAt(e, i)... };
             if constexpr (Stamp)
