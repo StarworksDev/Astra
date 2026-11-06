@@ -46,6 +46,7 @@
 #include "Archetype/ArchetypeManager.hpp"
 
 // Registry and queries
+#include "Registry/ComponentStorage.hpp"
 #include "Registry/Query.hpp"
 #include "Registry/Registry.hpp"
 #include "Registry/Relations.hpp"

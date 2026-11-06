@@ -349,6 +349,61 @@ namespace Astra
         struct AccessReads  { using type = decltype(std::tuple_cat(std::declval<typename ArgAccess<Args>::Read>()...)); };
         template<typename... Args>
         struct AccessWrites { using type = decltype(std::tuple_cat(std::declval<typename ArgAccess<Args>::Write>()...)); };
+
+        // ============ Storage policies (spec 2026-10-01 s6.1) ============
+        // Compile-time half of the per-argument storage classification. Table vs Sparse
+        // is the component TYPE's trait; Universal is a per-registry runtime fact that
+        // View resolves against its registry. Only Table-trait members can ever be in an
+        // archetype mask.
+        template<typename T>
+        inline constexpr bool IsSparseArgV = (StorageOfV<std::remove_cvref_t<T>> == Storage::Sparse);
+
+        template<typename Tuple> struct FilterTableTrait;
+        template<typename... Ts>
+        struct FilterTableTrait<std::tuple<Ts...>>
+        {
+            using type = decltype(std::tuple_cat(
+                std::conditional_t<!IsSparseArgV<Ts>, std::tuple<Ts>, std::tuple<>>{}...));
+        };
+        template<typename Tuple> using FilterTableTrait_t = typename FilterTableTrait<Tuple>::type;
+
+        template<typename Tuple> struct FilterSparseTrait;
+        template<typename... Ts>
+        struct FilterSparseTrait<std::tuple<Ts...>>
+        {
+            using type = decltype(std::tuple_cat(
+                std::conditional_t<IsSparseArgV<Ts>, std::tuple<Ts>, std::tuple<>>{}...));
+        };
+        template<typename Tuple> using FilterSparseTrait_t = typename FilterSparseTrait<Tuple>::type;
+
+        template<typename Tuple> struct AnySparseTrait;
+        template<typename... Ts>
+        struct AnySparseTrait<std::tuple<Ts...>> : std::bool_constant<(IsSparseArgV<Ts> || ...)> {};
+
+        // Every component a query NAMES, through any modifier (ExtractComponents skips
+        // Optional/Not/With/Changed/Added/IncludeDisabled, so it cannot serve here).
+        template<typename A> struct ArgComponents                  { using type = std::tuple<std::remove_const_t<A>>; };
+        template<typename T> struct ArgComponents<Optional<T>>        { using type = std::tuple<std::remove_const_t<T>>; };
+        template<typename T> struct ArgComponents<Not<T>>             { using type = std::tuple<std::remove_const_t<T>>; };
+        template<typename T> struct ArgComponents<IncludeDisabled<T>> { using type = std::tuple<std::remove_const_t<T>>; };
+        template<typename T> struct ArgComponents<With<T>>            { using type = std::tuple<std::remove_const_t<T>>; };
+        template<typename T> struct ArgComponents<Changed<T>>         { using type = std::tuple<std::remove_const_t<T>>; };
+        template<typename T> struct ArgComponents<Added<T>>           { using type = std::tuple<std::remove_const_t<T>>; };
+        template<typename... Ts> struct ArgComponents<Any<Ts...>>     { using type = std::tuple<std::remove_const_t<Ts>...>; };
+        template<typename... Ts> struct ArgComponents<OneOf<Ts...>>   { using type = std::tuple<std::remove_const_t<Ts>...>; };
+
+        template<typename... QueryArgs>
+        using QueryPlanTypes = typename UniqueTypes<decltype(std::tuple_cat(
+            std::declval<typename ArgComponents<QueryArgs>::type>()...))>::type;
+
+        // Position of T in a tuple (== tuple size when absent).
+        template<typename T, typename Tuple> struct TupleIndexOf;
+        template<typename T> struct TupleIndexOf<T, std::tuple<>> { static constexpr size_t value = 0; };
+        template<typename T, typename U, typename... Us>
+        struct TupleIndexOf<T, std::tuple<U, Us...>>
+        {
+            static constexpr size_t value = std::is_same_v<T, U> ? 0 : 1 + TupleIndexOf<T, std::tuple<Us...>>::value;
+        };
     }
     
     // Query modifier types
@@ -520,6 +575,22 @@ namespace Astra
                  | MakeMaskFromTuple<typename Classifier::AddedComponents>();
         }
 
+        // Storage policies (spec 2026-10-01 s6.1): the archetype-mask candidates. A
+        // Sparse-TRAIT member is never in an archetype mask, so it is left out here;
+        // View additionally removes the members its registry declares Universal.
+        static ComponentMask GetTableRequiredMask()
+        {
+            return MakeMaskFromTuple<Detail::FilterTableTrait_t<typename Classifier::RequiredComponents>>()
+                 | MakeMaskFromTuple<Detail::FilterTableTrait_t<typename Classifier::WithComponents>>()
+                 | MakeMaskFromTuple<Detail::FilterTableTrait_t<typename Classifier::ChangedComponents>>()
+                 | MakeMaskFromTuple<Detail::FilterTableTrait_t<typename Classifier::AddedComponents>>();
+        }
+
+        static ComponentMask GetTableExcludedMask()
+        {
+            return MakeMaskFromTuple<Detail::FilterTableTrait_t<typename Classifier::ExcludedComponents>>();
+        }
+
         // Handle Any groups - must have at least one component from each group
         template<typename Tuple, size_t... Is>
         static bool CheckAnyGroups(const ComponentMask& archetypeMask, std::index_sequence<Is...>)
@@ -567,7 +638,10 @@ namespace Astra
             return true;
         }
         
-        // Check if archetype matches this query
+        // Check if archetype matches this query, by the archetype MASK alone. Table-only:
+        // a Sparse or Universal member is in no archetype mask (spec 2026-10-01 s3.1), so a
+        // query naming one would reject every archetype here. Views match through
+        // View::MatchesArchetype, which takes those members out of the masks (s6.1).
         static bool Matches(const ComponentMask& archetypeMask)
         {
             // Must have all required AND all With AND all Changed/Added components

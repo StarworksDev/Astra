@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <concepts>
 #include <cstdint>
 
@@ -25,6 +26,39 @@ namespace Astra
     ASTRA_NODISCARD constexpr bool IsNewer(Tick a, Tick b) noexcept
     {
         return static_cast<int32_t>(a - b) > 0;
+    }
+
+    /**
+     * Shared-location tick accesses for the PARALLEL view drivers (RULINGS Task 28).
+     * A location several workers can reach in one walk (the untracked-Sparse coarse
+     * version slot, a chunk's column version written from a dense non-chunk-partitioned
+     * range, a Universal page version) is written with StoreTickRelaxed and read with
+     * LoadTickRelaxed: all workers store the same `now`, so relaxed ordering is enough
+     * and the formal data race is gone. Per-element / per-slot ticks of disjoint
+     * entities stay plain stores. Serial paths keep plain accesses (the `Par=false`
+     * arms of the stores' templated accessors never call these).
+     */
+    static_assert(std::atomic_ref<Tick>::is_always_lock_free, "Tick must be lock-free atomically accessible");
+
+    inline void StoreTickRelaxed(Tick& slot, Tick value) noexcept
+    {
+        std::atomic_ref<Tick>(slot).store(value, std::memory_order_relaxed);
+    }
+
+    ASTRA_NODISCARD inline Tick LoadTickRelaxed(const Tick& slot) noexcept
+    {
+        return std::atomic_ref<Tick>(const_cast<Tick&>(slot)).load(std::memory_order_relaxed);
+    }
+
+    /**
+     * Check-before-store for a shared stamp slot a parallel walk hits once per ENTITY: after
+     * the first worker stores `now`, the line stays shared and read-only instead of bouncing
+     * in exclusive state between workers on every entity.
+     */
+    inline void StampTickShared(Tick& slot, Tick now) noexcept
+    {
+        if (LoadTickRelaxed(slot) != now)
+            StoreTickRelaxed(slot, now);
     }
 
     /**

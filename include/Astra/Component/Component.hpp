@@ -18,7 +18,30 @@ namespace Astra
         #define ASTRA_MAX_COMPONENTS 128u
     #endif
 
+    // Storage policies (spec 2026-10-01 s3.2, s4): sparse slots per registry, entries
+    // per sparse-set page, slots per universal-column page. Overridable like
+    // ASTRA_MAX_COMPONENTS; the constexpr mirrors below are what code reads.
+    #ifndef ASTRA_MAX_SPARSE_COMPONENTS
+        #define ASTRA_MAX_SPARSE_COMPONENTS 32u
+    #endif
+    #ifndef ASTRA_SPARSE_PAGE_SIZE
+        #define ASTRA_SPARSE_PAGE_SIZE 4096u
+    #endif
+    #ifndef ASTRA_UNIVERSAL_PAGE_SLOTS
+        #define ASTRA_UNIVERSAL_PAGE_SLOTS 1024u
+    #endif
+
     constexpr std::size_t MAX_COMPONENTS = ASTRA_MAX_COMPONENTS;
+    constexpr std::size_t MAX_SPARSE_COMPONENTS = ASTRA_MAX_SPARSE_COMPONENTS;
+    constexpr std::size_t SPARSE_PAGE_SIZE = ASTRA_SPARSE_PAGE_SIZE;
+    constexpr std::size_t UNIVERSAL_PAGE_SLOTS = ASTRA_UNIVERSAL_PAGE_SLOTS;
+
+    static_assert(MAX_SPARSE_COMPONENTS >= 1 && MAX_SPARSE_COMPONENTS <= MAX_COMPONENTS && MAX_SPARSE_COMPONENTS <= 0x7FFF,
+                  "ASTRA_MAX_SPARSE_COMPONENTS must be in [1, min(ASTRA_MAX_COMPONENTS, 32767)]");
+    static_assert(SPARSE_PAGE_SIZE > 0 && (SPARSE_PAGE_SIZE & (SPARSE_PAGE_SIZE - 1)) == 0,
+                  "ASTRA_SPARSE_PAGE_SIZE must be a power of two");
+    static_assert(UNIVERSAL_PAGE_SLOTS >= 64 && (UNIVERSAL_PAGE_SLOTS & (UNIVERSAL_PAGE_SLOTS - 1)) == 0,
+                  "ASTRA_UNIVERSAL_PAGE_SLOTS must be a power of two >= 64 (its bitmaps are 64-bit words)");
     
     using ComponentMask = Bitmap<MAX_COMPONENTS>;
 
@@ -117,6 +140,52 @@ namespace Astra
     template<typename T>
     inline constexpr bool IsTransientResourceV = TransientResourceTraits<std::remove_const_t<T>>::value;
 
+    /**
+     * Storage policy (spec 2026-10-01 s3.2, decision D1). A component TYPE declares where
+     * its data lives with `static constexpr auto AstraStorage = Astra::Storage::Sparse;`
+     * or by specializing Astra::StorageTraits<T>. Default: Table (archetype columns).
+     * Universal is NOT a type trait: a Registry declares it (Registry::Config::AddUniversal),
+     * so the EFFECTIVE layout in one registry is a StorageKind (ComponentStorage::KindOf).
+     * Same if-constexpr-gated shape as EnableableTraits (the MSVC short-circuit rationale).
+     */
+    enum class Storage : uint8_t { Table, Sparse };
+
+    namespace Detail
+    {
+        // A type naming an AstraStorage member at all, and one whose member is a valid
+        // Astra::Storage. StorageTraits refuses the first without the second, so a wrongly
+        // typed declaration (an int, an Astra::StorageKind) can never silently stay Table
+        // (final review M1).
+        template<typename T>
+        concept NamesAstraStorage = requires { T::AstraStorage; };
+        template<typename T>
+        concept DeclaresAstraStorage = requires { { T::AstraStorage } -> std::convertible_to<Storage>; };
+    }
+
+    template<typename T>
+    struct StorageTraits
+    {
+        static constexpr Storage value = []() constexpr
+        {
+            if constexpr (Detail::DeclaresAstraStorage<T>)
+                return static_cast<Storage>(T::AstraStorage);
+            else
+            {
+                static_assert(!Detail::NamesAstraStorage<T>,
+                    "AstraStorage must be an Astra::Storage: `static constexpr auto AstraStorage = Astra::Storage::Sparse;`. "
+                    "(Universal is not a type trait: a Registry declares it with Registry::Config::AddUniversal.)");
+                return Storage::Table;
+            }
+        }();
+    };
+
+    template<typename T>
+    inline constexpr Storage StorageOfV = StorageTraits<std::remove_const_t<T>>::value;
+
+    // Effective layout of a component in ONE registry: the trait's Table/Sparse, or
+    // Universal when that registry declares it (Universal overrides the trait).
+    enum class StorageKind : uint8_t { Table, Sparse, Universal };
+
     namespace Detail
     {
         // A yielded component whose access is non-const and which has storage. Only
@@ -161,6 +230,7 @@ namespace Astra
         bool isEnableable = false;   // defaults false (same rationale as is_trivially_destructible above): a hand-built descriptor stays safe; the registry factory assigns IsEnableableV<T>
         bool isChangeTracked = false;   // defaults false (hand-built descriptors stay safe); the registry factory assigns IsChangeTrackedV<T>
         bool isTransientResource = false;   // defaults false (a hand-built descriptor persists as before); the registry factory assigns IsTransientResourceV<T>
+        Storage storage = Storage::Table;   // the type's Storage trait (spec 2026-10-01 s3.2); hand-built descriptors default to Table. Universal is per-registry (ComponentStorage::KindOf) and never stored here.
         ConstructFn* defaultConstruct;
         DestructFn* destruct;
         CopyConstructFn* copyConstruct;
@@ -203,6 +273,11 @@ namespace Astra
         
         inline void ConstructWith(void* ptr, const void* value) const
         {
+            if (size == 0)
+            {
+                return;  // empty (tag) component: nothing to construct (mirrors DefaultConstruct;
+                         // an enableable tag's bit-only column base must never be written)
+            }
             if (constructWith)
             {
                 constructWith(ptr, value);
@@ -219,6 +294,24 @@ namespace Astra
             }
         }
         
+        // Constructs into UNINITIALIZED `dst` from a type-erased source: the one
+        // construction ladder of the by-id add paths (ArchetypeManager::MoveAndAddByID,
+        // Registry's Sparse by-id add). memcpy for a trivially copyable type, else the
+        // specialized constructWith, copy, MOVE out of `src` for a move-only type (the
+        // CommandBuffer move-constructed the value into its own storage and destructs
+        // it after flush), and finally default construction (never-UB floor). A tag
+        // (size 0) has nothing to write.
+        inline void ConstructFromErased(void* dst, const void* src) const
+        {
+            if (size == 0)
+                return;
+            if (is_trivially_copyable)       std::memcpy(dst, src, size);
+            else if (constructWith)          constructWith(dst, src);
+            else if (copyConstruct)          copyConstruct(dst, src);
+            else if (moveConstruct)          moveConstruct(dst, const_cast<void*>(src));
+            else                             DefaultConstruct(dst);
+        }
+
         inline void BatchDefaultConstruct(void* ptr, size_t count) const
         {
             if (size == 0)
@@ -245,7 +338,7 @@ namespace Astra
             {
                 std::memcpy(dst, src, size);
             }
-            else
+            else if (size != 0)   // empty (tag) component: nothing to move (an enableable tag's bit-only column has no data)
             {
                 moveConstruct(dst, src);
             }

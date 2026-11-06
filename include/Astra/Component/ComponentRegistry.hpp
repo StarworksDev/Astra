@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <cstdint>
@@ -8,6 +9,7 @@
 #include <mutex>
 #include <string_view>
 #include <type_traits>
+#include <vector>
 
 #include "../Container/FlatMap.hpp"
 #include "../Container/SmallVector.hpp"
@@ -178,6 +180,11 @@ namespace Astra
                        inRange(reinterpret_cast<uintptr_t>(d.visitFields));
             };
 
+            // s4.4: stores built from the departing descriptors are torn down FIRST,
+            // outside every lock, while those descriptors are installed.
+            NotifyStoreRelease(CollectDeparting(
+                [&isOwned](uint32_t, const ComponentDescriptor& d) { return isOwned(d); }));
+
             SmallVector<MetaRelease, 4> metaWork;
             size_t dropped = 0;
             {
@@ -221,6 +228,12 @@ namespace Astra
 
             return dropped;
         }
+
+        // False until a descriptor with the Sparse storage trait has EVER been installed here
+        // (monotonic: unloading it does not reset). While false, no id of this registry can
+        // be Sparse-trait, so the type-erased Table paths skip the per-call descriptor read
+        // (Registry::IsSparseId). True only means "maybe": callers still ask KindOf.
+        ASTRA_NODISCARD bool MaySpawnSparse() const noexcept { return m_anySparse.load(std::memory_order_relaxed); }
 
         ASTRA_NODISCARD const ComponentDescriptor* GetComponentDescriptor(ComponentID id) const
         {
@@ -353,14 +366,14 @@ namespace Astra
             desc.isChangeTracked = IsChangeTrackedV<T>;
             desc.isTransientResource = IsTransientResourceV<T>;
 
-            // An enableable component must carry storage: the disabled bit lives
-            // per-entity in the chunk's column data, and an empty/tag type has no
-            // column (idToColumn == -1) to hang that bit off of. A runtime guard
-            // would make such a type silently unfilterable instead of catching the
-            // mistake at the call site, so refuse it at compile time.
-            static_assert(!(std::is_empty_v<T> && IsEnableableV<T>),
-                "An enableable component must have storage: an empty/tag type has no column to carry "
-                "a disabled bit. Use a non-empty component, or a separate enableable marker with a byte of state.");
+            // Storage trait snapshot (spec 2026-10-01 s3.2). Both registration paths
+            // (RegisterComponentImpl and ComponentModule::RegisterOneChecked) build
+            // through here, so both pick it up.
+            desc.storage = StorageOfV<T>;
+
+            // An enableable TAG is legal (spec 2026-10-01 s3.2, parity): its archetype gives
+            // it a BIT-ONLY column -- stride 0, a disabled-word region, no data region (see
+            // Archetype::BuildColumnMeta). A non-enableable tag still gets no column at all.
 
             desc.defaultConstruct = &DefaultConstruct<T>;
             desc.destruct = &Destruct<T>;
@@ -516,6 +529,7 @@ namespace Astra
                 if (!refusedReplace)   // refused: the slot is left untouched
                 {
                     m_components[id] = desc;
+                    NoteStorage(desc);
                     m_present.Set(id);
                     m_hashToID[desc.hash] = id;
                     m_owner[id] = owner;
@@ -555,6 +569,11 @@ namespace Astra
         // thunk -- user reflection code).
         SmallVector<MetaRelease, 4> ReleaseModule(uint32_t owner)
         {
+            // s4.4: stores built from this owner's descriptors are torn down FIRST,
+            // while those descriptors are installed and their code is still mapped.
+            NotifyStoreRelease(CollectDeparting(
+                [owner](uint32_t entryOwner, const ComponentDescriptor&) { return entryOwner == owner; }));
+
             SmallVector<MetaRelease, 4> metaWork;
             std::lock_guard<std::mutex> lock(m_registrationMutex);
             for (size_t id = 0; id < MAX_COMPONENTS; ++id)
@@ -582,7 +601,91 @@ namespace Astra
             return metaWork;
         }
 
+        // ==== Store-release hooks (storage policies, spec 2026-10-01 s4.4) ====
+        // A Registry's ComponentStorage holds Sparse/Universal elements whose
+        // destructors live in the module that registered the type. Before
+        // ReleaseModule / UnregisterModuleRange change ANY slot, every hook hears
+        // about every departing entry (live or shadowed) with that entry's
+        // descriptor, so stores built from it can destroy their elements while the
+        // image is still mapped. Hooks run outside m_registrationMutex (element
+        // destructors are user code) and outside m_hookMutex (a hook may destroy a
+        // Registry, which removes its own hook). Each hook is re-resolved by handle
+        // right before its call, so a hook removed by an earlier hook is never
+        // called with a dangling ctx. Like registration, unload is host-serialized:
+        // a hook is never removed concurrently with a release by another thread.
+        using StoreReleaseFn = void (*)(void* ctx, ComponentID id, const ComponentDescriptor& departing);
+
+        ASTRA_NODISCARD uint64_t AddStoreReleaseHook(void* ctx, StoreReleaseFn fn)
+        {
+            std::lock_guard<std::mutex> lock(m_hookMutex);
+            const uint64_t handle = ++m_nextStoreReleaseHook;
+            m_storeReleaseHooks.push_back(StoreReleaseHook{handle, ctx, fn});
+            return handle;
+        }
+
+        void RemoveStoreReleaseHook(uint64_t handle)
+        {
+            std::lock_guard<std::mutex> lock(m_hookMutex);
+            std::erase_if(m_storeReleaseHooks, [handle](const StoreReleaseHook& h) { return h.handle == handle; });
+        }
+
+        ASTRA_NODISCARD size_t StoreReleaseHookCount() const
+        {
+            std::lock_guard<std::mutex> lock(m_hookMutex);
+            return m_storeReleaseHooks.size();
+        }
+
     private:
+        struct StoreReleaseHook { uint64_t handle; void* ctx; StoreReleaseFn fn; };
+        using DepartingEntries = SmallVector<std::pair<ComponentID, ComponentDescriptor>, 4>;
+
+        // Snapshot (under the registration lock) of every entry, live or
+        // shadowed, for which departs(owner, desc) holds.
+        template<typename Pred>
+        DepartingEntries CollectDeparting(Pred&& departs)
+        {
+            DepartingEntries out;
+            std::lock_guard<std::mutex> lock(m_registrationMutex);
+            for (size_t raw = 0; raw < MAX_COMPONENTS; ++raw)
+            {
+                const auto id = static_cast<ComponentID>(raw);
+                if (auto it = m_shadow.Find(id); it != m_shadow.end())
+                    for (const auto& entry : it->second)
+                        if (departs(entry.owner, entry.desc)) out.push_back({id, entry.desc});
+                if (m_present.Test(raw) && departs(m_owner[raw], m_components[raw]))
+                    out.push_back({id, m_components[raw]});
+            }
+            return out;
+        }
+
+        // Only the HANDLES are snapshotted; each hook is looked up again under
+        // m_hookMutex immediately before its call (RULINGS Task 35), because a hook
+        // may destroy another Registry whose own hook must then not run.
+        void NotifyStoreRelease(const DepartingEntries& departing)
+        {
+            if (departing.empty())
+                return;
+            SmallVector<uint64_t, 4> handles;
+            {
+                std::lock_guard<std::mutex> lock(m_hookMutex);
+                for (const StoreReleaseHook& h : m_storeReleaseHooks) handles.push_back(h.handle);
+            }
+            for (const auto& [id, desc] : departing)
+                for (const uint64_t handle : handles)
+                {
+                    StoreReleaseHook hook{};
+                    {
+                        std::lock_guard<std::mutex> lock(m_hookMutex);
+                        const auto it = std::find_if(m_storeReleaseHooks.begin(), m_storeReleaseHooks.end(),
+                            [handle](const StoreReleaseHook& h) { return h.handle == handle; });
+                        if (it == m_storeReleaseHooks.end())
+                            continue;   // removed since the snapshot
+                        hook = *it;
+                    }
+                    hook.fn(hook.ctx, id, desc);
+                }
+        }
+
         // Replaces the LIVE entry at `id` with the newest remaining shadow
         // entry, or clears the slot to empty if none remain -- recording the
         // DEPARTING entry's meta release in `metaWork` rather than performing
@@ -605,6 +708,7 @@ namespace Astra
                 it->second.pop_back();
                 if (it->second.empty()) m_shadow.Erase(it);
                 m_components[id]  = restored.desc;        // same address, new contents
+                NoteStorage(restored.desc);
                 m_owner[id]       = restored.owner;
                 m_metaModule[id]  = restored.module;
             }
@@ -712,6 +816,7 @@ namespace Astra
 
                 // Directly indexed; the array slot is pointer-stable for life.
                 m_components[id] = desc;
+                NoteStorage(desc);
                 m_present.Set(id);
                 m_hashToID[desc.hash] = id;
                 m_owner[id] = 0;  // anonymous: this path never goes through a ComponentModule
@@ -832,6 +937,12 @@ namespace Astra
         // ResourceStorage teardown segfault). A fixed array never moves, so every
         // GetComponentDescriptor() pointer stays valid for the registry's life.
         std::array<ComponentDescriptor, MAX_COMPONENTS> m_components{};
+        std::atomic<bool> m_anySparse{false};   // see MaySpawnSparse
+        void NoteStorage(const ComponentDescriptor& d) noexcept
+        {
+            if (d.storage == Storage::Sparse)
+                m_anySparse.store(true, std::memory_order_relaxed);
+        }
         ComponentMask m_present;  // which ids in m_components hold a registered descriptor
         FlatMap<uint64_t, ComponentID> m_hashToID;  // hash -> id (sparse; stays a hash map)
         // Use deque instead of vector to prevent pointer invalidation when adding new names.
@@ -871,5 +982,9 @@ namespace Astra
         // different owner get an entry here. Written only under
         // m_registrationMutex (InstallOwned pushes; ReleaseModule pops/strips).
         FlatMap<ComponentID, SmallVector<ShadowEntry, 1>> m_shadow;
+
+        mutable std::mutex m_hookMutex;                    // guards the two members below only
+        std::vector<StoreReleaseHook> m_storeReleaseHooks;
+        uint64_t m_nextStoreReleaseHook = 0;
     };
 }

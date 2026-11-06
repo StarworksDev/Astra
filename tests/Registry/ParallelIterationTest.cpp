@@ -100,6 +100,36 @@ namespace
         EXPECT_EQ(visits.load(), kChildren);
     }
 
+    // Task 30 fix round 1 (I1): a non-const Table yield from Relations' parallel walk is a
+    // write whose chunk column-version stamp is shared across workers (dense descendant range,
+    // not chunk-partitioned) -- it must go through the Par=true stamp. Non-regression pin: the
+    // race itself is not observable without TSan; this proves every descendant is visited once
+    // and the write is visible to change detection afterwards.
+    TEST(ParallelIteration, ParallelForEachDescendantTableWriteYieldStampsChanged)
+    {
+        Astra::Registry::Config config;
+        config.workScheduler = std::make_shared<Astra::Testing::TestWorkerPool>();
+        Astra::Registry registry(config);
+        auto root = registry.CreateEntity<TrackedPos>();
+        constexpr size_t kChildren = 5'000;
+        std::vector<Astra::Entity> kids(kChildren);
+        registry.CreateEntities<TrackedPos>(kChildren, kids);
+        for (auto e : kids) registry.SetParent(e, root);
+
+        const Astra::Tick before = registry.AdvanceTick();
+        std::atomic<size_t> visits{0};
+        registry.GetRelations<TrackedPos>(root).ParallelForEachDescendant(
+            [&](Astra::Entity, size_t, TrackedPos& p)
+            {
+                p.x = 1.0f;
+                visits.fetch_add(1, std::memory_order_relaxed);
+            });
+        EXPECT_EQ(visits.load(), kChildren);
+        for (auto e : kids)
+            EXPECT_TRUE(registry.IsChanged<TrackedPos>(e, before - 1));
+        EXPECT_FALSE(registry.IsChanged<TrackedPos>(root, before - 1));   // the root is not a descendant
+    }
+
     TEST(ParallelIteration, ParallelExecutorRunsAllSystems)
     {
         Astra::Registry registry;

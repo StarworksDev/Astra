@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bit>
 #include <cstddef>
 #include <cstring>
 #include <limits>
@@ -26,21 +27,22 @@ namespace Astra
 {
     // Per-archetype column metadata, built once and shared by every chunk of the archetype.
     // The heavy ComponentDescriptor lives here once (via pointer into the archetype's canonical
-    // list) instead of by-value in every chunk slot. Columns are storage-bearing components only
-    // (tags excluded), sorted ascending by id so cross-archetype moves can merge-join.
+    // list) instead of by-value in every chunk slot. Columns are storage-bearing components plus
+    // one BIT-ONLY column (stride 0: disabled words, no data) per ENABLEABLE tag; non-enableable
+    // tags have no column. Sorted ascending by id so cross-archetype moves can merge-join.
     struct ArchetypeColumnMeta
     {
         struct ColumnDesc
         {
             ComponentID id{0};
-            uint32_t stride{0};                          // == descriptor->size
+            uint32_t stride{0};                          // == descriptor->size (0 for an enableable tag's bit-only column)
             const ComponentDescriptor* descriptor{nullptr};
         };
 
-        uint16_t  columnCount{0};                        // N: storage-bearing components
+        uint16_t  columnCount{0};                        // N: storage-bearing components + enableable-tag bit-only columns
         bool      isComplex{false};                      // any column not trivially copyable
         ColumnDesc columns[MAX_COMPONENTS]{};            // [0, columnCount) valid, ascending id
-        int16_t   idToColumn[MAX_COMPONENTS];            // id -> column index, or -1 (absent OR tag)
+        int16_t   idToColumn[MAX_COMPONENTS];            // id -> column index, or -1 (absent OR non-enableable tag)
 
         // Enableable-components (spec §3/§4): the column ordinals (into `columns`)
         // whose component opted into ASTRA_ENABLEABLE. Only these carve per-chunk
@@ -64,6 +66,82 @@ namespace Astra
     class ArchetypeChunkPool;
     class Archetype;
 
+    // Power-of-two word-block freelist for per-chunk sparse presence blocks
+    // (storage policies, spec s5.1). Owned by ArchetypeChunkPool and shared by
+    // every chunk it creates, so presence-block churn never reaches the global
+    // allocator. A request of N words is served from the 2^ceil(log2 N) class.
+    // Not thread-safe: structural changes run on the registry's context
+    // (spec s4.3), the only place blocks are created or freed.
+    class SparseWordFreelist
+    {
+    public:
+        SparseWordFreelist() = default;
+        SparseWordFreelist(const SparseWordFreelist&) = delete;
+        SparseWordFreelist& operator=(const SparseWordFreelist&) = delete;
+        ~SparseWordFreelist() { Trim(); }
+
+        // Zeroed words, at least `words` of them (a chunk's WordsForCapacity).
+        ASTRA_NODISCARD uint64_t* Acquire(size_t words)
+        {
+            ASTRA_ASSERT(words > 0, "SparseWordFreelist::Acquire of zero words");
+            const size_t cls = ClassOf(words);
+            ASTRA_ASSERT(cls < CLASS_COUNT, "sparse presence block larger than the freelist's largest class");
+            uint64_t* p = nullptr;
+            if (!m_free[cls].empty())
+            {
+                p = m_free[cls].back();
+                m_free[cls].pop_back();
+            }
+            else
+            {
+                p = new uint64_t[size_t(1) << cls];
+            }
+            std::memset(p, 0, words * sizeof(uint64_t));
+            ++m_live;
+            return p;
+        }
+
+        // `wordCount` must be the value passed to the matching Acquire. Declared
+        // noexcept for the chunk destructor, but the cache push_back can allocate: a
+        // bad_alloc here is std::terminate (accepted; release must not fail).
+        void Release(uint64_t* words, size_t wordCount) noexcept
+        {
+            if (!words) return;
+            ASTRA_ASSERT(m_live > 0, "SparseWordFreelist::Release without a matching Acquire");
+            --m_live;
+            m_free[ClassOf(wordCount)].push_back(words);
+        }
+
+        // Frees every cached (not live) block back to the heap.
+        void Trim() noexcept
+        {
+            for (auto& bucket : m_free)
+            {
+                for (uint64_t* p : bucket)
+                    delete[] p;
+                bucket.clear();
+            }
+        }
+
+        ASTRA_NODISCARD size_t LiveBlocks() const noexcept { return m_live; }
+        ASTRA_NODISCARD size_t CachedBlocks() const noexcept
+        {
+            size_t n = 0;
+            for (const auto& bucket : m_free) n += bucket.size();
+            return n;
+        }
+
+    private:
+        // 2^0 .. 2^19 words. The 1 MB chunk ceiling holds at most 2^20 slots
+        // (ComputeCapacityForBytes with a 1-byte entity), which is 2^14 words, so the top
+        // classes are headroom.
+        static constexpr size_t CLASS_COUNT = 20;
+        ASTRA_NODISCARD static size_t ClassOf(size_t words) noexcept { return static_cast<size_t>(std::bit_width(words - 1)); }
+
+        std::vector<uint64_t*> m_free[CLASS_COUNT];
+        size_t m_live = 0;
+    };
+
     class ArchetypeChunk
     {
     public:
@@ -73,8 +151,11 @@ namespace Astra
             m_count(other.m_count),
             m_entities(std::move(other.m_entities)),
             m_meta(other.m_meta),
+            m_hasSparse(other.m_hasSparse),
             m_columnVersion(other.m_columnVersion),
-            m_chunkSize(other.m_chunkSize)
+            m_chunkSize(other.m_chunkSize),
+            m_sparseBlocks(std::move(other.m_sparseBlocks)),
+            m_sparseWords(other.m_sparseWords)
         {
             // Column is trivially copyable; a memberwise byte copy of the packed
             // array is correct (the bases point into m_memory, which we took over).
@@ -82,6 +163,8 @@ namespace Astra
             // Make the moved-from chunk inert so its destructor touches nothing.
             other.m_meta = nullptr;
             other.m_count = 0;
+            other.m_sparseBlocks.clear();   // the blocks' words now belong to *this
+            other.m_hasSparse = false;
         }
         
         ArchetypeChunk(const ArchetypeChunk&) = delete;
@@ -89,6 +172,8 @@ namespace Astra
 
         ~ArchetypeChunk()
         {
+            ReleaseSparseBlocks();   // presence words go back to the pool (spec s5.1)
+
             if (!m_meta) ASTRA_UNLIKELY
                 return;  // moved-from (inert) chunk: nothing to destruct
 
@@ -134,12 +219,20 @@ namespace Astra
         template<typename T>
         void ConstructComponentAt(size_t index, T&& value)
         {
+            if constexpr (std::is_empty_v<std::decay_t<T>>)
+            {
+                return;   // a tag carries no value (and an enableable Table tag's column is bit-only)
+            }
             ComponentID id = TypeID<std::decay_t<T>>::Value();
             const int col = m_meta->idToColumn[id];
 
             if (col < 0) ASTRA_UNLIKELY
             {
-                return;  // absent or tag: no storage
+                // Spec 2026-10-01 s7.1, "no silent drops": the Registry diverts every
+                // Sparse/Universal value before archetype placement, so a non-empty value
+                // without a column here is a routing bug. Make it loud.
+                ASTRA_ASSERT(false, "ConstructComponentAt: component has no column in this archetype");
+                return;
             }
 
             const ComponentDescriptor& desc = *m_meta->columns[col].descriptor;
@@ -313,6 +406,12 @@ namespace Astra
         template<Component T>
         void BatchConstructComponent(std::span<const size_t> indices, const T& value)
         {
+            // Empty (tag) component: nothing to construct. Must precede the column lookup: an
+            // enableable tag HAS a (bit-only, stride-0) column, and the trivially-copyable path
+            // below would memcpy sizeof(T) == 1 byte through its base.
+            if constexpr (std::is_empty_v<T>)
+                return;
+
             ComponentID id = TypeID<T>::Value();
             const int col = m_meta->idToColumn[id];
 
@@ -403,7 +502,7 @@ namespace Astra
                     void* srcPtr = base + lastIndex * stride;
 
                     // Destruct destination, move from source, then destruct the
-                    // moved-from source slot (mirrors Archetype::MoveEntitiesBetweenChunks).
+                    // moved-from source slot (the same pairing Archetype::CompactChunks uses).
                     desc.Destruct(dstPtr);
                     desc.MoveConstruct(dstPtr, srcPtr);
                     desc.Destruct(srcPtr);
@@ -443,6 +542,12 @@ namespace Astra
                     m_columns[c].ticks[index] = m_columns[c].ticks[lastIndex];
                 }
 
+            // Sparse presence carry (storage policies, spec s5.3): the tail's bits
+            // fill the vacated slot, then the tail is cleared. With index == lastIndex
+            // this only clears the removed entity's own bits.
+            if (m_hasSparse) ASTRA_UNLIKELY
+                SwapRemoveSparseBits(index, lastIndex);
+
             // Remove last entity
             m_entities.pop_back();
             --m_count;
@@ -454,20 +559,18 @@ namespace Astra
         T* GetComponent(size_t index)
         {
             ASTRA_ASSERT(index < m_count, "Index out of count");
-            ComponentID id = TypeID<T>::Value();
-            void* ptr = GetComponentPointer(id, index);
-            
-            // For empty components, return a static instance
+            // Empty (tag) component: no data, so a shared static instance -- also for an
+            // enableable tag, whose bit-only column has a (never-dereferenced) base. Callers
+            // resolve presence from the archetype mask first (Archetype::GetComponent).
             if constexpr (std::is_empty_v<T>)
             {
-                if (ptr == nullptr)
-                {
-                    static T emptyInstance{};
-                    return &emptyInstance;
-                }
+                static T emptyInstance{};
+                return &emptyInstance;
             }
-            
-            return static_cast<T*>(ptr);
+            else
+            {
+                return static_cast<T*>(GetComponentPointer(TypeID<T>::Value(), index));
+            }
         }
         
         template<Component T>
@@ -573,23 +676,187 @@ namespace Astra
             return true;
         }
 
+        // ===================== Sparse presence blocks (storage policies, spec s5.1) =====================
+        // One lazily created block per sparse SLOT that at least one entity of this
+        // chunk holds. A slot is ComponentStorage's dense slot number, never a
+        // ComponentID. A SET present bit means the entity in that chunk slot is a
+        // member of the slot's sparse set (P1). A SET disabled bit means DISABLED
+        // (P3). `present == nullptr` marks a Universal-enableable mirror block,
+        // where every entity is present and only disabled words exist. A Sparse
+        // slot's present words are allocated by its first SetSparsePresent(true),
+        // which always precedes any disabled bit for that slot. Words come from the
+        // pool's SparseWordFreelist and go back to it when the chunk dies.
+        // Invariant: bits at chunk slots >= count are 0.
+        struct SparseBlock
+        {
+            uint16_t slot{0};
+            uint32_t presentCount{0};     // == popcount(present)
+            uint32_t disabledCount{0};    // == popcount(disabled)
+            uint64_t* present{nullptr};
+            uint64_t* disabled{nullptr};
+        };
+
+        ASTRA_NODISCARD SparseBlock* FindSparseBlock(uint16_t slot) noexcept
+        {
+            SparseBlock* it = LowerBoundSparse(slot);
+            return (it != m_sparseBlocks.data() + m_sparseBlocks.size() && it->slot == slot) ? it : nullptr;
+        }
+        ASTRA_NODISCARD const SparseBlock* FindSparseBlock(uint16_t slot) const noexcept
+        {
+            return const_cast<ArchetypeChunk*>(this)->FindSparseBlock(slot);
+        }
+
+        // Creates the slot's block if missing; with `withDisabled` also allocates
+        // its disabled words. Never allocates present words (see SetSparsePresent).
+        // May reallocate the block list: SparseBlock pointers from an earlier
+        // Find/GetOrCreate on THIS chunk are invalidated (word pointers are not).
+        SparseBlock& GetOrCreateSparseBlock(uint16_t slot, bool withDisabled)
+        {
+            SparseBlock* it = LowerBoundSparse(slot);
+            const size_t pos = static_cast<size_t>(it - m_sparseBlocks.data());
+            if (pos == m_sparseBlocks.size() || it->slot != slot)
+            {
+                SparseBlock fresh;
+                fresh.slot = slot;
+                m_sparseBlocks.insert(m_sparseBlocks.begin() + pos, fresh);
+                m_hasSparse = true;
+            }
+            SparseBlock& b = m_sparseBlocks[pos];
+            if (withDisabled && !b.disabled)
+                b.disabled = AcquireSparseWords();
+            return b;
+        }
+
+        // Returns true iff the bit changed. Clearing presence also clears the
+        // slot's disabled bit: a non-member cannot be disabled (P3).
+        bool SetSparsePresent(uint16_t slot, size_t index, bool present)
+        {
+            ASTRA_ASSERT(index < m_capacity, "SetSparsePresent: index out of capacity");
+            if (present)
+            {
+                SparseBlock& b = GetOrCreateSparseBlock(slot, false);
+                if (!b.present)
+                    b.present = AcquireSparseWords();
+                return WriteSparseBit(b.present, b.presentCount, index, true);
+            }
+            SparseBlock* b = FindSparseBlock(slot);
+            if (!b || !b->present)
+                return false;
+            const bool changed = WriteSparseBit(b->present, b->presentCount, index, false);
+            if (b->disabled)
+                WriteSparseBit(b->disabled, b->disabledCount, index, false);
+            return changed;
+        }
+
+        ASTRA_NODISCARD bool IsSparsePresent(uint16_t slot, size_t index) const noexcept
+        {
+            const SparseBlock* b = FindSparseBlock(slot);
+            return b && b->present && TestSparseBit(b->present, index);
+        }
+
+        // Returns true iff the bit changed. Setting creates the block and its
+        // disabled words lazily (a Universal mirror block when no present words exist).
+        bool SetSparseDisabled(uint16_t slot, size_t index, bool disabled)
+        {
+            ASTRA_ASSERT(index < m_capacity, "SetSparseDisabled: index out of capacity");
+            if (disabled)
+            {
+                SparseBlock& b = GetOrCreateSparseBlock(slot, true);
+                // P3, present before disabled: a Sparse member's present bit is already set. A
+                // Universal mirror block has no present words (spec s5.1) and is exempt.
+                ASTRA_ASSERT(!b.present || TestSparseBit(b.present, index),
+                    "SetSparseDisabled: a non-member cannot be disabled (P3)");
+                return WriteSparseBit(b.disabled, b.disabledCount, index, true);
+            }
+            SparseBlock* b = FindSparseBlock(slot);
+            if (!b || !b->disabled)
+                return false;
+            return WriteSparseBit(b->disabled, b->disabledCount, index, false);
+        }
+
+        ASTRA_NODISCARD bool IsSparseDisabled(uint16_t slot, size_t index) const noexcept
+        {
+            const SparseBlock* b = FindSparseBlock(slot);
+            return b && b->disabled && TestSparseBit(b->disabled, index);
+        }
+
+        // Relocation carry (spec s5.3): copy every set bit of `src` slot `srcIndex`
+        // into this chunk's FRESH slot `dstIndex` (its bits are 0 by the tail
+        // invariant), across every block, creating destination blocks and words
+        // lazily. A source mirror block (present == nullptr) stays a mirror.
+        void CarrySparseBits(const ArchetypeChunk& src, size_t srcIndex, size_t dstIndex)
+        {
+            ASTRA_ASSERT(&src != this, "CarrySparseBits: source and destination must differ");
+            for (const SparseBlock& s : src.m_sparseBlocks)
+            {
+                const bool present  = s.present  && TestSparseBit(s.present, srcIndex);
+                const bool disabled = s.disabled && TestSparseBit(s.disabled, srcIndex);
+                if (!present && !disabled)
+                    continue;
+                if (present)
+                    SetSparsePresent(s.slot, dstIndex, true);
+                if (disabled)
+                    SetSparseDisabled(s.slot, dstIndex, true);
+            }
+        }
+
+        // Swap-remove carry (spec s5.3): the tail slot's bits fill `index`, then the
+        // tail is cleared. With index == lastIndex only the tail clear runs, which
+        // drops exactly the removed entity's own bits.
+        void SwapRemoveSparseBits(size_t index, size_t lastIndex) noexcept
+        {
+            for (SparseBlock& b : m_sparseBlocks)
+            {
+                MoveSparseBit(b.present, b.presentCount, index, lastIndex);
+                MoveSparseBit(b.disabled, b.disabledCount, index, lastIndex);
+            }
+        }
+
+        ASTRA_NODISCARD std::span<const SparseBlock> GetSparseBlocks() const noexcept
+        {
+            return std::span<const SparseBlock>(m_sparseBlocks.data(), m_sparseBlocks.size());
+        }
+        ASTRA_NODISCARD bool HasSparseBlocks() const noexcept { return m_hasSparse; }
+
+        // Drops one slot's block and returns its words (module unload, Task 36).
+        void ReleaseSparseBlock(uint16_t slot) noexcept
+        {
+            SparseBlock* b = FindSparseBlock(slot);
+            if (!b) return;
+            const size_t words = WordsForCapacity(m_capacity);
+            m_sparseWords->Release(b->present, words);
+            m_sparseWords->Release(b->disabled, words);
+            m_sparseBlocks.erase(b);
+            m_hasSparse = !m_sparseBlocks.empty();
+        }
+
         // ===================== Change detection: chunk column versions =====================
         // One Tick per storage column (spec 2026-09-10 §3.2, coarse tier -- every
         // component pays 4 bytes per chunk per column). `column` is a storage-column
         // ORDINAL (m_meta->columns index), never a ComponentID. The region is carved
         // in the chunk arena right after the column data (see InitializeColumns) and
-        // is zero-initialised: version 0 == "never stamped". Stamps are plain stores.
+        // is zero-initialised: version 0 == "never stamped". Stamps are plain stores on serial paths, check-before-store relaxed atomic_ref under Par.
 
+        // `Par`: a parallel driver whose workers can share this chunk (a sparse-driven
+        // dense range is not chunk-partitioned) uses relaxed atomic access (RULINGS Task 28).
+        template<bool Par = false>
         ASTRA_NODISCARD ASTRA_FORCEINLINE Tick GetColumnVersion(int column) const noexcept
         {
             ASTRA_ASSERT(column >= 0 && column < m_meta->columnCount, "column ordinal out of range");
-            return m_columnVersion[column];
+            if constexpr (Par)
+                return LoadTickRelaxed(m_columnVersion[column]);
+            else
+                return m_columnVersion[column];
         }
 
+        template<bool Par = false>
         ASTRA_FORCEINLINE void StampColumn(int column, Tick tick) noexcept
         {
             ASTRA_ASSERT(column >= 0 && column < m_meta->columnCount, "column ordinal out of range");
-            m_columnVersion[column] = tick;
+            if constexpr (Par)
+                StampTickShared(m_columnVersion[column], tick);
+            else
+                m_columnVersion[column] = tick;
         }
 
         // Every storage column at once: the structural-write stamp (a slot in this
@@ -600,7 +867,7 @@ namespace Astra
                 m_columnVersion[c] = tick;
         }
 
-        // Same-archetype relocation carry (CompactChunks / MoveEntitiesBetweenChunks):
+        // Same-archetype relocation carry (CompactChunks):
         // keep whichever of the two versions is newer so a recently-written entity
         // that gets repacked into a fresh chunk is never read as unchanged.
         ASTRA_FORCEINLINE void FoldColumnVersion(int column, Tick other) noexcept
@@ -733,17 +1000,27 @@ namespace Astra
         }
 
         // Assign each storage column a cache-line-aligned base within the chunk arena.
-        // Column physical order follows m_meta->columns (ascending by id); tags carry
-        // no column, so every column here has real storage.
+        // Column physical order follows m_meta->columns (ascending by id). Non-enableable
+        // tags carry no column; an enableable tag's column is BIT-ONLY (stride 0).
         void InitializeColumns()
         {
             size_t offset = 0;
             for (uint16_t c = 0; c < m_meta->columnCount; ++c)
             {
+                m_columns[c].stride = m_meta->columns[c].stride;
+                if (m_columns[c].stride == 0)
+                {
+                    // Bit-only column (enableable tag, spec 2026-10-01 s3.2): no data region and
+                    // no alignment. The base is a NON-NULL in-arena address at the running offset,
+                    // so the type-erased move/copy paths (memcpy of 0 bytes) never see nullptr.
+                    // It is never dereferenced: desc.size == 0 makes every construct/move/destruct
+                    // a no-op, and the Inspector's layout walk reads it as a zero-byte column.
+                    m_columns[c].base = static_cast<std::byte*>(m_memory) + offset;
+                    continue;
+                }
                 // Align offset to a cache line to avoid false sharing between columns.
                 offset = (offset + CACHE_LINE_SIZE - 1) & ~(CACHE_LINE_SIZE - 1);
-                m_columns[c].base   = static_cast<std::byte*>(m_memory) + offset;
-                m_columns[c].stride = m_meta->columns[c].stride;
+                m_columns[c].base = static_cast<std::byte*>(m_memory) + offset;
                 offset += static_cast<size_t>(m_meta->columns[c].stride) * m_capacity;
             }
 
@@ -784,6 +1061,57 @@ namespace Astra
             }
 
             ASTRA_ASSERT(offset <= m_chunkSize, "Component layout exceeds chunk size");
+        }
+
+        ASTRA_NODISCARD SparseBlock* LowerBoundSparse(uint16_t slot) noexcept
+        {
+            return std::lower_bound(m_sparseBlocks.data(), m_sparseBlocks.data() + m_sparseBlocks.size(), slot,
+                                    [](const SparseBlock& b, uint16_t s) { return b.slot < s; });
+        }
+
+        ASTRA_NODISCARD uint64_t* AcquireSparseWords()
+        {
+            ASTRA_ASSERT(m_sparseWords, "chunk has no sparse word freelist (not created by ArchetypeChunkPool)");
+            return m_sparseWords->Acquire(WordsForCapacity(m_capacity));
+        }
+
+        void ReleaseSparseBlocks() noexcept
+        {
+            if (!m_hasSparse) return;
+            const size_t words = WordsForCapacity(m_capacity);
+            for (SparseBlock& b : m_sparseBlocks)
+            {
+                m_sparseWords->Release(b.present, words);
+                m_sparseWords->Release(b.disabled, words);
+            }
+            m_sparseBlocks.clear();
+            m_hasSparse = false;
+        }
+
+        ASTRA_NODISCARD static bool TestSparseBit(const uint64_t* words, size_t i) noexcept
+        {
+            return (words[i >> 6] >> (i & 63)) & 1ull;
+        }
+
+        // Writes one bit, keeping `count` == popcount. Returns true iff it changed.
+        static bool WriteSparseBit(uint64_t* words, uint32_t& count, size_t i, bool value) noexcept
+        {
+            uint64_t& word = words[i >> 6];
+            const uint64_t bit = 1ull << (i & 63);
+            if (((word & bit) != 0) == value)
+                return false;
+            if (value) { word |= bit;  ++count; }
+            else       { word &= ~bit; --count; }
+            return true;
+        }
+
+        static void MoveSparseBit(uint64_t* words, uint32_t& count, size_t index, size_t lastIndex) noexcept
+        {
+            if (!words) return;
+            const bool tail = TestSparseBit(words, lastIndex);
+            if (index != lastIndex)
+                WriteSparseBit(words, count, index, tail);
+            WriteSparseBit(words, count, lastIndex, false);
         }
 
         // Ordinal-direct column addressing for merge-join callers that already
@@ -832,9 +1160,16 @@ namespace Astra
         size_t m_count;
         std::vector<Entity> m_entities;
         const ArchetypeColumnMeta* m_meta{nullptr};  // shared per-archetype metadata (not owned)
+        // == !m_sparseBlocks.empty(), kept HERE beside the hot header: m_sparseBlocks sits
+        // behind the 4 KB column array, and every swap-remove and archetype move of the Table
+        // path asks "does this chunk hold sparse bits" (spec s5.3) -- a cold-line load each
+        // time if it read the vector. Written only where the block list changes.
+        bool m_hasSparse{false};
         Column m_columns[MAX_COMPONENTS]{};          // [0, m_meta->columnCount) live
         Tick* m_columnVersion{nullptr};              // arena-carved, [0, columnCount) live; 0 == never
         size_t m_chunkSize;
+        SmallVector<SparseBlock, 2> m_sparseBlocks;     // sorted by slot; lazily populated (spec s5.1)
+        SparseWordFreelist* m_sparseWords{nullptr};     // the owning pool's freelist (set by CreateChunk)
 
         friend class ArchetypeChunkPool;
     };
@@ -968,6 +1303,7 @@ namespace Astra
             }
 
             auto* chunk = new Chunk(capacity, meta, memory, chunkBytes);
+            chunk->m_sparseWords = &m_sparseWords;
             ChunkDeleter deleter{this, memory};
             return std::unique_ptr<Chunk, ChunkDeleter>(chunk, deleter);
         }
@@ -1000,6 +1336,17 @@ namespace Astra
         ASTRA_NODISCARD size_t GetMinChunkBytes() const noexcept { return m_config.minChunkBytes; }
         ASTRA_NODISCARD size_t GetMaxChunkBytes() const noexcept { return m_config.maxChunkBytes; }
         ASTRA_NODISCARD size_t GetGrowDivisor() const noexcept { return m_config.growDivisor; }
+
+        // Presence-block word accounting (storage policies, spec s5.1).
+        struct SparseWordStats
+        {
+            size_t liveBlocks = 0;     // word blocks held by live chunks
+            size_t cachedBlocks = 0;   // word blocks parked in the freelist
+        };
+        ASTRA_NODISCARD SparseWordStats GetSparseWordStats() const noexcept
+        {
+            return SparseWordStats{m_sparseWords.LiveBlocks(), m_sparseWords.CachedBlocks()};
+        }
 
         ASTRA_NODISCARD Stats GetStats() const
         {
@@ -1039,6 +1386,7 @@ namespace Astra
         
         DefragmentResult Defragment()
         {
+            m_sparseWords.Trim();
             DefragmentResult result;
 
             // Collect first: ForEachFullyFreeArena walks Tlsf's arena list by
@@ -1193,6 +1541,7 @@ namespace Astra
         Config m_config;
         Tlsf m_tlsf;
         SmallVector<ArenaRecord, 16> m_arenas;
+        SparseWordFreelist m_sparseWords;
 
         std::atomic<size_t> m_totalChunks{0};       // LIVE chunks (see GetStats)
         std::atomic<size_t> m_acquireCount{0};
