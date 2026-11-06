@@ -196,7 +196,7 @@ TEST(StorageViewAccess, RangeForSurvivesDestroyingBystandersOfTheCurrentChunk)
     }
     size_t visited = 0;
     bool destroyed = false;
-    for (auto [e, pos, s] : reg.CreateView<Position, PosS>())
+    for ([[maybe_unused]] auto [e, pos, s] : reg.CreateView<Position, PosS>())
     {
         ++visited;
         if (!destroyed)
@@ -217,7 +217,7 @@ TEST(StorageViewAccess, RangeForSurvivesDestroyingBystandersOnUniversalYield)
     for (int i = 0; i < 300; ++i) all.push_back(reg->CreateEntity<Position>());
     size_t visited = 0;
     bool destroyed = false;
-    for (auto [e, pos, h] : reg->CreateView<Position, Health>())
+    for ([[maybe_unused]] auto [e, pos, h] : reg->CreateView<Position, Health>())
     {
         ++visited;
         if (!destroyed)

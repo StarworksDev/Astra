@@ -280,11 +280,11 @@ TYPED_TEST(StorageParityPos, SignalsFireOnGenuineChangeOnly)
     reg->EnableSignals(Astra::Signal::ComponentAdded | Astra::Signal::ComponentRemoved);
     const Astra::ComponentID id = Astra::TypeID<C>::Value();
     std::vector<std::pair<Astra::Entity, C>> added, removed;
-    reg->GetSignalManager()->On<Astra::Events::ComponentAdded>().Register(
+    reg->GetSignalManager()->template On<Astra::Events::ComponentAdded>().Register(
         [&](const Astra::Events::ComponentAdded& ev) {
             if (ev.componentId == id) added.emplace_back(ev.entity, *static_cast<const C*>(ev.component));
         });
-    reg->GetSignalManager()->On<Astra::Events::ComponentRemoved>().Register(
+    reg->GetSignalManager()->template On<Astra::Events::ComponentRemoved>().Register(
         [&](const Astra::Events::ComponentRemoved& ev) {   // emitted BEFORE removal: read the live value
             if (ev.componentId == id) removed.emplace_back(ev.entity, *static_cast<const C*>(ev.component));
         });
@@ -517,9 +517,9 @@ TYPED_TEST(StorageParityEnableable, BornEnabledToggleReportsAndSignalsOnChangeOn
     reg->EnableSignals(Astra::Signal::ComponentEnabled | Astra::Signal::ComponentDisabled);
     const Astra::ComponentID id = Astra::TypeID<C>::Value();
     int enabledSignals = 0, disabledSignals = 0;
-    reg->GetSignalManager()->On<Astra::Events::ComponentEnabled>().Register(
+    reg->GetSignalManager()->template On<Astra::Events::ComponentEnabled>().Register(
         [&](const Astra::Events::ComponentEnabled& ev) { if (ev.componentId == id) ++enabledSignals; });
-    reg->GetSignalManager()->On<Astra::Events::ComponentDisabled>().Register(
+    reg->GetSignalManager()->template On<Astra::Events::ComponentDisabled>().Register(
         [&](const Astra::Events::ComponentDisabled& ev) { if (ev.componentId == id) ++disabledSignals; });
 
     EXPECT_TRUE(reg->template SetEnabled<C>(e, false));
@@ -683,7 +683,7 @@ TYPED_TEST(StorageParityUniversalTag, PayloadIsTheSentinelAndEnabledStateToggles
     // The by-hash (type-erased) payload of a present tag is the shared sentinel in every kind;
     // the typed pointer is only required to be non-null (Table hands out a column-relative address).
     EXPECT_EQ(reg->GetComponentByHash(e, hash), Astra::EmptyComponentSentinel());
-    EXPECT_EQ(static_cast<const void*>(std::as_const(*reg).GetComponent<C>(e)), static_cast<void*>(typed));
+    EXPECT_EQ(static_cast<const void*>(std::as_const(*reg).template GetComponent<C>(e)), static_cast<void*>(typed));
 
     EXPECT_TRUE(reg->template IsEnabled<C>(e));
     EXPECT_EQ((reg->template CreateView<Velocity, C>().Size()), 2u);
