@@ -83,7 +83,7 @@ TEST(ComponentStorageFormat, BlockIsSortedByHashWithAscendingEntitiesValuesAndDi
     {
         const BlockHeader h = ReadBlockHeader(r);
         ASSERT_FALSE(r.HasError());
-        if (b > 0) EXPECT_GT(h.hash, previous) << "blocks must be sorted by hash";
+        if (b > 0) { EXPECT_GT(h.hash, previous) << "blocks must be sorted by hash"; }
         previous = h.hash;
         EXPECT_EQ(h.version, 1u);
 
@@ -262,7 +262,7 @@ TEST(ComponentStorageFormat, SparseUniversalAndSparseTagRoundTripInBothCompressi
                 h.parent = static_cast<uint32_t>(i);
                 ASSERT_TRUE(reg.AddComponentByID(e, save.hierId, &h, sizeof(h)));
             }
-            if (i % 6 == 0) ASSERT_TRUE(reg.SetEnabledByID(e, save.hierId, false));
+            if (i % 6 == 0) { ASSERT_TRUE(reg.SetEnabledByID(e, save.hierId, false)); }
             if (i % 5 == 0)
             {
                 Player tag{};
@@ -576,7 +576,7 @@ TEST(ComponentStorageFormat, EnableableUniversalKeepsDisabledEntitiesAcrossSaveL
     {
         const Astra::Entity e = reg.CreateEntity<Position>();
         reg.GetComponent<Hierarchy>(e)->parent = static_cast<uint32_t>(i);
-        if (i % 3 == 0) ASSERT_TRUE(reg.SetEnabled<Hierarchy>(e, false));
+        if (i % 3 == 0) { ASSERT_TRUE(reg.SetEnabled<Hierarchy>(e, false)); }
         es.push_back(e);
     }
     ASSERT_EQ(reg.ValidateStorageInvariants(), "");
@@ -615,7 +615,7 @@ TEST(ComponentStorageFormat, ArchivedUniversalLoadsAsSparseWithValuesPresenceAnd
     {
         const Astra::Entity e = reg.CreateEntity<Position>();
         reg.GetComponent<Hierarchy>(e)->parent = 40u + static_cast<uint32_t>(i);
-        if (i == 2 || i == 5) ASSERT_TRUE(reg.SetEnabled<Hierarchy>(e, false));
+        if (i == 2 || i == 5) { ASSERT_TRUE(reg.SetEnabled<Hierarchy>(e, false)); }
         es.push_back(e);
     }
     auto saved = reg.Save();

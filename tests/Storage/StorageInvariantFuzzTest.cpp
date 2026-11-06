@@ -429,7 +429,7 @@ namespace
             if (how == 0)      ok = m_reg->AddComponent(e, value);
             else if (how == 1) ok = m_reg->EmplaceComponent<T>(e, value);
             else               ok = m_reg->AddComponentByID(e, Astra::TypeID<T>::Value(), &value, sizeof(T));
-            if (how == 2) EXPECT_EQ(ok, !present && !universal) << "by-id add: true iff absent";
+            if (how == 2) { EXPECT_EQ(ok, !present && !universal) << "by-id add: true iff absent"; }
             else          EXPECT_TRUE(ok) << "typed/emplace add of a live entity must return true (present => no-op)";
         }
 
@@ -477,7 +477,7 @@ namespace
             const bool removed = RemoveOne<T>(e);
             m_expectRefusal = false;
             EXPECT_FALSE(removed) << "a Universal component must never be removed";
-            if (kAssertsActive) EXPECT_EQ(m_refusals, before + 1) << "Debug must assert exactly once on a Universal remove";
+            if (kAssertsActive) { EXPECT_EQ(m_refusals, before + 1) << "Debug must assert exactly once on a Universal remove"; }
         }
 
         const char* OpRemove()
@@ -640,7 +640,7 @@ namespace
                                                   : m_reg->RemoveComponents<Timer>(std::span{es});
                 m_expectRefusal = false;
                 EXPECT_EQ(removed, 0u);
-                if (kAssertsActive) EXPECT_EQ(m_refusals, before + 1) << "Debug must assert exactly once on a Universal batch remove";
+                if (kAssertsActive) { EXPECT_EQ(m_refusals, before + 1) << "Debug must assert exactly once on a Universal batch remove"; }
                 return "batch-remove Universal (refused)";
             }
             }
@@ -659,7 +659,7 @@ namespace
             const auto result = cmd.Execute();
             m_expectRefusal = false;
             EXPECT_FALSE(result.IsOk()) << "a recorded Universal remove must fail at Execute";
-            if (kAssertsActive) EXPECT_EQ(m_refusals, before + 1) << "Debug must assert exactly once on a recorded Universal remove";
+            if (kAssertsActive) { EXPECT_EQ(m_refusals, before + 1) << "Debug must assert exactly once on a recorded Universal remove"; }
             return "command-buffer Universal remove (refused)";
         }
 

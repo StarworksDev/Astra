@@ -275,7 +275,9 @@ TEST(StorageViewAccess, NestedAndCopiedRangeForIteratorsKeepIndependentWalks)
         auto copy = it;
         ++it;
         if (n > 1)
+        {
             EXPECT_NE(std::get<0>(*it), std::get<0>(*copy));
+        }
         for (; it != view.end(); ++it) {}
         std::vector<Astra::Entity> viaCopy;
         for (; copy != view.end(); ++copy) viaCopy.push_back(std::get<0>(*copy));

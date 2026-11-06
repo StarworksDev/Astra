@@ -101,7 +101,7 @@ TYPED_TEST(StorageParityPos, RemovePresentAbsentAndUniversalRefusal)
             EXPECT_FALSE(reg->RemoveComponent<C>(e));
             EXPECT_FALSE(reg->RemoveComponentByID(e, Astra::TypeID<C>::Value()));
         }
-        if (kAssertsActive) EXPECT_GE(cap.count, 2);   // one refusal per call (Debug)
+        if (kAssertsActive) { EXPECT_GE(cap.count, 2); }   // one refusal per call (Debug)
         else                EXPECT_EQ(cap.count, 0);
         EXPECT_TRUE(reg->HasComponent<C>(e));
         EXPECT_EQ(*reg->GetComponent<C>(e), MakePos<C>(1.0f));
@@ -207,7 +207,7 @@ TYPED_TEST(StorageParityPos, BatchCreateAddEmplaceRemove)
             removed = reg->RemoveComponents<C>(firstHalf);
         }
         EXPECT_EQ(removed, 0u);
-        if (kAssertsActive) EXPECT_GE(cap.count, 1);
+        if (kAssertsActive) { EXPECT_GE(cap.count, 1); }
         else                EXPECT_EQ(cap.count, 0);
         for (Astra::Entity e : firstHalf) EXPECT_TRUE(reg->HasComponent<C>(e));
     }
@@ -217,7 +217,7 @@ TYPED_TEST(StorageParityPos, BatchCreateAddEmplaceRemove)
         for (size_t i = 0; i < N; ++i)
         {
             ASSERT_EQ(reg->HasComponent<C>(withC[i]), i >= N / 2) << i;
-            if (i >= N / 2) ASSERT_EQ(*reg->GetComponent<C>(withC[i]), MakePos<C>(float(i))) << i;
+            if (i >= N / 2) { ASSERT_EQ(*reg->GetComponent<C>(withC[i]), MakePos<C>(float(i))) << i; }
         }
         EXPECT_EQ(reg->RemoveComponents<C>(firstHalf), 0u);   // all absent now
     }

@@ -136,7 +136,7 @@ TEST(MatchingRuns, RandomSetsAgreeWithTheReferenceAndTheHelpers)
         std::vector<uint64_t> out(words, 0xDEADull);
         Astra::Detail::WriteMatchWords(pe.data(), pe.size(), pr.data(), pr.size(), count, out.data());
         ASSERT_EQ(Collect({}, {out}, count), expected) << "round " << round;
-        if (count % 64) ASSERT_EQ(out.back() >> (count % 64), 0ull);   // tail cleared
+        if (count % 64) { ASSERT_EQ(out.back() >> (count % 64), 0ull); }   // tail cleared
 
         // The kept wrapper is exclude-only and agrees with ForEachMatchingRun.
         Runs viaWrapper;

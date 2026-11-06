@@ -155,7 +155,7 @@ TEST(StorageMigration, InlineEnableableTableColumnKeepsItsDisabledStateAsSparse)
     {
         const Astra::Entity e = reg.CreateEntity<Position, Hierarchy>();
         reg.GetComponent<Hierarchy>(e)->parent = static_cast<uint32_t>(i);
-        if (i % 4 == 1) ASSERT_TRUE(reg.SetEnabled<Hierarchy>(e, false));
+        if (i % 4 == 1) { ASSERT_TRUE(reg.SetEnabled<Hierarchy>(e, false)); }
         es.push_back(e);
     }
     const auto bytes = SaveWith(reg, Astra::CompressionMode::None);
@@ -404,7 +404,7 @@ TEST(StorageMigration, ArchivedEnableableTagLoadsAsADataTableTypeWithDefaultValu
             {
                 const Astra::Entity e = reg.CreateEntity<Position>();
                 ASSERT_TRUE(reg.AddComponentByID(e, nameId, nullptr, 0));
-                if (i % 3 == 0) ASSERT_TRUE(reg.SetEnabledByID(e, nameId, false));
+                if (i % 3 == 0) { ASSERT_TRUE(reg.SetEnabledByID(e, nameId, false)); }
                 entities.push_back(e);
             }
             bytes = SaveWith(reg, mode);
@@ -456,7 +456,7 @@ namespace
                     Hierarchy h{};
                     h.parent = static_cast<uint32_t>(i);
                     EXPECT_TRUE(reg->AddComponentByID(e, hierId, &h, sizeof(h)));
-                    if (i % 8 == 0) EXPECT_TRUE(reg->SetEnabledByID(e, hierId, false));
+                    if (i % 8 == 0) { EXPECT_TRUE(reg->SetEnabledByID(e, hierId, false)); }
                 }
                 entities.push_back(e);
             }

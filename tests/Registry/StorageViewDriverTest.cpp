@@ -127,7 +127,7 @@ TEST(StorageViewDriver, ParallelSparseDrivenVisitsEachMemberOnce)
     });
     EXPECT_EQ(visits.load(), 8000u);
     for (size_t i = 0; i < es.size(); ++i)
-        if (reg.HasComponent<PosS>(es[i])) ASSERT_FLOAT_EQ(std::as_const(reg).GetComponent<PosS>(es[i])->y, 1.0f) << i;
+        if (reg.HasComponent<PosS>(es[i])) { ASSERT_FLOAT_EQ(std::as_const(reg).GetComponent<PosS>(es[i])->y, 1.0f) << i; }
 }
 
 // Archetype-driven parallel walk with a Sparse filter and a Universal yield.

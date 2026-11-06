@@ -176,7 +176,9 @@ TEST(EnableableTag, BatchAddLeavesNeighbourDataIntact)
         EXPECT_EQ(p->z, -static_cast<float>(i));
         EXPECT_EQ(reg.HasComponent<EnTag>(es[i]), (i % 2) == 1) << i;
         if ((i % 2) == 1)
+        {
             EXPECT_TRUE(reg.IsEnabled<EnTag>(es[i])) << i;
+        }
     }
     ExpectBitInvariant(reg);
 }

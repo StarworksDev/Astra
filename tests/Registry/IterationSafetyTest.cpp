@@ -271,7 +271,9 @@ TEST(IterationSafety, SparseRemoveDuringRequiringViewTripsTheGuardAndStaysSafe)
     {
         const PosS* s = std::as_const(reg).GetComponent<PosS>(es[i]);
         if (i % 2 == 0)
+        {
             EXPECT_EQ(s, nullptr) << i;
+        }
         else
         {
             ASSERT_NE(s, nullptr) << i;

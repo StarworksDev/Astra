@@ -160,7 +160,7 @@ TEST(StorageViewFilter, OptionalSparseAndUniversalYieldPointers)
             ++visits;
             const size_t i = size_t(std::find(es.begin(), es.end(), e) - es.begin());
             EXPECT_EQ(s != nullptr, i % 2 == 0);
-            if (s) EXPECT_FLOAT_EQ(s->x, float(i));
+            if (s) { EXPECT_FLOAT_EQ(s->x, float(i)); }
             EXPECT_NE(h, nullptr);
         });
     EXPECT_EQ(visits, 20u);

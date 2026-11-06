@@ -47,7 +47,7 @@ namespace
         for (size_t i = 0; i < n; ++i)
         {
             p.es[i] = p.reg->CreateEntityWith(Velocity{float(i), 0.0f, 0.0f});
-            if (Population<V>::HasHealth(i)) EXPECT_TRUE(p.reg->AddComponent(p.es[i], Health{}));
+            if (Population<V>::HasHealth(i)) { EXPECT_TRUE(p.reg->AddComponent(p.es[i], Health{})); }
             if (p.Given(i)) Give<V>(*p.reg, p.es[i], MakePos<typename V::Comp>(float(i)));
         }
         return p;
@@ -117,7 +117,7 @@ TYPED_TEST(StorageParityQuery, NotWithOptionalAnyOneOf)
         ++visited;
         const size_t i = size_t(v.dx);
         EXPECT_EQ(c != nullptr, p.HasC(i)) << i;
-        if (c) EXPECT_EQ(*c, p.ValueOf(i)) << i;
+        if (c) { EXPECT_EQ(*c, p.ValueOf(i)) << i; }
     });
     EXPECT_EQ(visited, p.n);
 }
@@ -197,7 +197,7 @@ TYPED_TEST(StorageParityQuery, ParallelForEachOnARealSchedulerVisitsEveryHolderO
     });
     EXPECT_EQ(visits.load(), p.Holders());
     for (size_t i = 0; i < p.n; ++i)
-        if (p.HasC(i)) ASSERT_FLOAT_EQ(p.reg->template GetComponent<C>(p.es[i])->z, p.ValueOf(i).z + 1.0f) << i;
+        if (p.HasC(i)) { ASSERT_FLOAT_EQ(p.reg->template GetComponent<C>(p.es[i])->z, p.ValueOf(i).z + 1.0f) << i; }
 
     std::atomic<size_t> onlyC{0};                            // sparse-driven partitioning (s6.5)
     p.reg->template CreateView<const C>().ParallelForEach([&](Astra::Entity, const C&) { onlyC.fetch_add(1, std::memory_order_relaxed); });
@@ -275,7 +275,7 @@ TYPED_TEST(StorageParityQuery, SaveLoadRoundTripKeepsValuesAndMembership)
         for (size_t i = 0; i < p.n; ++i)
         {
             ASSERT_EQ(r.template HasComponent<C>(p.es[i]), p.HasC(i)) << i;
-            if (p.HasC(i)) ASSERT_EQ(*r.template GetComponent<C>(p.es[i]), p.ValueOf(i)) << i;
+            if (p.HasC(i)) { ASSERT_EQ(*r.template GetComponent<C>(p.es[i]), p.ValueOf(i)) << i; }
             ASSERT_EQ(r.template HasComponent<Health>(p.es[i]), p.HasHealth(i)) << i;
         }
         EXPECT_EQ((r.template CreateView<Velocity, C>().Size()), p.Holders());
@@ -398,7 +398,7 @@ TYPED_TEST(StorageParityEnableableQuery, DefaultViewsSkipDisabledAndBitsSurviveS
         return std::tuple{MakeHier<C>(uint32_t(i)), Velocity{float(i), 0.0f, 0.0f}};
     })), N);
     auto disabled = [](size_t i) { return i % 3 == 0 || i == 63 || i == 64 || i == 65 || i == 127 || i == 128; };
-    for (size_t i = 0; i < N; ++i) if (disabled(i)) ASSERT_TRUE(reg->template SetEnabled<C>(es[i], false));
+    for (size_t i = 0; i < N; ++i) if (disabled(i)) { ASSERT_TRUE(reg->template SetEnabled<C>(es[i], false)); }
     size_t enabled = 0;
     for (size_t i = 0; i < N; ++i) enabled += disabled(i) ? 0 : 1;
 

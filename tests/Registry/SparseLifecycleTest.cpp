@@ -107,7 +107,7 @@ TEST(SparseLifecycle, DestroyEntitiesBatchWithDuplicates)
         if (dead) { EXPECT_FALSE(reg.IsValid(es[i])); continue; }
         EXPECT_EQ(reg.HasComponent<SpA>(es[i]), i % 2 == 0) << i;
         expectA += (i % 2 == 0) ? 1u : 0u;
-        if (i % 3 == 0) EXPECT_EQ(reg.IsEnabled<SpE>(es[i]), i % 6 != 0) << i;
+        if (i % 3 == 0) { EXPECT_EQ(reg.IsEnabled<SpE>(es[i]), i % 6 != 0) << i; }
     }
     EXPECT_EQ(SetSize<SpA>(reg), expectA);
     ExpectInvariants(reg);
@@ -194,7 +194,7 @@ TEST(SparseLifecycle, DefragmentAfterDestroysKeepsPresenceAndDisabledState)
             ASSERT_NE(reg.GetComponent<SpA>(es[i]), nullptr) << i;
             EXPECT_FLOAT_EQ(reg.GetComponent<SpA>(es[i])->v, float(i)) << i;
         }
-        if (i % 2 == 0) EXPECT_EQ(reg.IsEnabled<SpE>(es[i]), i % 4 != 0) << i;
+        if (i % 2 == 0) { EXPECT_EQ(reg.IsEnabled<SpE>(es[i]), i % 4 != 0) << i; }
         expectA += (i % 3 == 0) ? 1u : 0u;
     }
     EXPECT_EQ(SetSize<SpA>(reg), expectA);
