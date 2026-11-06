@@ -648,7 +648,7 @@ TEST(StorageModuleUnload, UnloadingAnEnableableUniversalReleasesItsMirrorOnlyBlo
     const int slot = reg.GetComponentStorage()->SparseSlotOf(id);
     ASSERT_GE(slot, 0) << "an enableable Universal owns a mirror slot";
     size_t chunksWithBlock = 0;
-    size_t chunks = 0;
+    [[maybe_unused]] size_t chunks = 0;
     for (Astra::Archetype* archetype : reg.GetArchetypeManager()->GetArchetypes())
         for (const auto& chunk : archetype->GetChunks())
             if (chunk && chunk->GetCount() > 0)

@@ -26,12 +26,12 @@ TYPED_TEST(StorageParityPos, VariantIsInForce)
     using V = TypeParam;
     using C = typename V::Comp;
     auto reg = V::Make();
-    Astra::Entity e = reg->CreateEntity<Velocity>();
+    Astra::Entity e = reg->template CreateEntity<Velocity>();
     const size_t archetypesBefore = reg->GetArchetypeCount();
     if constexpr (V::kUniversal)
     {
-        EXPECT_TRUE(reg->HasComponent<C>(e));                    // always present
-        EXPECT_NE(reg->GetComponent<C>(e), nullptr);
+        EXPECT_TRUE(reg->template HasComponent<C>(e));                    // always present
+        EXPECT_NE(reg->template GetComponent<C>(e), nullptr);
         Astra::Registry plain;                                   // same create, no Universal declared
         plain.CreateEntity<Velocity>();
         EXPECT_EQ(archetypesBefore, plain.GetArchetypeCount());  // not in any archetype mask: no extra archetype vs a plain registry
@@ -39,7 +39,7 @@ TYPED_TEST(StorageParityPos, VariantIsInForce)
     }
     else
     {
-        EXPECT_FALSE(reg->HasComponent<C>(e));
+        EXPECT_FALSE(reg->template HasComponent<C>(e));
         ASSERT_TRUE(reg->AddComponent(e, MakePos<C>(1.0f)));
         if constexpr (V::kSparse)
             EXPECT_EQ(reg->GetArchetypeCount(), archetypesBefore);       // never fragments
@@ -55,13 +55,13 @@ TYPED_TEST(StorageParityPos, CreateWithValueThenGetAndHas)
     auto reg = V::Make();
     Astra::Entity e = reg->CreateEntityWith(MakePos<C>(1.0f), Velocity{4.0f, 5.0f, 6.0f});
     ASSERT_TRUE(reg->IsValid(e));
-    EXPECT_TRUE(reg->HasComponent<C>(e));
-    C* c = reg->GetComponent<C>(e);
+    EXPECT_TRUE(reg->template HasComponent<C>(e));
+    C* c = reg->template GetComponent<C>(e);
     ASSERT_NE(c, nullptr);
     EXPECT_EQ(*c, MakePos<C>(1.0f));          // Universal: a supplied value is never overwritten
     const Astra::Registry& cref = *reg;
     EXPECT_EQ(cref.GetComponent<C>(e), c);    // const and mutable access agree
-    EXPECT_FLOAT_EQ(reg->GetComponent<Velocity>(e)->dx, 4.0f);
+    EXPECT_FLOAT_EQ(reg->template GetComponent<Velocity>(e)->dx, 4.0f);
 }
 
 TYPED_TEST(StorageParityPos, AddAndEmplaceWhenPresentAreNoOpsReturningTrue)
@@ -69,21 +69,21 @@ TYPED_TEST(StorageParityPos, AddAndEmplaceWhenPresentAreNoOpsReturningTrue)
     using V = TypeParam;
     using C = typename V::Comp;
     auto reg = V::Make();
-    Astra::Entity e = reg->CreateEntity<Velocity>();
+    Astra::Entity e = reg->template CreateEntity<Velocity>();
     // Universal: present from creation, so even the first Add is the no-op (s3.3, s12.2).
     const C expected = V::kUniversal ? C{} : MakePos<C>(1.0f);
 
     EXPECT_TRUE(reg->AddComponent(e, MakePos<C>(1.0f)));
-    EXPECT_TRUE(reg->HasComponent<C>(e));
-    EXPECT_EQ(*reg->GetComponent<C>(e), expected);
+    EXPECT_TRUE(reg->template HasComponent<C>(e));
+    EXPECT_EQ(*reg->template GetComponent<C>(e), expected);
     EXPECT_TRUE(reg->AddComponent(e, MakePos<C>(9.0f)));             // present: no-op, true
-    EXPECT_EQ(*reg->GetComponent<C>(e), expected);
-    EXPECT_TRUE(reg->EmplaceComponent<C>(e, 7.0f, 7.0f, 7.0f));    // present: no-op, true
-    EXPECT_EQ(*reg->GetComponent<C>(e), expected);
+    EXPECT_EQ(*reg->template GetComponent<C>(e), expected);
+    EXPECT_TRUE(reg->template EmplaceComponent<C>(e, 7.0f, 7.0f, 7.0f));    // present: no-op, true
+    EXPECT_EQ(*reg->template GetComponent<C>(e), expected);
 
-    Astra::Entity f = reg->CreateEntity<Velocity>();
-    EXPECT_TRUE(reg->EmplaceComponent<C>(f, 3.0f, 4.0f, 5.0f));
-    EXPECT_EQ(*reg->GetComponent<C>(f), (V::kUniversal ? C{} : C{3.0f, 4.0f, 5.0f}));
+    Astra::Entity f = reg->template CreateEntity<Velocity>();
+    EXPECT_TRUE(reg->template EmplaceComponent<C>(f, 3.0f, 4.0f, 5.0f));
+    EXPECT_EQ(*reg->template GetComponent<C>(f), (V::kUniversal ? C{} : C{3.0f, 4.0f, 5.0f}));
 }
 
 TYPED_TEST(StorageParityPos, RemovePresentAbsentAndUniversalRefusal)
@@ -98,25 +98,25 @@ TYPED_TEST(StorageParityPos, RemovePresentAbsentAndUniversalRefusal)
         AssertCount cap;
         {
             Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &cap);
-            EXPECT_FALSE(reg->RemoveComponent<C>(e));
+            EXPECT_FALSE(reg->template RemoveComponent<C>(e));
             EXPECT_FALSE(reg->RemoveComponentByID(e, Astra::TypeID<C>::Value()));
         }
         if (kAssertsActive) { EXPECT_GE(cap.count, 2); }   // one refusal per call (Debug)
         else                EXPECT_EQ(cap.count, 0);
-        EXPECT_TRUE(reg->HasComponent<C>(e));
-        EXPECT_EQ(*reg->GetComponent<C>(e), MakePos<C>(1.0f));
+        EXPECT_TRUE(reg->template HasComponent<C>(e));
+        EXPECT_EQ(*reg->template GetComponent<C>(e), MakePos<C>(1.0f));
     }
     else
     {
-        EXPECT_TRUE(reg->RemoveComponent<C>(e));
-        EXPECT_FALSE(reg->HasComponent<C>(e));
-        EXPECT_EQ(reg->GetComponent<C>(e), nullptr);
-        EXPECT_FALSE(reg->RemoveComponent<C>(e));                            // absent: false
+        EXPECT_TRUE(reg->template RemoveComponent<C>(e));
+        EXPECT_FALSE(reg->template HasComponent<C>(e));
+        EXPECT_EQ(reg->template GetComponent<C>(e), nullptr);
+        EXPECT_FALSE(reg->template RemoveComponent<C>(e));                            // absent: false
         EXPECT_FALSE(reg->RemoveComponentByID(e, Astra::TypeID<C>::Value()));
         EXPECT_TRUE(reg->IsValid(e));
-        EXPECT_NE(reg->GetComponent<Velocity>(e), nullptr);                  // other data untouched
+        EXPECT_NE(reg->template GetComponent<Velocity>(e), nullptr);                  // other data untouched
     }
-    EXPECT_EQ(*reg->GetComponent<C>(keep), MakePos<C>(2.0f));                // neighbour value intact
+    EXPECT_EQ(*reg->template GetComponent<C>(keep), MakePos<C>(2.0f));                // neighbour value intact
 }
 
 // Review Focus 1: a stale handle (destroy + recycle at version+1) must miss or be
@@ -135,21 +135,21 @@ TYPED_TEST(StorageParityPos, StaleHandleAfterDestroyAndRecycleMisses)
     ASSERT_EQ(occupant.GetID(), stale.GetID());
     ASSERT_NE(occupant.GetVersion(), stale.GetVersion());
 
-    EXPECT_FALSE(reg->HasComponent<C>(stale));
-    EXPECT_EQ(reg->GetComponent<C>(stale), nullptr);
+    EXPECT_FALSE(reg->template HasComponent<C>(stale));
+    EXPECT_EQ(reg->template GetComponent<C>(stale), nullptr);
     EXPECT_FALSE(reg->HasComponentByHash(stale, Astra::TypeID<C>::Hash()));
     EXPECT_EQ(reg->GetComponentByHash(stale, Astra::TypeID<C>::Hash()), nullptr);
     EXPECT_FALSE(reg->AddComponent(stale, MakePos<C>(9.0f)));
-    EXPECT_FALSE(reg->EmplaceComponent<C>(stale, 9.0f, 9.0f, 9.0f));
+    EXPECT_FALSE(reg->template EmplaceComponent<C>(stale, 9.0f, 9.0f, 9.0f));
     {
         AssertCount cap;   // Universal: a remove is refused whatever the handle; never fatal here
         Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &cap);
-        EXPECT_FALSE(reg->RemoveComponent<C>(stale));
+        EXPECT_FALSE(reg->template RemoveComponent<C>(stale));
         EXPECT_FALSE(reg->RemoveComponentByID(stale, Astra::TypeID<C>::Value()));
         EXPECT_EQ(cap.count, 0) << "a stale handle stays quiet for every kind (Task 12)";
     }
-    EXPECT_TRUE(reg->HasComponent<C>(occupant));
-    EXPECT_EQ(*reg->GetComponent<C>(occupant), MakePos<C>(5.0f));   // the occupant is untouched
+    EXPECT_TRUE(reg->template HasComponent<C>(occupant));
+    EXPECT_EQ(*reg->template GetComponent<C>(occupant), MakePos<C>(5.0f));   // the occupant is untouched
 }
 
 // Review Focus 1 (Clear): every pre-Clear handle is stale afterwards.
@@ -166,10 +166,10 @@ TYPED_TEST(StorageParityPos, ClearThenRecycleMisses)
     for (int i = 0; i < 64; ++i) after.push_back(reg->CreateEntityWith(MakePos<C>(100.0f + i), Velocity{}));
     for (int i = 0; i < 64; ++i)
     {
-        EXPECT_FALSE(reg->HasComponent<C>(before[i])) << i;
-        EXPECT_EQ(reg->GetComponent<C>(before[i]), nullptr) << i;
+        EXPECT_FALSE(reg->template HasComponent<C>(before[i])) << i;
+        EXPECT_EQ(reg->template GetComponent<C>(before[i]), nullptr) << i;
         EXPECT_FALSE(reg->AddComponent(before[i], MakePos<C>(-1.0f))) << i;
-        EXPECT_EQ(*reg->GetComponent<C>(after[i]), MakePos<C>(100.0f + i)) << i;
+        EXPECT_EQ(*reg->template GetComponent<C>(after[i]), MakePos<C>(100.0f + i)) << i;
     }
 }
 
@@ -182,20 +182,20 @@ TYPED_TEST(StorageParityPos, BatchCreateAddEmplaceRemove)
     auto reg = V::Make();
     constexpr size_t N = 3000;
     std::vector<Astra::Entity> withC(N);
-    ASSERT_EQ((reg->CreateEntitiesWith<C, Velocity>(N, std::span{withC}, [](size_t i) {
+    ASSERT_EQ((reg->template CreateEntitiesWith<C, Velocity>(N, std::span{withC}, [](size_t i) {
         return std::tuple{MakePos<C>(float(i)), Velocity{}};
     })), N);
-    for (size_t i = 0; i < N; ++i) ASSERT_EQ(*reg->GetComponent<C>(withC[i]), MakePos<C>(float(i))) << i;
+    for (size_t i = 0; i < N; ++i) ASSERT_EQ(*reg->template GetComponent<C>(withC[i]), MakePos<C>(float(i))) << i;
 
     std::vector<Astra::Entity> plain(N);
-    ASSERT_EQ(reg->CreateEntities<Velocity>(N, std::span{plain}), N);
+    ASSERT_EQ(reg->template CreateEntities<Velocity>(N, std::span{plain}), N);
     reg->AddComponents(std::span{plain}, MakePos<C>(42.0f));
-    for (Astra::Entity e : plain) ASSERT_EQ(*reg->GetComponent<C>(e), V::kUniversal ? C{} : MakePos<C>(42.0f));
+    for (Astra::Entity e : plain) ASSERT_EQ(*reg->template GetComponent<C>(e), V::kUniversal ? C{} : MakePos<C>(42.0f));
 
     std::vector<Astra::Entity> emplaced(64);
-    ASSERT_EQ(reg->CreateEntities<Velocity>(64, std::span{emplaced}), 64u);
-    reg->EmplaceComponents<C>(std::span{emplaced}, 3.0f, 3.0f, 3.0f);
-    for (Astra::Entity e : emplaced) ASSERT_EQ(*reg->GetComponent<C>(e), (V::kUniversal ? C{} : C{3.0f, 3.0f, 3.0f}));
+    ASSERT_EQ(reg->template CreateEntities<Velocity>(64, std::span{emplaced}), 64u);
+    reg->template EmplaceComponents<C>(std::span{emplaced}, 3.0f, 3.0f, 3.0f);
+    for (Astra::Entity e : emplaced) ASSERT_EQ(*reg->template GetComponent<C>(e), (V::kUniversal ? C{} : C{3.0f, 3.0f, 3.0f}));
 
     std::span<Astra::Entity> firstHalf(withC.data(), N / 2);
     if constexpr (V::kUniversal)
@@ -204,22 +204,22 @@ TYPED_TEST(StorageParityPos, BatchCreateAddEmplaceRemove)
         size_t removed = 0;
         {
             Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &cap);
-            removed = reg->RemoveComponents<C>(firstHalf);
+            removed = reg->template RemoveComponents<C>(firstHalf);
         }
         EXPECT_EQ(removed, 0u);
         if (kAssertsActive) { EXPECT_GE(cap.count, 1); }
         else                EXPECT_EQ(cap.count, 0);
-        for (Astra::Entity e : firstHalf) EXPECT_TRUE(reg->HasComponent<C>(e));
+        for (Astra::Entity e : firstHalf) EXPECT_TRUE(reg->template HasComponent<C>(e));
     }
     else
     {
-        EXPECT_EQ(reg->RemoveComponents<C>(firstHalf), N / 2);
+        EXPECT_EQ(reg->template RemoveComponents<C>(firstHalf), N / 2);
         for (size_t i = 0; i < N; ++i)
         {
-            ASSERT_EQ(reg->HasComponent<C>(withC[i]), i >= N / 2) << i;
-            if (i >= N / 2) { ASSERT_EQ(*reg->GetComponent<C>(withC[i]), MakePos<C>(float(i))) << i; }
+            ASSERT_EQ(reg->template HasComponent<C>(withC[i]), i >= N / 2) << i;
+            if (i >= N / 2) { ASSERT_EQ(*reg->template GetComponent<C>(withC[i]), MakePos<C>(float(i))) << i; }
         }
-        EXPECT_EQ(reg->RemoveComponents<C>(firstHalf), 0u);   // all absent now
+        EXPECT_EQ(reg->template RemoveComponents<C>(firstHalf), 0u);   // all absent now
     }
 }
 
@@ -232,7 +232,7 @@ TYPED_TEST(StorageParityPos, ByIdPathsAndReflectionSeeTheComponent)
     using V = TypeParam;
     using C = typename V::Comp;
     auto reg = V::Make();
-    Astra::Entity e = reg->CreateEntity<Velocity>();
+    Astra::Entity e = reg->template CreateEntity<Velocity>();
     const Astra::ComponentID id = Astra::TypeID<C>::Value();
     const uint64_t hash = Astra::TypeID<C>::Hash();
     const C value = MakePos<C>(3.0f);
@@ -243,7 +243,7 @@ TYPED_TEST(StorageParityPos, ByIdPathsAndReflectionSeeTheComponent)
     ASSERT_TRUE(reg->HasComponentByHash(e, hash));
     ASSERT_NE(reg->GetComponentByHash(e, hash), nullptr);
     EXPECT_EQ(*static_cast<const C*>(reg->GetComponentByHash(e, hash)), expected);
-    EXPECT_EQ(reg->GetComponentByHash(e, hash), static_cast<void*>(reg->GetComponent<C>(e)));
+    EXPECT_EQ(reg->GetComponentByHash(e, hash), static_cast<void*>(reg->template GetComponent<C>(e)));
 
     auto countId = [&](const std::vector<const Astra::ComponentDescriptor*>& ds) {
         return std::count_if(ds.begin(), ds.end(), [&](const Astra::ComponentDescriptor* d) { return d && d->id == id; });
@@ -252,7 +252,7 @@ TYPED_TEST(StorageParityPos, ByIdPathsAndReflectionSeeTheComponent)
     const auto infos = reg->InspectEntity(e);
     auto it = std::find_if(infos.begin(), infos.end(), [&](const auto& ci) { return ci.descriptor && ci.descriptor->id == id; });
     ASSERT_NE(it, infos.end());
-    EXPECT_EQ(it->data, static_cast<void*>(reg->GetComponent<C>(e)));
+    EXPECT_EQ(it->data, static_cast<void*>(reg->template GetComponent<C>(e)));
 
     if constexpr (!V::kUniversal)
     {
@@ -262,12 +262,12 @@ TYPED_TEST(StorageParityPos, ByIdPathsAndReflectionSeeTheComponent)
         EXPECT_EQ(countId(reg->GetEntityComponents(e)), 0);
         EXPECT_EQ(reg->AddComponentsByID(std::span{&e, 1}, id, &value, sizeof(C)), 1u);
         EXPECT_EQ(reg->RemoveComponentsByID(std::span{&e, 1}, id), 1u);
-        EXPECT_FALSE(reg->HasComponent<C>(e));
+        EXPECT_FALSE(reg->template HasComponent<C>(e));
     }
     else
     {
         EXPECT_EQ(reg->AddComponentsByID(std::span{&e, 1}, id, &value, sizeof(C)), 0u);   // present: nothing added
-        EXPECT_EQ(*reg->GetComponent<C>(e), C{});
+        EXPECT_EQ(*reg->template GetComponent<C>(e), C{});
     }
 }
 
@@ -289,7 +289,7 @@ TYPED_TEST(StorageParityPos, SignalsFireOnGenuineChangeOnly)
             if (ev.componentId == id) removed.emplace_back(ev.entity, *static_cast<const C*>(ev.component));
         });
 
-    Astra::Entity e = reg->CreateEntity<Velocity>();
+    Astra::Entity e = reg->template CreateEntity<Velocity>();
     if constexpr (V::kUniversal)
     {
         ASSERT_EQ(added.size(), 1u);   // Universal: ComponentAdded at create (s3.3)
@@ -322,17 +322,17 @@ TYPED_TEST(StorageParityPos, SignalsFireOnGenuineChangeOnly)
         AssertCount cap;
         {
             Astra::Testing::ScopedAssertHandler guard(&CountAndContinue, &cap);
-            EXPECT_FALSE(reg->RemoveComponent<C>(e));
+            EXPECT_FALSE(reg->template RemoveComponent<C>(e));
         }
         EXPECT_TRUE(removed.empty());  // refused: no signal
     }
     else
     {
-        ASSERT_TRUE(reg->RemoveComponent<C>(e));
+        ASSERT_TRUE(reg->template RemoveComponent<C>(e));
         ASSERT_EQ(removed.size(), 1u);
         EXPECT_EQ(removed[0].first, e);
         EXPECT_EQ(removed[0].second, MakePos<C>(1.0f));
-        EXPECT_FALSE(reg->RemoveComponent<C>(e));
+        EXPECT_FALSE(reg->template RemoveComponent<C>(e));
         EXPECT_EQ(removed.size(), 1u);
     }
     const size_t removedBeforeDestroy = removed.size();
@@ -364,14 +364,14 @@ TYPED_TEST(StorageParityPos, CommandBufferPlaysBackIdentically)
 
     ASSERT_TRUE(reg->IsValid(t));
     ASSERT_TRUE(reg->IsValid(u));
-    EXPECT_TRUE(reg->HasComponent<C>(t));   // Universal: constructed by the funnel, never skipped
-    EXPECT_TRUE(reg->HasComponent<C>(u));
-    EXPECT_EQ(*reg->GetComponent<C>(t), V::kUniversal ? C{} : MakePos<C>(1.0f));
-    EXPECT_EQ(*reg->GetComponent<C>(u), (V::kUniversal ? C{} : C{2.0f, 3.0f, 4.0f}));
+    EXPECT_TRUE(reg->template HasComponent<C>(t));   // Universal: constructed by the funnel, never skipped
+    EXPECT_TRUE(reg->template HasComponent<C>(u));
+    EXPECT_EQ(*reg->template GetComponent<C>(t), V::kUniversal ? C{} : MakePos<C>(1.0f));
+    EXPECT_EQ(*reg->template GetComponent<C>(u), (V::kUniversal ? C{} : C{2.0f, 3.0f, 4.0f}));
     for (Astra::Entity b : batch)
     {
         ASSERT_TRUE(reg->IsValid(b));
-        EXPECT_EQ(*reg->GetComponent<C>(b), V::kUniversal ? C{} : MakePos<C>(10.0f));
+        EXPECT_EQ(*reg->template GetComponent<C>(b), V::kUniversal ? C{} : MakePos<C>(10.0f));
     }
 
     if constexpr (!V::kUniversal)
@@ -379,15 +379,15 @@ TYPED_TEST(StorageParityPos, CommandBufferPlaysBackIdentically)
         Astra::CommandBuffer rm(reg.get());
         rm.RemoveComponent<C>(t);
         ASSERT_TRUE(rm.Execute().IsOk());
-        EXPECT_FALSE(reg->HasComponent<C>(t));
-        EXPECT_TRUE(reg->HasComponent<Velocity>(t));
+        EXPECT_FALSE(reg->template HasComponent<C>(t));
+        EXPECT_TRUE(reg->template HasComponent<Velocity>(t));
     }
     Astra::CommandBuffer d(reg.get());
     d.DestroyEntity(u);
     ASSERT_TRUE(d.Execute().IsOk());
     EXPECT_FALSE(reg->IsValid(u));
-    EXPECT_EQ(reg->GetComponent<C>(u), nullptr);
-    for (Astra::Entity b : batch) EXPECT_TRUE(reg->HasComponent<C>(b));   // other holders unaffected
+    EXPECT_EQ(reg->template GetComponent<C>(u), nullptr);
+    for (Astra::Entity b : batch) EXPECT_TRUE(reg->template HasComponent<C>(b));   // other holders unaffected
 }
 
 // Controller carry (c), add side: a deferred add of an already-present component fails
@@ -412,11 +412,11 @@ TYPED_TEST(StorageParityPos, CommandBufferAddOfAPresentComponentFailsIdentically
         cmd.EmplaceComponent<C>(e, 8.0f, 8.0f, 8.0f);
         EXPECT_TRUE(cmd.Execute().IsErr());
     }
-    EXPECT_EQ(*reg->GetComponent<C>(e), MakePos<C>(1.0f));   // untouched
+    EXPECT_EQ(*reg->template GetComponent<C>(e), MakePos<C>(1.0f));   // untouched
 
     constexpr size_t N = 4;
     std::vector<Astra::Entity> es(N);
-    ASSERT_EQ((reg->CreateEntitiesWith<C, Velocity>(N, std::span{es}, [](size_t i) {
+    ASSERT_EQ((reg->template CreateEntitiesWith<C, Velocity>(N, std::span{es}, [](size_t i) {
         return std::tuple{MakePos<C>(float(i)), Velocity{}};
     })), N);
     {
@@ -428,7 +428,7 @@ TYPED_TEST(StorageParityPos, CommandBufferAddOfAPresentComponentFailsIdentically
         EXPECT_EQ(*result.GetError(), Astra::CommandError::ExecutionFailed);
         EXPECT_EQ(cmd.GetLastBatchFailureCount(), N);
     }
-    for (size_t i = 0; i < N; ++i) EXPECT_EQ(*reg->GetComponent<C>(es[i]), MakePos<C>(float(i))) << i;
+    for (size_t i = 0; i < N; ++i) EXPECT_EQ(*reg->template GetComponent<C>(es[i]), MakePos<C>(float(i))) << i;
 }
 
 // Controller carry (b)+(c), remove side: Table/Sparse remove succeeds (single and batch);
@@ -441,7 +441,7 @@ TYPED_TEST(StorageParityPos, CommandBufferRemoveSingleAndBatchReportTheUniversal
     auto reg = V::Make();
     constexpr size_t N = 5;
     std::vector<Astra::Entity> es(N);
-    ASSERT_EQ((reg->CreateEntitiesWith<C, Velocity>(N, std::span{es}, [](size_t i) {
+    ASSERT_EQ((reg->template CreateEntitiesWith<C, Velocity>(N, std::span{es}, [](size_t i) {
         return std::tuple{MakePos<C>(float(i)), Velocity{}};
     })), N);
 
@@ -471,8 +471,8 @@ TYPED_TEST(StorageParityPos, CommandBufferRemoveSingleAndBatchReportTheUniversal
         EXPECT_EQ(cap.count, kAssertsActive ? int(N) : 0);
         for (size_t i = 0; i < N; ++i)
         {
-            ASSERT_TRUE(reg->HasComponent<C>(es[i])) << i;
-            EXPECT_EQ(*reg->GetComponent<C>(es[i]), MakePos<C>(float(i))) << i;
+            ASSERT_TRUE(reg->template HasComponent<C>(es[i])) << i;
+            EXPECT_EQ(*reg->template GetComponent<C>(es[i]), MakePos<C>(float(i))) << i;
         }
     }
     else
@@ -482,13 +482,13 @@ TYPED_TEST(StorageParityPos, CommandBufferRemoveSingleAndBatchReportTheUniversal
             cmd.RemoveComponent<C>(es[0]);
             ASSERT_TRUE(cmd.Execute().IsOk());
         }
-        EXPECT_FALSE(reg->HasComponent<C>(es[0]));
+        EXPECT_FALSE(reg->template HasComponent<C>(es[0]));
         {
             Astra::CommandBuffer cmd(reg.get());
             cmd.RemoveComponents<C>(std::span<const Astra::Entity>(es).subspan(1));
             ASSERT_TRUE(cmd.Execute().IsOk());
         }
-        for (Astra::Entity e : es) EXPECT_FALSE(reg->HasComponent<C>(e));
+        for (Astra::Entity e : es) EXPECT_FALSE(reg->template HasComponent<C>(e));
         // Removing an absent component fails Execute and counts every slot.
         Astra::CommandBuffer again(reg.get());
         again.RemoveComponents<C>(es);
@@ -512,7 +512,7 @@ TYPED_TEST(StorageParityEnableable, BornEnabledToggleReportsAndSignalsOnChangeOn
     using C = typename V::Comp;
     auto reg = V::Make();
     Astra::Entity e = reg->CreateEntityWith(MakeHier<C>(7), Velocity{});
-    EXPECT_TRUE(reg->IsEnabled<C>(e));
+    EXPECT_TRUE(reg->template IsEnabled<C>(e));
 
     reg->EnableSignals(Astra::Signal::ComponentEnabled | Astra::Signal::ComponentDisabled);
     const Astra::ComponentID id = Astra::TypeID<C>::Value();
@@ -522,15 +522,15 @@ TYPED_TEST(StorageParityEnableable, BornEnabledToggleReportsAndSignalsOnChangeOn
     reg->GetSignalManager()->On<Astra::Events::ComponentDisabled>().Register(
         [&](const Astra::Events::ComponentDisabled& ev) { if (ev.componentId == id) ++disabledSignals; });
 
-    EXPECT_TRUE(reg->SetEnabled<C>(e, false));
-    EXPECT_FALSE(reg->IsEnabled<C>(e));
+    EXPECT_TRUE(reg->template SetEnabled<C>(e, false));
+    EXPECT_FALSE(reg->template IsEnabled<C>(e));
     EXPECT_EQ(disabledSignals, 1);
-    EXPECT_TRUE(reg->SetEnabled<C>(e, false));      // idempotent: still true, silent
+    EXPECT_TRUE(reg->template SetEnabled<C>(e, false));      // idempotent: still true, silent
     EXPECT_EQ(disabledSignals, 1);
-    EXPECT_TRUE(reg->HasComponent<C>(e));           // existence never lies
-    EXPECT_EQ(reg->GetComponent<C>(e)->parent, 7u);
-    EXPECT_TRUE(reg->SetEnabled<C>(e, true));
-    EXPECT_TRUE(reg->IsEnabled<C>(e));
+    EXPECT_TRUE(reg->template HasComponent<C>(e));           // existence never lies
+    EXPECT_EQ(reg->template GetComponent<C>(e)->parent, 7u);
+    EXPECT_TRUE(reg->template SetEnabled<C>(e, true));
+    EXPECT_TRUE(reg->template IsEnabled<C>(e));
     EXPECT_EQ(enabledSignals, 1);
 }
 
@@ -547,15 +547,15 @@ TYPED_TEST(StorageParityEnableable, StaleAndMissingAreRefused)
     });
     ASSERT_TRUE(occupant.IsValid());
     ASSERT_EQ(occupant.GetID(), dead.GetID());
-    EXPECT_FALSE(reg->SetEnabled<C>(dead, false));
-    EXPECT_FALSE(reg->IsEnabled<C>(dead));
-    EXPECT_TRUE(reg->IsEnabled<C>(occupant));
-    EXPECT_EQ(reg->GetComponent<C>(occupant)->parent, 2u);
+    EXPECT_FALSE(reg->template SetEnabled<C>(dead, false));
+    EXPECT_FALSE(reg->template IsEnabled<C>(dead));
+    EXPECT_TRUE(reg->template IsEnabled<C>(occupant));
+    EXPECT_EQ(reg->template GetComponent<C>(occupant)->parent, 2u);
     if constexpr (!V::kUniversal)
     {
-        Astra::Entity without = reg->CreateEntity<Velocity>();
-        EXPECT_FALSE(reg->SetEnabled<C>(without, false));   // missing component
-        EXPECT_FALSE(reg->IsEnabled<C>(without));
+        Astra::Entity without = reg->template CreateEntity<Velocity>();
+        EXPECT_FALSE(reg->template SetEnabled<C>(without, false));   // missing component
+        EXPECT_FALSE(reg->template IsEnabled<C>(without));
     }
 }
 
@@ -568,11 +568,11 @@ TYPED_TEST(StorageParityEnableable, DisabledStateSurvivesRelocationAndViewsAgree
     auto reg = V::Make();
     constexpr size_t N = 300;
     std::vector<Astra::Entity> es(N);
-    ASSERT_EQ((reg->CreateEntitiesWith<C, Velocity>(N, std::span{es}, [](size_t i) {
+    ASSERT_EQ((reg->template CreateEntitiesWith<C, Velocity>(N, std::span{es}, [](size_t i) {
         return std::tuple{MakeHier<C>(uint32_t(i)), Velocity{}};
     })), N);
-    for (size_t i = 0; i < N; i += 3) ASSERT_TRUE(reg->SetEnabled<C>(es[i], false));
-    for (int i : {64, 65, 127, 128}) (void)reg->SetEnabled<C>(es[size_t(i)], false);   // word boundaries
+    for (size_t i = 0; i < N; i += 3) ASSERT_TRUE(reg->template SetEnabled<C>(es[i], false));
+    for (int i : {64, 65, 127, 128}) (void)reg->template SetEnabled<C>(es[size_t(i)], false);   // word boundaries
     for (size_t i = 0; i < N; i += 2) ASSERT_TRUE(reg->AddComponent(es[i], Health{}));
     for (size_t i = 0; i < N; i += 5) reg->DestroyEntity(es[i]);
     (void)reg->Defragment();
@@ -584,16 +584,16 @@ TYPED_TEST(StorageParityEnableable, DisabledStateSurvivesRelocationAndViewsAgree
         if (i % 5 == 0) { EXPECT_FALSE(reg->IsValid(es[i])); continue; }
         ++alive;
         enabled += disabled(i) ? 0 : 1;
-        EXPECT_EQ(reg->IsEnabled<C>(es[i]), !disabled(i)) << "entity " << i;
-        EXPECT_EQ(reg->GetComponent<C>(es[i])->parent, uint32_t(i)) << "entity " << i;
+        EXPECT_EQ(reg->template IsEnabled<C>(es[i]), !disabled(i)) << "entity " << i;
+        EXPECT_EQ(reg->template GetComponent<C>(es[i])->parent, uint32_t(i)) << "entity " << i;
     }
     size_t seen = 0;
-    reg->CreateView<C>().ForEach([&](Astra::Entity, C&) { ++seen; });
+    reg->template CreateView<C>().ForEach([&](Astra::Entity, C&) { ++seen; });
     EXPECT_EQ(seen, enabled);
-    EXPECT_EQ(reg->CreateView<C>().Size(), enabled);
-    EXPECT_EQ(reg->CreateView<Astra::IncludeDisabled<C>>().Size(), alive);
+    EXPECT_EQ(reg->template CreateView<C>().Size(), enabled);
+    EXPECT_EQ(reg->template CreateView<Astra::IncludeDisabled<C>>().Size(), alive);
     size_t nullOpt = 0;
-    reg->CreateView<Velocity, Astra::Optional<C>>().ForEach([&](Astra::Entity, Velocity&, C* c) { nullOpt += (c == nullptr); });
+    reg->template CreateView<Velocity, Astra::Optional<C>>().ForEach([&](Astra::Entity, Velocity&, C* c) { nullOpt += (c == nullptr); });
     EXPECT_EQ(nullOpt, alive - enabled);             // a disabled Optional<T> yields null
 }
 
@@ -605,9 +605,9 @@ TYPED_TEST(StorageParityEnableable, DeferredSetEnabledAppliesAtFlushAndStaleFail
     Astra::Entity e = reg->CreateEntityWith(MakeHier<C>(1), Velocity{});
     Astra::CommandBuffer cmd(reg.get());
     cmd.SetEnabled<C>(e, false);
-    EXPECT_TRUE(reg->IsEnabled<C>(e));               // not yet applied
+    EXPECT_TRUE(reg->template IsEnabled<C>(e));               // not yet applied
     ASSERT_TRUE(cmd.Execute().IsOk());
-    EXPECT_FALSE(reg->IsEnabled<C>(e));
+    EXPECT_FALSE(reg->template IsEnabled<C>(e));
 
     Astra::Entity dead = reg->CreateEntityWith(MakeHier<C>(2), Velocity{});
     reg->DestroyEntity(dead);
@@ -630,33 +630,33 @@ TYPED_TEST(StorageParityTag, AddHasRemoveAndFilters)
     using C = typename V::Comp;
     auto reg = V::Make();
     std::vector<Astra::Entity> es(100);
-    ASSERT_EQ(reg->CreateEntities<Velocity>(100, std::span{es}), 100u);
+    ASSERT_EQ(reg->template CreateEntities<Velocity>(100, std::span{es}), 100u);
     for (size_t i = 0; i < 100; i += 4) ASSERT_TRUE(reg->AddComponent(es[i], C{}));
-    for (size_t i = 0; i < 100; ++i) EXPECT_EQ(reg->HasComponent<C>(es[i]), i % 4 == 0) << i;
+    for (size_t i = 0; i < 100; ++i) EXPECT_EQ(reg->template HasComponent<C>(es[i]), i % 4 == 0) << i;
 
-    EXPECT_EQ((reg->CreateView<Velocity, C>().Size()), 25u);
-    EXPECT_EQ((reg->CreateView<Velocity, Astra::Not<C>>().Size()), 75u);
+    EXPECT_EQ((reg->template CreateView<Velocity, C>().Size()), 25u);
+    EXPECT_EQ((reg->template CreateView<Velocity, Astra::Not<C>>().Size()), 75u);
     size_t n = 0;
-    reg->CreateView<Velocity, Astra::With<C>>().ForEach([&](Astra::Entity, Velocity&) { ++n; });
+    reg->template CreateView<Velocity, Astra::With<C>>().ForEach([&](Astra::Entity, Velocity&) { ++n; });
     EXPECT_EQ(n, 25u);
 
-    for (size_t i = 0; i < 100; i += 8) ASSERT_TRUE(reg->RemoveComponent<C>(es[i]));   // 13 removed
-    EXPECT_EQ((reg->CreateView<Velocity, C>().Size()), 12u);
-    EXPECT_FALSE(reg->RemoveComponent<C>(es[0]));
+    for (size_t i = 0; i < 100; i += 8) ASSERT_TRUE(reg->template RemoveComponent<C>(es[i]));   // 13 removed
+    EXPECT_EQ((reg->template CreateView<Velocity, C>().Size()), 12u);
+    EXPECT_FALSE(reg->template RemoveComponent<C>(es[0]));
     EXPECT_TRUE(reg->HasComponentByHash(es[4], Astra::TypeID<C>::Hash()));
     EXPECT_NE(reg->GetComponentByHash(es[4], Astra::TypeID<C>::Hash()), nullptr);   // present tag: sentinel, never null
     EXPECT_FALSE(reg->HasComponentByHash(es[8], Astra::TypeID<C>::Hash()));
 
     // Enableable tags (s3.2): toggling never changes existence, only visibility.
-    EXPECT_TRUE(reg->IsEnabled<C>(es[4]));
-    EXPECT_TRUE(reg->SetEnabled<C>(es[4], false));
-    EXPECT_FALSE(reg->IsEnabled<C>(es[4]));
-    EXPECT_TRUE(reg->HasComponent<C>(es[4]));
-    EXPECT_EQ((reg->CreateView<Velocity, C>().Size()), 11u);                          // disabled: filtered out
-    EXPECT_EQ((reg->CreateView<Velocity, Astra::IncludeDisabled<C>>().Size()), 12u);
-    EXPECT_FALSE(reg->SetEnabled<C>(es[8], false));                                  // absent: refused
-    EXPECT_TRUE(reg->SetEnabled<C>(es[4], true));
-    EXPECT_EQ((reg->CreateView<Velocity, C>().Size()), 12u);
+    EXPECT_TRUE(reg->template IsEnabled<C>(es[4]));
+    EXPECT_TRUE(reg->template SetEnabled<C>(es[4], false));
+    EXPECT_FALSE(reg->template IsEnabled<C>(es[4]));
+    EXPECT_TRUE(reg->template HasComponent<C>(es[4]));
+    EXPECT_EQ((reg->template CreateView<Velocity, C>().Size()), 11u);                          // disabled: filtered out
+    EXPECT_EQ((reg->template CreateView<Velocity, Astra::IncludeDisabled<C>>().Size()), 12u);
+    EXPECT_FALSE(reg->template SetEnabled<C>(es[8], false));                                  // absent: refused
+    EXPECT_TRUE(reg->template SetEnabled<C>(es[4], true));
+    EXPECT_EQ((reg->template CreateView<Velocity, C>().Size()), 12u);
 }
 
 // Controller carry (a): an enableable Universal TAG (EmptyComponentSentinel payload)
@@ -671,29 +671,29 @@ TYPED_TEST(StorageParityUniversalTag, PayloadIsTheSentinelAndEnabledStateToggles
     using V = TypeParam;
     using C = typename V::Comp;
     auto reg = V::Make();
-    Astra::Entity e = reg->CreateEntity<Velocity>();
-    Astra::Entity other = reg->CreateEntity<Velocity>();
+    Astra::Entity e = reg->template CreateEntity<Velocity>();
+    Astra::Entity other = reg->template CreateEntity<Velocity>();
     Give<V>(*reg, e, C{});
     Give<V>(*reg, other, C{});
     const uint64_t hash = Astra::TypeID<C>::Hash();
 
-    ASSERT_TRUE(reg->HasComponent<C>(e));
-    C* typed = reg->GetComponent<C>(e);
+    ASSERT_TRUE(reg->template HasComponent<C>(e));
+    C* typed = reg->template GetComponent<C>(e);
     ASSERT_NE(typed, nullptr);                                    // a present tag is never a null payload
     // The by-hash (type-erased) payload of a present tag is the shared sentinel in every kind;
     // the typed pointer is only required to be non-null (Table hands out a column-relative address).
     EXPECT_EQ(reg->GetComponentByHash(e, hash), Astra::EmptyComponentSentinel());
     EXPECT_EQ(static_cast<const void*>(std::as_const(*reg).GetComponent<C>(e)), static_cast<void*>(typed));
 
-    EXPECT_TRUE(reg->IsEnabled<C>(e));
-    EXPECT_EQ((reg->CreateView<Velocity, C>().Size()), 2u);
-    EXPECT_TRUE(reg->SetEnabled<C>(e, false));
-    EXPECT_FALSE(reg->IsEnabled<C>(e));
-    EXPECT_TRUE(reg->IsEnabled<C>(other));                        // the neighbour is untouched
-    EXPECT_TRUE(reg->HasComponent<C>(e));                         // existence never lies
-    EXPECT_NE(reg->GetComponent<C>(e), nullptr);                  // payload survives the disable
-    EXPECT_EQ((reg->CreateView<Velocity, C>().Size()), 1u);       // disabled: filtered out
-    EXPECT_EQ((reg->CreateView<Velocity, Astra::IncludeDisabled<C>>().Size()), 2u);
-    EXPECT_TRUE(reg->SetEnabled<C>(e, true));
-    EXPECT_EQ((reg->CreateView<Velocity, C>().Size()), 2u);
+    EXPECT_TRUE(reg->template IsEnabled<C>(e));
+    EXPECT_EQ((reg->template CreateView<Velocity, C>().Size()), 2u);
+    EXPECT_TRUE(reg->template SetEnabled<C>(e, false));
+    EXPECT_FALSE(reg->template IsEnabled<C>(e));
+    EXPECT_TRUE(reg->template IsEnabled<C>(other));                        // the neighbour is untouched
+    EXPECT_TRUE(reg->template HasComponent<C>(e));                         // existence never lies
+    EXPECT_NE(reg->template GetComponent<C>(e), nullptr);                  // payload survives the disable
+    EXPECT_EQ((reg->template CreateView<Velocity, C>().Size()), 1u);       // disabled: filtered out
+    EXPECT_EQ((reg->template CreateView<Velocity, Astra::IncludeDisabled<C>>().Size()), 2u);
+    EXPECT_TRUE(reg->template SetEnabled<C>(e, true));
+    EXPECT_EQ((reg->template CreateView<Velocity, C>().Size()), 2u);
 }
